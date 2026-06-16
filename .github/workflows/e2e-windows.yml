@@ -169,7 +169,7 @@ jobs:
       - name: Checkout src code to hermes home
         uses: actions/checkout@v4
         with:
-          path: {{ github.workspace }}\.e2e-hermes-home\hermes-agent
+          path: {{ github.workspace }}/.e2e-hermes-home/hermes-agent
 
       # ── Screen recording for coordinate discovery ───────────────────
       - name: Start screen recording
