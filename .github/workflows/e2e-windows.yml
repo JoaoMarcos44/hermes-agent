@@ -175,6 +175,7 @@ jobs:
         shell: pwsh
         run: |
           $installDir = "$env:HERMES_HOME\hermes-agent"
+          New-Item -ItemType Directory -Path $installDir -Force
           Get-ChildItem -Path ${{ github.workspace }} -Force | Move-Item -Destination $installDir -Force
           Write-Host "Isolated install dir ready: $installDir"
 
