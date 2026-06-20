@@ -2759,3 +2759,101 @@ class TestHomeTargetEnvVarRegistry:
         from cron.scheduler import _HOME_TARGET_ENV_VARS
 
         assert _HOME_TARGET_ENV_VARS.get("whatsapp") == "WHATSAPP_HOME_CHANNEL"
+
+
+class TestDeliverResultErrorBubbling:
+    """Verify that _deliver_result bubbles up live adapter errors only when standalone fallback also fails."""
+
+    def test_bubbles_errors_when_both_fail(self):
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        # 1. Live adapter fails
+        adapter = AsyncMock()
+        adapter.send.side_effect = RuntimeError("live adapter connection failed")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        # Need a future that raises the exception
+        failed_future = Future()
+        failed_future.set_exception(RuntimeError("live adapter connection failed"))
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return failed_future
+
+        job = {
+            "id": "failed-delivery-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        # Standalone path also fails
+        standalone_send = AsyncMock(return_value={"error": "standalone endpoint offline"})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "live adapter delivery to telegram:123 failed" in result
+        assert "delivery error: standalone endpoint offline" in result
+
+    def test_succeeds_when_live_fails_but_standalone_succeeds(self):
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        # 1. Live adapter fails
+        adapter = AsyncMock()
+        adapter.send.side_effect = RuntimeError("live adapter connection failed")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        failed_future = Future()
+        failed_future.set_exception(RuntimeError("live adapter connection failed"))
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return failed_future
+
+        job = {
+            "id": "fallback-success-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        # Standalone path succeeds
+        standalone_send = AsyncMock(return_value={"success": True})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None  # Success because standalone succeeded
+
