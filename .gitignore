@@ -137,3 +137,7 @@ RELEASE_v*.md
 # Desktop demo-run scratch output (hermes writes demo/*.txt during recorded
 # walkthroughs). Throwaway artifacts, never part of the app.
 apps/desktop/demo/
+
+# graphify knowledge graph — generated locally by .claude/hooks/session-start.sh,
+# rebuilt per-container, not meant to be versioned (large + machine-generated).
+graphify-out/
