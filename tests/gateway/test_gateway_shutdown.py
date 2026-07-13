@@ -134,6 +134,52 @@ async def test_gateway_stop_interrupts_after_drain_timeout():
 
 
 @pytest.mark.asyncio
+async def test_drain_waits_for_api_server_in_flight_runs():
+    """#63529: shutdown drain must see api_server runs, not just _running_agents."""
+    runner, adapter = make_restart_runner()
+    disconnect_mock = AsyncMock()
+    adapter.disconnect = disconnect_mock
+
+    api_adapter = MagicMock()
+    api_adapter.active_run_count.return_value = 1
+    runner.adapters[Platform.API_SERVER] = api_adapter
+
+    async def finish_run():
+        await asyncio.sleep(0.05)
+        api_adapter.active_run_count.return_value = 0
+
+    asyncio.create_task(finish_run())
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    api_adapter.interrupt_active_runs.assert_not_called()
+    disconnect_mock.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_interrupts_api_server_runs():
+    """#63529: a still-running api_server run gets interrupted like any other session."""
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 0.05
+
+    disconnect_mock = AsyncMock()
+    adapter.disconnect = disconnect_mock
+
+    api_adapter = MagicMock()
+    api_adapter.active_run_count.return_value = 1
+    runner.adapters[Platform.API_SERVER] = api_adapter
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop()
+
+    api_adapter.interrupt_active_runs.assert_called_once_with("Gateway shutting down")
+    disconnect_mock.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_systemd_service_restart_exits_cleanly(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     runner, adapter = make_restart_runner()

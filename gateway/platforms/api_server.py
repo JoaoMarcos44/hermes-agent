@@ -801,6 +801,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # Number of in-flight runs on the non-streaming chat/responses paths
         # (the /v1/runs path tracks its own in-flight set via _run_streams).
         self._inflight_agent_runs: int = 0
+        # agent_ref handles for in-flight chat/completions + responses runs
+        # (#63529). Appended/removed only from the event-loop thread inside
+        # _run_agent(), same as _inflight_agent_runs above — the executor
+        # thread only ever writes ref[0] once, a pattern already relied on
+        # by the SSE writers' disconnect-interrupt path. This is what makes
+        # those runs interruptible/countable for shutdown drain; distinct
+        # from _active_run_agents, which covers the separate /v1/runs path.
+        self._pending_agent_refs: List[list] = []
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -3722,6 +3730,11 @@ class APIServerAdapter(BasePlatformAdapter):
         another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_running_loop()
+        # Always a real one-element list, whether the caller passed one (for
+        # its own disconnect-interrupt use) or not — this is also what
+        # active_run_count()/interrupt_active_runs() read for shutdown drain
+        # (#63529), so it must exist even when no caller-side ref was given.
+        _ref = agent_ref if agent_ref is not None else [None]
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -3741,8 +3754,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                 )
-                if agent_ref is not None:
-                    agent_ref[0] = agent
+                _ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,
@@ -3765,10 +3777,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 clear_session_vars(tokens)
 
         self._inflight_agent_runs += 1
+        self._pending_agent_refs.append(_ref)
         try:
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            try:
+                self._pending_agent_refs.remove(_ref)
+            except ValueError:
+                pass
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -4332,6 +4349,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
+
+    def active_run_count(self) -> int:
+        """Number of agent runs currently in flight on this adapter (#63529).
+
+        Gateway shutdown drain has no visibility into api_server runs — they
+        live in two separate registries here, neither of which is
+        ``GatewayRunner._running_agents``: ``_active_run_agents`` (the
+        /v1/runs streaming path) and ``_pending_agent_refs`` (the
+        /v1/chat/completions + /v1/responses path, both streaming and
+        non-streaming, which all funnel through ``_run_agent()``). The two
+        are mutually exclusive per request — no run is ever tracked by
+        both — so summing them can't double-count.
+        """
+        return len(self._active_run_agents) + len(self._pending_agent_refs)
+
+    def interrupt_active_runs(self, reason: str) -> None:
+        """Interrupt all in-flight runs so shutdown drain can reclaim them (#63529)."""
+        for run_id, agent in list(self._active_run_agents.items()):
+            try:
+                agent.interrupt(reason)
+            except Exception:
+                logger.debug("Failed interrupting api_server run %s during shutdown", run_id, exc_info=True)
+        for ref in list(self._pending_agent_refs):
+            agent = ref[0]
+            if agent is None:
+                continue
+            try:
+                agent.interrupt(reason)
+            except Exception:
+                logger.debug("Failed interrupting api_server chat/responses run during shutdown", exc_info=True)
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""

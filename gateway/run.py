@@ -3533,7 +3533,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._shutdown_event.set()
 
     def _running_agent_count(self) -> int:
-        return len(self._running_agents)
+        return len(self._running_agents) + self._api_server_active_run_count()
+
+    def _api_server_active_run_count(self) -> int:
+        """In-flight runs on the api_server adapter, if enabled (#63529).
+
+        These live in the adapter's own ``_active_run_agents`` registry, not
+        ``self._running_agents`` — folded in here so drain/interrupt see them.
+        """
+        adapter = self.adapters.get(Platform.API_SERVER)
+        if adapter is None:
+            return 0
+        try:
+            return adapter.active_run_count()
+        except Exception:
+            return 0
 
     def _status_action_label(self) -> str:
         return "restart" if self._restart_requested else "shutdown"
@@ -4490,7 +4504,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_active_count = active_count
                 last_status_at = now
 
-        if not self._running_agents:
+        if self._running_agent_count() == 0:
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -4499,10 +4513,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return snapshot, True
 
         deadline = asyncio.get_running_loop().time() + timeout
-        while self._running_agents and asyncio.get_running_loop().time() < deadline:
+        while self._running_agent_count() > 0 and asyncio.get_running_loop().time() < deadline:
             _maybe_update_status()
             await asyncio.sleep(0.1)
-        timed_out = bool(self._running_agents)
+        timed_out = self._running_agent_count() > 0
         _maybe_update_status(force=True)
         return snapshot, timed_out
 
@@ -4515,6 +4529,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
+        # api_server runs live outside _running_agents entirely (#63529) — same
+        # drain-timeout escalation, routed through the adapter's own registry.
+        api_adapter = self.adapters.get(Platform.API_SERVER)
+        if api_adapter is not None:
+            try:
+                api_adapter.interrupt_active_runs(reason)
+            except Exception as e:
+                logger.debug("Failed interrupting api_server runs during shutdown: %s", e)
 
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
@@ -6690,7 +6712,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
                 interrupt_deadline = asyncio.get_running_loop().time() + 5.0
-                while self._running_agents and asyncio.get_running_loop().time() < interrupt_deadline:
+                while self._running_agent_count() > 0 and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
 

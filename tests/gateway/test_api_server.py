@@ -527,6 +527,113 @@ def auth_adapter():
 # ---------------------------------------------------------------------------
 
 
+class TestActiveRunCount:
+    """#63529: gateway shutdown drain reads active_run_count()/interrupt_active_runs()."""
+
+    @pytest.mark.asyncio
+    async def test_active_run_count_reflects_inflight_chat_completions_run(self, adapter):
+        import threading
+
+        release = threading.Event()
+        mock_agent = MagicMock()
+
+        def _blocking_run_conversation(**_kwargs):
+            release.wait(timeout=5)
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _blocking_run_conversation
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        assert adapter.active_run_count() == 0
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            task = asyncio.ensure_future(
+                adapter._run_agent(user_message="hi", conversation_history=[], session_id="s1")
+            )
+            for _ in range(200):
+                if adapter.active_run_count() == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert adapter.active_run_count() == 1
+
+            release.set()
+            await task
+
+        assert adapter.active_run_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_interrupt_active_runs_reaches_chat_completions_agent(self, adapter):
+        import threading
+
+        release = threading.Event()
+        mock_agent = MagicMock()
+
+        def _blocking_run_conversation(**_kwargs):
+            release.wait(timeout=5)
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _blocking_run_conversation
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            task = asyncio.ensure_future(
+                adapter._run_agent(user_message="hi", conversation_history=[], session_id="s1")
+            )
+            # active_run_count() flips as soon as the ref is registered, but
+            # the ref's agent slot is only populated once the executor thread
+            # actually reaches _create_agent() — wait for that specifically.
+            for _ in range(200):
+                if adapter._pending_agent_refs and adapter._pending_agent_refs[0][0] is not None:
+                    break
+                await asyncio.sleep(0.01)
+
+            adapter.interrupt_active_runs("Gateway shutting down")
+            mock_agent.interrupt.assert_called_once_with("Gateway shutting down")
+
+            release.set()
+            await task
+
+    @pytest.mark.asyncio
+    async def test_active_run_count_sums_both_registries_without_double_counting(self, adapter):
+        """/v1/runs (_active_run_agents) and chat/completions (_pending_agent_refs)
+        are mutually exclusive per request; concurrently active runs on each
+        must add up, not collide or double-count either one."""
+        assert adapter.active_run_count() == 0
+
+        adapter._active_run_agents["run-1"] = MagicMock()
+        assert adapter.active_run_count() == 1
+
+        import threading
+
+        release = threading.Event()
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = lambda **_kw: (release.wait(timeout=5), {"final_response": "ok"})[1]
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            task = asyncio.ensure_future(
+                adapter._run_agent(user_message="hi", conversation_history=[], session_id="s1")
+            )
+            for _ in range(200):
+                if adapter.active_run_count() == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert adapter.active_run_count() == 2
+
+            release.set()
+            await task
+
+        assert adapter.active_run_count() == 1
+        adapter._active_run_agents.clear()
+        assert adapter.active_run_count() == 0
+
+
 class TestAgentExecution:
     @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
