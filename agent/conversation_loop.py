@@ -366,6 +366,30 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     if agent._session_db:
         try:
             agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            # A write that raises is already loud (below). A write that
+            # returns cleanly but doesn't stick is not — that's exactly how
+            # #63713 was reported as "never repaired": the same WARNING above
+            # fires every single turn forever with nothing louder to catch
+            # it. Only pay for the read-back + retry on the repair path
+            # (stored_state was already broken coming in) so the happy path
+            # (new session, first write) stays a single write.
+            if conversation_history and stored_state in ("null", "empty"):
+                _verify_row = agent._session_db.get_session(agent.session_id)
+                _verify_prompt = _verify_row.get("system_prompt") if _verify_row else None
+                if not _verify_prompt:
+                    # One immediate retry — cheap insurance against a
+                    # transient hiccup on the first attempt.
+                    agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+                    _verify_row = agent._session_db.get_session(agent.session_id)
+                    _verify_prompt = _verify_row.get("system_prompt") if _verify_row else None
+                if not _verify_prompt:
+                    logger.error(
+                        "Session DB update_system_prompt did not persist for "
+                        "session %s after repair + retry — stored system_prompt "
+                        "is still %s. This session's prefix cache will keep "
+                        "missing every turn until the write path is fixed.",
+                        agent.session_id, "null" if _verify_prompt is None else "empty",
+                    )
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "

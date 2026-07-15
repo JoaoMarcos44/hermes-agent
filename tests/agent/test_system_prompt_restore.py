@@ -230,6 +230,102 @@ class TestSilentFailureWarnings:
 
 
 # ---------------------------------------------------------------------------
+# Repair-write verification (#63713) — a write that raises is already loud;
+# a write that returns cleanly but doesn't stick previously left the row
+# broken forever with nothing louder than the same repeating WARNING.
+# ---------------------------------------------------------------------------
+
+
+class TestRepairWriteVerification:
+    def test_repair_write_confirmed_on_first_read_back_no_retry(self, caplog):
+        """Write sticks on the first try → no retry, no escalation."""
+        db = MagicMock()
+        db.get_session.side_effect = [
+            {"system_prompt": None},  # initial restore read: null
+            {"system_prompt": "BUILT_PROMPT"},  # read-back after write: fixed
+        ]
+        agent = _make_agent(session_db=db)
+
+        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert db.update_system_prompt.call_count == 1
+        assert db.get_session.call_count == 2
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not errors
+
+    def test_repair_write_not_stuck_retries_once_then_recovers(self, caplog):
+        """Write silently didn't stick → one retry, retry succeeds → no escalation."""
+        db = MagicMock()
+        db.get_session.side_effect = [
+            {"system_prompt": None},  # initial restore read: null
+            {"system_prompt": None},  # read-back after 1st write: still null
+            {"system_prompt": "BUILT_PROMPT"},  # read-back after retry: fixed
+        ]
+        agent = _make_agent(session_db=db)
+
+        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        # Original write + one retry
+        assert db.update_system_prompt.call_count == 2
+        assert db.get_session.call_count == 3
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not errors, f"Expected no escalation once the retry recovers, got: {errors}"
+
+    def test_repair_write_never_sticks_escalates_to_error(self, caplog):
+        """Write never sticks even after retry → loud ERROR, not another WARNING.
+
+        This is the exact #63713 symptom: the row stays null/empty forever
+        and the only signal was a repeating WARNING easy to miss in log
+        noise. A write that never sticks must escalate distinctly.
+        """
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": None}
+        agent = _make_agent(session_db=db)
+
+        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        # Original write + exactly one retry — not an unbounded loop
+        assert db.update_system_prompt.call_count == 2
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any(
+            "did not persist" in m and "repair + retry" in m for m in errors
+        ), f"Expected a loud persistence-failure ERROR, got: {errors}"
+
+    def test_repair_write_never_sticks_empty_string_escalates_to_error(self, caplog):
+        """Same escalation for the '' (empty) unusable-state variant."""
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": ""}
+        agent = _make_agent(session_db=db)
+
+        with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert db.update_system_prompt.call_count == 2
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("did not persist" in m for m in errors)
+
+    def test_stale_runtime_rebuild_does_not_trigger_verification(self):
+        """The stale-runtime rebuild path writes a good value from a 'present'
+        row — it never entered the null/empty repair branch, so it must not
+        pay for (or need) the read-back verification."""
+        stored = (
+            "You are Hermes Agent.\nModel: old-model\nProvider: openrouter"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt="You are Hermes Agent.\nModel: test-model\nProvider: openrouter")
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        # One read (initial restore) + one write — no verification read-back.
+        assert db.get_session.call_count == 1
+        assert db.update_system_prompt.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Byte-stability invariant
 # ---------------------------------------------------------------------------
 
