@@ -250,6 +250,21 @@ class TestCodexBuildKwargs:
         assert eb.get("prompt_cache_key") == "caller-override"
         assert eb.get("other_field") == 42
 
+    def test_xai_top_level_override_also_governs_extra_body(self, transport):
+        """A caller's top-level request_overrides={"prompt_cache_key": ...}
+        must win in extra_body.prompt_cache_key too -- the field xAI actually
+        reads -- instead of being silently outrun by the auto-derived
+        content-hash cache_key (#78941)."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="grok-4.3", messages=messages, tools=[],
+            session_id="conv-xai-1",
+            is_xai_responses=True,
+            request_overrides={"prompt_cache_key": "caller-top-level"},
+        )
+        assert kw["prompt_cache_key"] == "caller-top-level"
+        assert kw["extra_body"]["prompt_cache_key"] == "caller-top-level"
+
 
 
 

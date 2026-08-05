@@ -500,11 +500,17 @@ class ResponsesApiTransport(ProviderTransport):
             # https://docs.x.ai/developers/advanced-api-usage/prompt-caching/maximizing-cache-hits.
             # Sent via extra_body (not the typed kwarg) so it survives openai
             # SDK builds whose Responses.stream() signature has dropped the field.
+            # A caller's request_overrides={"prompt_cache_key": ...} lands on
+            # the top-level kwarg set earlier -- read it back here so an
+            # explicit override actually governs the field xAI reads, instead
+            # of being silently outrun by the auto-derived cache_key (#78941).
             existing_extra_body = kwargs.get("extra_body")
             merged_extra_body: Dict[str, Any] = {}
             if isinstance(existing_extra_body, dict):
                 merged_extra_body.update(existing_extra_body)
-            merged_extra_body.setdefault("prompt_cache_key", cache_key)
+            merged_extra_body.setdefault(
+                "prompt_cache_key", kwargs.get("prompt_cache_key", cache_key)
+            )
             kwargs["extra_body"] = merged_extra_body
 
         extra_body = kwargs.get("extra_body")
