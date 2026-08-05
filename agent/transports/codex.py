@@ -493,7 +493,12 @@ class ResponsesApiTransport(ProviderTransport):
                         if key and value is not None
                     }
                 )
-            merged_extra_headers["x-grok-conv-id"] = session_id
+            # Scoped like the body cache key below — otherwise cron's
+            # per-fire timestamp in session_id (cron_<id>_<ts>) pins every
+            # fire of the same job to a different xAI backend server (#78941).
+            merged_extra_headers["x-grok-conv-id"] = _cache_scope_from_session_id(
+                session_id
+            )
             kwargs["extra_headers"] = merged_extra_headers
 
             # xAI Responses cache-routing — body-level field per

@@ -94,6 +94,22 @@ class TestOpenRouterProfile:
         )
         assert tl["extra_headers"]["x-grok-conv-id"] == "sess-abc123"
 
+    def test_grok_conv_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job must pin to the same xAI backend,
+        same as the body.session_id sticky key (#78941)."""
+        p = get_provider_profile("openrouter")
+        _, first = p.build_api_kwargs_extras(
+            model="x-ai/grok-4", session_id="cron_job42_20260801_090000",
+        )
+        _, second = p.build_api_kwargs_extras(
+            model="x-ai/grok-4", session_id="cron_job42_20260802_090000",
+        )
+        assert first["extra_headers"]["x-grok-conv-id"] == "cron_job42"
+        assert (
+            first["extra_headers"]["x-grok-conv-id"]
+            == second["extra_headers"]["x-grok-conv-id"]
+        )
+
 
 
 

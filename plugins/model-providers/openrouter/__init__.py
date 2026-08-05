@@ -183,7 +183,7 @@ class OpenRouterProfile(ProviderProfile):
         # backend server via this header, and aux calls pass no session_id, so
         # reading the ambient conversation keeps compression/vision/MoA traffic
         # on the same Grok backend as the conversation it belongs to.
-        grok_conv_id = get_conversation_context() or session_id
+        grok_conv_id = _cache_scope_from_session_id(get_conversation_context() or session_id)
         if grok_conv_id and model and model.startswith(("x-ai/grok-", "xai/grok-")):
             extra_headers["x-grok-conv-id"] = grok_conv_id
         if extra_headers:
