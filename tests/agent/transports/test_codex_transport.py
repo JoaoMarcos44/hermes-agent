@@ -257,26 +257,28 @@ class TestCodexBuildKwargs:
     @pytest.mark.parametrize("length", [64, 65])
     def test_codex_cache_scope_boundary(self, transport, length):
         session_id = "s" * length
-        scope = transport.build_kwargs(
+        kw = transport.build_kwargs(
             model="gpt-5.4",
             messages=[{"role": "user", "content": "Hi"}],
             tools=[],
             session_id=session_id,
             is_codex_backend=True,
             request_overrides={"extra_headers": {"x-test": "1"}},
-        )["extra_headers"]
+        )
+        headers = kw["extra_headers"]
 
-        assert scope["x-test"] == "1"
-        assert len(scope["session_id"]) <= 64
-        assert scope["x-client-request-id"] == scope["session_id"]
-        if length == 64:
-            assert scope["session_id"] == session_id
-        else:
-            assert scope["session_id"].startswith("pck_")
-            assert scope["session_id"] != session_id
+        assert headers["x-test"] == "1"
+        # session_id header carries the raw physical id untouched regardless
+        # of length (#57012); x-client-request-id mirrors the body's
+        # effective (already-bounded) prompt_cache_key.
+        assert headers["session_id"] == session_id
+        assert headers["x-client-request-id"] == kw["prompt_cache_key"]
+        assert len(headers["x-client-request-id"]) <= 64
 
     def test_codex_cache_scope_headers_normalize_cron_session_id(self, transport):
-        """Cache-routing headers strip the cron per-fire timestamp, same as prompt_cache_key."""
+        """x-client-request-id shares a cache scope across cron re-fires of the
+        same job (cron per-fire timestamp stripped, same as prompt_cache_key),
+        while session_id stays the raw per-fire physical id (#57012)."""
         first_run = transport.build_kwargs(
             model="gpt-5.4",
             messages=[{"role": "user", "content": "Hi"}],
@@ -299,10 +301,11 @@ class TestCodexBuildKwargs:
             is_codex_backend=True,
         )["extra_headers"]
 
-        assert first_run["session_id"] == "cron_job42"
-        assert first_run["session_id"] == second_run["session_id"]
+        assert first_run["session_id"] == "cron_job42_20260801_090000"
+        assert second_run["session_id"] == "cron_job42_20260802_090000"
+        assert first_run["x-client-request-id"].startswith("pck_")
         assert first_run["x-client-request-id"] == second_run["x-client-request-id"]
-        assert first_run["session_id"] != other_job["session_id"]
+        assert first_run["x-client-request-id"] != other_job["x-client-request-id"]
 
 
 

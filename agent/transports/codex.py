@@ -373,7 +373,7 @@ class ResponsesApiTransport(ProviderTransport):
         # content to hash.
         cache_key = _content_cache_key(
             instructions, response_tools, _cache_scope_from_session_id(session_id)
-        ) or session_id
+        ) or _cache_scope_from_session_id(session_id)
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
@@ -455,15 +455,15 @@ class ResponsesApiTransport(ProviderTransport):
         if is_codex_backend:
             # The Codex backend rejects body-level ``extra_headers`` with
             # HTTP 400, but the OpenAI SDK's ``extra_headers`` kwarg maps
-            # to actual HTTP request headers (not body fields).  We need
-            # these headers for cache-scope routing so prompt cache hits
-            # remain high.  Send session_id / x-client-request-id as HTTP
-            # headers while keeping ``prompt_cache_key`` in the body for
-            # standard OpenAI routing as a belt-and-braces fallback.
-            cache_scope_id = _bounded_prompt_cache_key(
+            # to actual HTTP request headers (not body fields).  ``session_id``
+            # carries the raw physical session id — transcript/identity, per
+            # the #57012 contract — while ``x-client-request-id`` mirrors the
+            # body's effective ``prompt_cache_key`` so header and body always
+            # agree on the same routing bucket instead of diverging (#78941).
+            final_cache_key = kwargs.get("prompt_cache_key") or _bounded_prompt_cache_key(
                 _cache_scope_from_session_id(session_id)
             )
-            if cache_scope_id:
+            if session_id or final_cache_key:
                 existing_extra_headers = kwargs.get("extra_headers")
                 merged_extra_headers: Dict[str, str] = {}
                 if isinstance(existing_extra_headers, dict):
@@ -474,8 +474,10 @@ class ResponsesApiTransport(ProviderTransport):
                             if key and value is not None
                         }
                     )
-                merged_extra_headers["session_id"] = cache_scope_id
-                merged_extra_headers["x-client-request-id"] = cache_scope_id
+                if session_id:
+                    merged_extra_headers["session_id"] = str(session_id)
+                if final_cache_key:
+                    merged_extra_headers["x-client-request-id"] = final_cache_key
                 kwargs["extra_headers"] = merged_extra_headers
 
         max_tokens = params.get("max_tokens")
