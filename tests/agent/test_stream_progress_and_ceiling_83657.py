@@ -134,6 +134,42 @@ class TestHardCeiling:
         )
         assert resolve_stream_hard_timeout("nous", "m", 180.0) == 120.0
 
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"providers": {"nous": {"max_call_seconds": 0}}},
+            {
+                "providers": {
+                    "nous": {
+                        "max_call_seconds": 120,
+                        "models": {"m": {"max_call_seconds": 0}},
+                    }
+                }
+            },
+        ],
+        ids=["provider", "model"],
+    )
+    def test_configured_zero_disables_the_ceiling(self, monkeypatch, config):
+        from hermes_cli import timeouts
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly", lambda: config
+        )
+        monkeypatch.setattr(
+            "hermes_cli.timeouts.get_provider_max_call_timeout",
+            lambda provider, model: timeouts._lookup_provider_timeout(
+                provider,
+                model,
+                "max_call_seconds",
+                "max_call_seconds",
+                allow_zero=True,
+            ),
+        )
+        monkeypatch.delenv("HERMES_STREAM_MAX_CALL_SECONDS", raising=False)
+        monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
+
+        assert resolve_stream_hard_timeout("nous", "m", 180.0) == float("inf")
+
     def test_config_lookup_failure_falls_back_to_default(self, monkeypatch):
         def boom(*_a, **_kw):
             raise RuntimeError("config unreadable")
