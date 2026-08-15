@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 
-def _coerce_timeout(raw: object) -> float | None:
+def _coerce_timeout(raw: object, *, allow_zero: bool = False) -> float | None:
     try:
         timeout = float(raw)
     except (TypeError, ValueError):
         return None
-    if timeout <= 0:
+    if timeout < 0 or (timeout == 0 and not allow_zero):
         return None
     return timeout
 
@@ -16,6 +16,8 @@ def _lookup_provider_timeout(
     model: str | None,
     model_key: str,
     provider_key: str,
+    *,
+    allow_zero: bool = False,
 ) -> float | None:
     """Read a timeout from ``providers.<id>`` config, model override first."""
     if not provider_id:
@@ -36,11 +38,15 @@ def _lookup_provider_timeout(
 
     model_config = _get_model_config(provider_config, model)
     if model_config is not None:
-        timeout = _coerce_timeout(model_config.get(model_key))
+        timeout = _coerce_timeout(
+            model_config.get(model_key), allow_zero=allow_zero
+        )
         if timeout is not None:
             return timeout
 
-    return _coerce_timeout(provider_config.get(provider_key))
+    return _coerce_timeout(
+        provider_config.get(provider_key), allow_zero=allow_zero
+    )
 
 
 def get_provider_request_timeout(
@@ -72,7 +78,11 @@ def get_provider_max_call_timeout(
     activity-based guard we have (issue #83657: one 1239s call).
     """
     return _lookup_provider_timeout(
-        provider_id, model, "max_call_seconds", "max_call_seconds"
+        provider_id,
+        model,
+        "max_call_seconds",
+        "max_call_seconds",
+        allow_zero=True,
     )
 
 
