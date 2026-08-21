@@ -69,6 +69,27 @@ def test_wedged_worker_does_not_block_interpreter_exit():
     assert "main-done" in proc.stdout
 
 
+def test_compatible_with_current_interpreters_worker_signature():
+    """_adjust_thread_count must match this interpreter's _worker() signature.
+
+    CPython 3.14 replaced concurrent.futures.thread._worker's
+    (executor_reference, work_queue, initializer, initargs) shape with
+    (executor_reference, ctx, work_queue), sourcing ctx from
+    self._create_worker_context() instead of self._initializer/_initargs
+    (which no longer exist as attributes on 3.14+). A pool hardcoded to the
+    pre-3.14 shape raises AttributeError on the very first submit() on
+    3.14+, and a pool hardcoded to the 3.14+ shape would do the same on
+    3.8-3.13. This exercises whichever branch this interpreter needs and
+    asserts the pool actually completes work end-to-end.
+    """
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    try:
+        result = pool.submit(lambda: 1 + 1).result(timeout=10)
+        assert result == 2
+    finally:
+        pool.shutdown(wait=True)
+
+
 def _repo_root():
     import pathlib
 
