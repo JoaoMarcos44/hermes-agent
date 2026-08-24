@@ -3734,6 +3734,42 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             elif isinstance(tc, dict):
                 tc["function"] = {"name": _EMPTY_NAME_SENTINEL, "arguments": "{}"}
 
+    # --- Drop assistant tool_calls that cannot be paired on the wire ---
+    # A tool call with no usable id cannot receive a role=tool response. Keep
+    # it in the assistant payload and the final request contains an
+    # unbalanced tool batch (N calls, N-1 results), which strict providers
+    # reject. Remove only the unpairable call on this per-call copy; never
+    # mutate the stored trajectory or invent an identifier for a call whose
+    # result cannot be correlated safely.
+    unpairable_tool_calls = 0
+    normalized_unpairable: List[Dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            normalized_unpairable.append(msg)
+            continue
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            normalized_unpairable.append(msg)
+            continue
+        kept_tool_calls = [tc for tc in tool_calls if _tool_call_id_variants(tc)]
+        if len(kept_tool_calls) == len(tool_calls):
+            normalized_unpairable.append(msg)
+            continue
+        unpairable_tool_calls += len(tool_calls) - len(kept_tool_calls)
+        if kept_tool_calls:
+            normalized_unpairable.append({**msg, "tool_calls": kept_tool_calls})
+        else:
+            normalized_unpairable.append(
+                {key: value for key, value in msg.items() if key != "tool_calls"}
+            )
+    if unpairable_tool_calls:
+        messages = normalized_unpairable
+        _ra().logger.warning(
+            "Pre-call sanitizer: dropped %d assistant tool_call(s) without "
+            "a usable pairing id",
+            unpairable_tool_calls,
+        )
+
     surviving_call_ids: set = set()
     for msg in messages:
         if msg.get("role") == "assistant":

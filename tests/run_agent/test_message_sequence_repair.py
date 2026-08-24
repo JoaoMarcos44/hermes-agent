@@ -476,6 +476,40 @@ def test_sanitize_drops_empty_tool_calls_array():
     assert assistant["content"] == "answer"
 
 
+def test_sanitize_drops_tool_call_without_pairing_id():
+    """An unpairable tool call must not reach the API without a result."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "run both tools"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_ok",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_ok", "content": "ok"},
+    ]
+
+    out = sanitize_api_messages(messages)
+    assistant = next(msg for msg in out if msg.get("role") == "assistant")
+    tool_results = [msg for msg in out if msg.get("role") == "tool"]
+
+    assert [tc["id"] for tc in assistant["tool_calls"]] == ["call_ok"]
+    assert [msg["tool_call_id"] for msg in tool_results] == ["call_ok"]
+    assert len(assistant["tool_calls"]) == len(tool_results)
+    assert len(messages[1]["tool_calls"]) == 2
+
+
 def test_repair_drops_stale_empty_tool_calls_on_merged_assistant():
     """repair_message_sequence must drop a stale ``tool_calls: []`` on the
     surviving message of a consecutive-assistant merge (#77921).
