@@ -54,6 +54,149 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
+_WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+
+def _windows_close_handle(handle: Any) -> None:
+    """Close a native Windows handle without importing ctypes on other hosts."""
+    if not _IS_WINDOWS or handle is None:
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle(ctypes.c_void_p(int(handle)))
+    except Exception:
+        logger.debug("Could not close Windows handle", exc_info=True)
+
+
+def _windows_create_kill_on_close_job() -> Optional[Any]:
+    """Create a Windows Job Object that owns the complete worker tree."""
+    if not _IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.POINTER(wintypes.ULONG)),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = (
+            _WINDOWS_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        if not kernel32.SetInformationJobObject(
+            job,
+            _WINDOWS_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            _windows_close_handle(job)
+            return None
+        return job
+    except Exception:
+        logger.debug("Could not create Windows worker Job Object", exc_info=True)
+        return None
+
+
+def _windows_process_handle(proc: subprocess.Popen) -> Optional[int]:
+    """Return a real Popen process handle, excluding test doubles."""
+    raw_handle = getattr(proc, "_handle", None)
+    if not isinstance(raw_handle, int) or raw_handle <= 0:
+        return None
+    return int(raw_handle)
+
+
+def _windows_assign_process_to_job(job: Any, proc: subprocess.Popen) -> bool:
+    """Assign a suspended Popen child to a Job Object before it can fork."""
+    if not _IS_WINDOWS or job is None:
+        return False
+    try:
+        import ctypes
+
+        process_handle = _windows_process_handle(proc)
+        if process_handle is None:
+            return False
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        return bool(
+            kernel32.AssignProcessToJobObject(
+                ctypes.c_void_p(int(job)),
+                ctypes.c_void_p(process_handle),
+            )
+        )
+    except Exception:
+        logger.debug("Could not assign worker to Windows Job Object", exc_info=True)
+        return False
+
+
+def _windows_resume_process(proc: subprocess.Popen) -> bool:
+    """Resume a Popen child created with CREATE_SUSPENDED."""
+    if not _IS_WINDOWS:
+        return True
+    try:
+        import ctypes
+
+        process_handle = _windows_process_handle(proc)
+        if process_handle is None:
+            # A patched Popen test double was not actually created suspended.
+            # Real Windows Popen instances always expose _handle here.
+            return True
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        resume_process = ntdll.NtResumeProcess
+        resume_process.argtypes = [ctypes.c_void_p]
+        resume_process.restype = ctypes.c_long
+        return int(resume_process(ctypes.c_void_p(process_handle))) == 0
+    except Exception:
+        logger.debug("Could not resume suspended Windows worker", exc_info=True)
+        return False
+
+
+def _windows_terminate_job(job: Any) -> bool:
+    """Terminate every process currently assigned to a worker Job Object."""
+    if not _IS_WINDOWS or job is None:
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        return bool(kernel32.TerminateJobObject(ctypes.c_void_p(int(job)), 1))
+    except Exception:
+        logger.debug("Could not terminate Windows worker Job Object", exc_info=True)
+        return False
+
 
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
@@ -385,6 +528,10 @@ class ProcessSession:
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
+    # Windows-only per-session Job Object handle. It is deliberately not
+    # checkpointed: native handles are process-local and closing this handle
+    # is the tree-kill operation for a live session.
+    job_handle: Any = field(default=None, repr=False, compare=False)
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -1094,7 +1241,15 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        windows_job = _windows_create_kill_on_close_job() if _IS_WINDOWS else None
+        if windows_job is not None:
+            # Popen closes the primary thread handle before returning, so the
+            # process must be resumed through NtResumeProcess after the
+            # suspended child is assigned to the Job Object.
+            _popen_flags = windows_hide_flags() | _WINDOWS_CREATE_SUSPENDED
+        else:
+            _popen_flags = windows_hide_flags()
+        _popen_kwargs = {"creationflags": _popen_flags} if _IS_WINDOWS else {}
 
         # Cgroup isolation (#70716): when running in the live, supervised
         # systemd gateway, wrap the worker in its own transient systemd
@@ -1143,23 +1298,62 @@ class ProcessRegistry:
                     _systemd_run_user_scope_available(),
                 )
 
-        proc = subprocess.Popen(
-            spawn_argv,
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=popen_start_new_session,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                spawn_argv,
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=popen_start_new_session,
+                **_popen_kwargs,
+            )
+        except Exception:
+            _windows_close_handle(windows_job)
+            raise
 
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+
+        if windows_job is not None:
+            if _windows_assign_process_to_job(windows_job, proc):
+                if not _windows_resume_process(proc):
+                    _windows_close_handle(windows_job)
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "Could not resume the suspended Windows worker after "
+                        "Job Object assignment"
+                    )
+                session.job_handle = windows_job
+            else:
+                # Nested jobs may be unavailable in a restrictive host
+                # launcher. Resume and retain the taskkill fallback rather
+                # than leaving a suspended process or failing every spawn.
+                logger.warning(
+                    "Could not assign local worker %s to a Windows Job Object; "
+                    "falling back to taskkill tree cleanup",
+                    session.id,
+                )
+                if not _windows_resume_process(proc):
+                    _windows_close_handle(windows_job)
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "Could not resume the suspended Windows worker after "
+                        "Job Object assignment failed"
+                    )
+                _windows_close_handle(windows_job)
 
         try:
             # Start output reader thread
@@ -1182,7 +1376,9 @@ class ProcessRegistry:
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
             try:
-                if session.systemd_unit:
+                if session.job_handle is not None:
+                    self._terminate_session_job(session)
+                elif session.systemd_unit:
                     # The worker runs in its own systemd scope and, since the
                     # #70716 session-isolation fix, its own session.  Stop the
                     # scope (kills every process in the worker cgroup), then
@@ -1552,6 +1748,25 @@ class ProcessRegistry:
             session.completion_reason = "exited"
         self._move_to_finished(session)
 
+    @staticmethod
+    def _take_session_job_handle(session: ProcessSession) -> Any:
+        """Detach a session's native Job Object handle exactly once."""
+        with session._lock:
+            handle = session.job_handle
+            session.job_handle = None
+        return handle
+
+    def _terminate_session_job(self, session: ProcessSession) -> bool:
+        """Kill and close a live per-session Windows Job Object, if present."""
+        handle = self._take_session_job_handle(session)
+        if handle is None:
+            return False
+        _windows_terminate_job(handle)
+        # KILL_ON_JOB_CLOSE is the fallback if TerminateJobObject raced with
+        # a descendant spawn or returned an access error.
+        _windows_close_handle(handle)
+        return True
+
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
 
@@ -1562,6 +1777,11 @@ class ProcessRegistry:
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+        # Closing the Job Object after the logical process exits prevents a
+        # wrapper that reparented a descendant from becoming an invisible
+        # unmanaged worker. Explicit cancellation calls
+        # _terminate_session_job first, so this is idempotent.
+        _windows_close_handle(self._take_session_job_handle(session))
         session._completion_event.set()
         self._write_checkpoint()
 
@@ -2251,9 +2471,11 @@ class ProcessRegistry:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
                 # Local process -- kill the process tree. On Windows this
-                # must be taskkill /T /F; Popen.terminate() only kills the
-                # shell wrapper and leaves Git Bash descendants behind.
-                self._terminate_host_pid(session.process.pid, session.host_start_time)
+                # uses the per-session Job Object when available. Recovered
+                # sessions and hosts that reject nested jobs retain the
+                # taskkill fallback.
+                if not self._terminate_session_job(session):
+                    self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)

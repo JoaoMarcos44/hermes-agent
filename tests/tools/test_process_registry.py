@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -1282,6 +1283,78 @@ class TestTerminateHostPidWindows:
         assert "12345" in captured["args"]
         assert "/T" in captured["args"], "Tree flag required to reach descendants"
         assert "/F" in captured["args"], "Force flag required for headless Chromium"
+
+    @pytest.mark.windows_only
+    def test_spawned_job_kills_reparented_descendants(self, registry, tmp_path):
+        """Cancelling a local session must kill a grandchild after reparenting."""
+        grand = tmp_path / "grand.py"
+        mid = tmp_path / "mid.py"
+        top = tmp_path / "top.py"
+        grand_pid_file = tmp_path / "grand.pid"
+        mid_done = tmp_path / "mid.done"
+        grand.write_text(
+            "import sys,time,os\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii')\n"
+            "time.sleep(120)\n",
+            encoding="utf-8",
+        )
+        mid.write_text(
+            "import subprocess,sys,time\n"
+            "from pathlib import Path\n"
+            "CREATE_NO_WINDOW=0x08000000\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], *sys.argv[2:]], "
+            "creationflags=CREATE_NO_WINDOW, close_fds=True)\n"
+            "time.sleep(0.4)\n"
+            "Path(sys.argv[3]).write_text('done', encoding='ascii')\n",
+            encoding="utf-8",
+        )
+        top.write_text(
+            "import subprocess,sys,time\n"
+            "CREATE_NO_WINDOW=0x08000000\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], *sys.argv[2:]], "
+            "creationflags=CREATE_NO_WINDOW, close_fds=True)\n"
+            "time.sleep(120)\n",
+            encoding="utf-8",
+        )
+
+        command = " ".join(
+            shlex.quote(value)
+            for value in (
+                sys.executable,
+                top.as_posix(),
+                mid.as_posix(),
+                grand.as_posix(),
+                grand_pid_file.as_posix(),
+                mid_done.as_posix(),
+            )
+        )
+        session = registry.spawn_local(command, cwd=str(tmp_path))
+        grand_pid = None
+        try:
+            assert _wait_until(
+                lambda: grand_pid_file.exists() and mid_done.exists(),
+                timeout=10.0,
+            )
+            grand_pid = int(grand_pid_file.read_text(encoding="ascii"))
+            result = registry.kill_process(session.id, source="windows_job_regression")
+            assert result["status"] == "killed"
+
+            import psutil
+
+            assert _wait_until(
+                lambda: not psutil.pid_exists(grand_pid),
+                timeout=5.0,
+            ), "reparented grandchild survived session cancellation"
+        finally:
+            if not session.exited:
+                registry.kill_process(session.id, source="windows_job_cleanup")
+            if grand_pid is not None:
+                subprocess.run(
+                    ["taskkill", "/PID", str(grand_pid), "/F"],
+                    capture_output=True,
+                    timeout=10,
+                )
 
 class TestTerminateHostPidPosix:
     """POSIX branch walks the tree via psutil and SIGTERMs children first."""
