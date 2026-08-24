@@ -6,6 +6,7 @@ after the agent finishes its current task — not silently dropped.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 
@@ -168,6 +169,45 @@ class TestQueueConsumptionAfterCompletion:
         # pending_event (which is what `returned` is), and the slot
         # gets the next-in-line item.
         assert adapter._pending_messages[session_key].text == "Q2"
+
+    def test_recursion_cap_requeues_dequeued_event_before_overflow(self):
+        """The recursion guard must preserve the complete FIFO chain."""
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        state = SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
+        runner._peek_session_state = lambda _key: state
+        runner._session_state = lambda _key: state
+        adapter = _StubAdapter()
+        session_key = "telegram:user:recursion-cap"
+
+        for text in ("Q1", "Q2", "Q3", "Q4"):
+            runner._enqueue_fifo(
+                session_key,
+                MessageEvent(
+                    text=text,
+                    message_type=MessageType.TEXT,
+                    source=MagicMock(),
+                    message_id=f"q-{text}",
+                ),
+                adapter,
+            )
+
+        pending_event = _dequeue_pending_event(adapter, session_key)
+        pending_event = runner._promote_queued_event(
+            session_key,
+            adapter,
+            pending_event,
+            defer_if_recursion_limit=True,
+        )
+        runner._enqueue_fifo(session_key, pending_event, adapter)
+
+        assert adapter._pending_messages[session_key].text == "Q1"
+        assert [event.text for event in state.conversation.queued_events] == [
+            "Q2",
+            "Q3",
+            "Q4",
+        ]
 
 
 class TestBusyInputModeQueueFifo:

@@ -9015,6 +9015,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         adapter: Any,
         pending_event: Optional["MessageEvent"],
+        *,
+        defer_if_recursion_limit: bool = False,
     ) -> Optional["MessageEvent"]:
         """Promote the next overflow item after the slot was drained.
 
@@ -9030,6 +9032,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _q_state = self._peek_session_state(session_key)
         overflow = _q_state.conversation.queued_events if _q_state else None
         if not overflow:
+            return pending_event
+        # The recursion guard below may refuse to process ``pending_event``.
+        # Do not pop the overflow head before that guard: if it is staged in
+        # the slot and the guard then requeues ``pending_event`` through the
+        # single-slot merge helper, the staged event is overwritten and lost.
+        # Leaving the overflow untouched lets the FIFO enqueue path restore
+        # the already-dequeued event ahead of the tail.
+        if defer_if_recursion_limit and pending_event is not None:
             return pending_event
         next_queued = overflow.pop(0)
         if pending_event is None:
@@ -29514,7 +29524,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # occupied for the full FIFO chain, which (a) preserves
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                pending_event = self._promote_queued_event(
+                    session_key,
+                    adapter,
+                    pending_event,
+                    defer_if_recursion_limit=_interrupt_depth >= self._MAX_INTERRUPT_DEPTH,
+                )
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
@@ -29610,7 +29625,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._enqueue_fifo(session_key, pending_event, adapter)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
