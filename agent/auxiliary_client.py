@@ -57,6 +57,7 @@ import re
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
@@ -8378,7 +8379,7 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
 # semaphore caps in-flight calls so retry amplification stays bounded.
 
 _aux_sync_semaphores: Dict[str, Tuple[int, threading.BoundedSemaphore]] = {}
-_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any]] = {}
+_aux_async_semaphores: Dict[str, weakref.WeakKeyDictionary] = {}
 _aux_sem_lock = threading.Lock()
 
 
@@ -8422,12 +8423,24 @@ def _acquire_async_aux_semaphore(task: Optional[str]):
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return None
-    key = (task, id(loop))
     with _aux_sem_lock:
-        entry = _aux_async_semaphores.get(key)
+        # Cache by the loop object, not id(loop): CPython may recycle an
+        # address after a closed loop is collected, which would otherwise
+        # hand a dead loop's semaphore (including its exhausted permits) to a
+        # new loop. Weak keys keep the process-global cache from retaining
+        # every loop forever; closed loops are pruned eagerly because a
+        # semaphore can temporarily retain its loop through pending waiters.
+        task_cache = _aux_async_semaphores.get(task)
+        if task_cache is None:
+            task_cache = weakref.WeakKeyDictionary()
+            _aux_async_semaphores[task] = task_cache
+        for cached_loop in list(task_cache):
+            if cached_loop.is_closed():
+                del task_cache[cached_loop]
+        entry = task_cache.get(loop)
         if entry is None or entry[0] != limit:
             semaphore = asyncio.Semaphore(limit)
-            _aux_async_semaphores[key] = (limit, semaphore)
+            task_cache[loop] = (limit, semaphore)
             return semaphore
         return entry[1]
 
