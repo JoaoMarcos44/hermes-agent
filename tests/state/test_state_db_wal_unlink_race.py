@@ -7,8 +7,8 @@ import pytest
 import hermes_state
 
 
-def test_wal_restoration_reuses_exclusive_repair_connection(tmp_path, monkeypatch):
-    """WAL must be restored before the repair guard releases the live DB."""
+def test_journal_restoration_reuses_exclusive_repair_connection(tmp_path, monkeypatch):
+    """Restore the journal mode through the guarded connection and policy."""
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.execute("CREATE TABLE marker (value TEXT)")
@@ -25,5 +25,8 @@ def test_wal_restoration_reuses_exclusive_repair_connection(tmp_path, monkeypatc
         conn=conn,
     )
 
-    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    expected_mode = (
+        "delete" if hermes_state._is_sqlite_wal_reset_vulnerable(sqlite3.sqlite_version_info) else "wal"
+    )
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == expected_mode
     conn.close()
