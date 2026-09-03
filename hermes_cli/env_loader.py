@@ -490,12 +490,15 @@ def resolve_env_sources(
     token rather than carrying user configuration, and ``load_hermes_dotenv``
     likewise keeps it out of its return value.
 
-    ``hermes_home`` defaults to the same bare ``HERMES_HOME`` lookup
-    ``load_hermes_dotenv`` performs.  Callers reporting to a user should pass
-    ``get_hermes_home()`` instead, so the profile override and the
-    platform-native default are honored.
+    ``hermes_home`` defaults to :func:`hermes_constants.get_process_hermes_home`
+    — the same launch-scope resolution ``load_hermes_dotenv`` performs, so the
+    two cannot disagree about *where* the user ``.env`` lives.  Callers
+    reporting to a user may pass ``get_hermes_home()`` instead, which
+    additionally follows the context-local profile override.
     """
-    home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    from hermes_constants import get_process_hermes_home
+
+    home_path = Path(hermes_home) if hermes_home else get_process_hermes_home()
 
     sources: list[Path] = []
     seen: set[Path] = set()
@@ -535,7 +538,16 @@ def load_hermes_dotenv(
       profile's private secret snapshot without mutating the shared process
       environment; unscoped startup loads retain the normal behavior above.
     """
-    home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    # Resolve the launch-scope home through hermes_constants rather than a
+    # bare ``HERMES_HOME`` lookup.  The bare lookup hard-coded ``~/.hermes`` as
+    # the fallback, so on Windows with ``HERMES_HOME`` unset this read
+    # ``~/.hermes/.env`` while every other caller — ``hermes status``,
+    # ``hermes doctor``, ``get_env_path()`` — resolved the platform-native
+    # ``%LOCALAPPDATA%\hermes``, and the startup load silently used a different
+    # file than the one those commands reported.
+    from hermes_constants import get_process_hermes_home
+
+    home_path = Path(hermes_home) if hermes_home else get_process_hermes_home()
 
     # A multiplex gateway hosts every profile in one process.  While a routed
     # profile-home override is active, copying that profile's .env into
