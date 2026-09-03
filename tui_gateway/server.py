@@ -2389,6 +2389,80 @@ def _transfer_db_to_agent(agent, db) -> bool:
         return False
 
 
+def _move_session_db_ownership(old_agent, new_agent, db) -> None:
+    """Hand a rebuilt agent the ownership its predecessor held over *db*.
+
+    The in-place rebuild sites (``_sync_bot_capabilities``, ``/new``) replace
+    ``session["agent"]`` and drop the old object WITHOUT closing it, and
+    ``_teardown_session`` only closes whichever agent the session holds at the
+    end. So when a DEDICATED profile handle is reused across a rebuild, its
+    single owner has to move with it or the handle — its db/-wal/-shm fds and
+    its background token-writer thread — outlives the gateway session.
+
+    Only real ownership moves: the shared launch handle is never owned (see
+    :func:`_transfer_db_to_agent`, which refuses it), so both agents correctly
+    stay non-owners for a launch-profile session. The old agent is released
+    only once the transfer actually landed, so a refused transfer can never
+    leave the handle ownerless.
+    """
+    if not getattr(old_agent, "_owns_session_db", False):
+        return
+    if _transfer_db_to_agent(new_agent, db):
+        old_agent._owns_session_db = False
+
+
+def _rebuild_agent_session_db(session: dict):
+    """The store an in-place agent rebuild must bind, and whether it is ours.
+
+    A rebuild is the SAME session on the SAME store, so the live agent's handle
+    is the answer whenever there is one — ownership then moves across with
+    :func:`_move_session_db_ownership`. A session whose agent was never built
+    has none: a deferred build can be beaten to the punch by ``/new`` or by the
+    toolset/MCP change handler, and letting ``_make_agent`` default to the
+    launch handle there is the same mis-persist (#101719), so open the profile
+    store the way every build path does. Returns ``(db, owned)``; an owned
+    handle is the caller's until it reaches the built agent.
+
+    The launch profile needs neither: ``_make_agent``'s default IS its store.
+    """
+    if (db := getattr(session.get("agent"), "_session_db", None)) is not None:
+        return db, False
+    if profile_home := session.get("profile_home"):
+        return _open_profile_session_db(profile_home), True
+    return None, False
+
+
+def _require_profile_session_db(sid: str, session_db) -> None:
+    """Refuse to build a profile-scoped agent against the launch ``state.db``.
+
+    ``_make_agent`` defaults ``session_db`` to :func:`_get_db` — a module-level
+    singleton memoized on the LAUNCH profile for the life of the process. Every
+    build path that carries a ``profile_home`` already opens that profile's
+    store (:func:`_open_profile_session_db`) and passes it, but a caller that
+    forgets is not merely degraded: the turn prologue has already bound the
+    session's ``HERMES_HOME``, so ``run_agent._ensure_db_session`` stamps the
+    row with the NAMED profile while writing it through the launch handle. The
+    profile's own store stays empty and the launch store grows a visible
+    duplicate that Desktop can then resume under the wrong persona (#101719).
+
+    Fail closed instead of silently mis-persisting: a raise aborts the build
+    (the deferred builder routes it to ``agent_error``; the capability rebuild
+    keeps the live agent) and leaves the session on its correct store.
+    """
+    if session_db is not None:
+        return
+    with _sessions_lock:
+        registered = _sessions.get(sid)
+    profile_home = (registered or {}).get("profile_home")
+    if not profile_home:
+        return
+    raise RuntimeError(
+        "refusing to build a profile-scoped agent against the launch session "
+        f"store: session {sid} is bound to {profile_home} — pass that "
+        "profile's session_db (see _open_profile_session_db)"
+    )
+
+
 def _open_profile_session_db(profile_home):
     """Open a DEDICATED handle on ``profile_home``'s ``state.db`` — FAIL CLOSED.
 
@@ -6814,17 +6888,29 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     # Capability surface changed — rebuild the agent in place. Same
     # session_id/key, so the DB-backed history and (epoch-refreshed) system
     # prompt carry over; only tool definitions and prompt bytes change.
+    rebuild_db = None
+    owns_db = False
     try:
+        # Same session, therefore the same store. The turn prologue has already
+        # bound this session's profile home, so a rebuild that lets _make_agent
+        # default resolves to the LAUNCH profile's state.db and this bot's turns
+        # land there stamped with this profile's name (#101719).
+        rebuild_db, owns_db = _rebuild_agent_session_db(session)
         tokens = _set_session_context(sid, cwd=_session_cwd(session))
         try:
             new_agent = _make_agent(
                 sid,
                 session["session_key"],
                 session_id=session["session_key"],
+                session_db=rebuild_db,
                 platform_override=_session_source(session),
             )
         finally:
             _clear_session_context(tokens)
+        if owns_db:
+            owns_db = not _transfer_db_to_agent(new_agent, rebuild_db)
+        else:
+            _move_session_db_ownership(agent, new_agent, rebuild_db)
         new_agent._session_title_hint = "Bot Chat"
         session["agent"] = new_agent
         session["config_model_seen"] = _config_model_target()
@@ -6835,6 +6921,13 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
         )
     except Exception as e:
         logger.warning("Bot capability sync failed for %s: %s", sid, e)
+    finally:
+        # A handle we opened and never handed over (the build raised, or the
+        # rebuilt agent is not holding it) has no other owner — the session
+        # keeps running on the live agent's own store.
+        if owns_db and rebuild_db is not None:
+            with contextlib.suppress(Exception):
+                rebuild_db.close()
 
 
 def _sync_agent_model_with_config(sid: str, session: dict) -> None:
@@ -8997,6 +9090,11 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
+    old_agent = session.get("agent")
+    # /new keeps the session — and therefore its store. Bind it explicitly so a
+    # profile-scoped session's fresh conversation is not written to the launch
+    # profile's state.db by _make_agent's default (#101719).
+    rebuild_db, owns_db = _rebuild_agent_session_db(session)
     tokens = _set_session_context(session["session_key"])
     try:
         # /new is a full conversation boundary: session-scoped runtime
@@ -9014,13 +9112,25 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             sid,
             session["session_key"],
             session_id=session["session_key"],
+            session_db=rebuild_db,
             platform_override=_session_source(session),
             context_cwd_is_launch_artifact=(
                 _context_cwd_is_launch_artifact(session)
             ),
         )
+    except BaseException:
+        # Nothing took the handle we opened; the caller keeps its old agent.
+        if owns_db and rebuild_db is not None:
+            with contextlib.suppress(Exception):
+                rebuild_db.close()
+        raise
     finally:
         _clear_session_context(tokens)
+    if owns_db and not _transfer_db_to_agent(new_agent, rebuild_db):
+        with contextlib.suppress(Exception):
+            rebuild_db.close()
+    elif not owns_db:
+        _move_session_db_ownership(old_agent, new_agent, rebuild_db)
     session["agent"] = new_agent
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
@@ -9198,6 +9308,10 @@ def _make_agent(
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
         return synthetic
+
+    # A profile-scoped session must carry its own store into the build; the
+    # session_db default below is the launch profile's handle (#101719).
+    _require_profile_session_db(sid, session_db)
 
     from run_agent import AIAgent
 
