@@ -471,6 +471,27 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def _process_dotenv_load_skipped() -> bool:
+    """Return whether the process-global dotenv load is being skipped.
+
+    A multiplex gateway hosts every profile in one process.  While a routed
+    profile-home override is active, copying that profile's ``.env`` into
+    ``os.environ`` would expose its credentials to sibling turns and every
+    subsequently spawned child, so ``load_hermes_dotenv`` loads nothing and
+    returns an empty list.  An unscoped startup load remains process
+    configuration and takes the normal path.
+
+    The loader and :func:`resolve_env_sources` share this predicate so that
+    *which files count* stays one decision.  Without it the resolver keeps
+    advertising files the loader never reads, and every reporting command
+    built on the resolver inherits that claim (#19).
+    """
+    from agent.secret_scope import is_multiplex_active
+    from hermes_constants import get_hermes_home_override
+
+    return is_multiplex_active() and get_hermes_home_override() is not None
+
+
 def resolve_env_sources(
     *,
     hermes_home: str | os.PathLike | None = None,
@@ -494,7 +515,16 @@ def resolve_env_sources(
     ``load_hermes_dotenv`` performs.  Callers reporting to a user should pass
     ``get_hermes_home()`` instead, so the profile override and the
     platform-native default are honored.
+
+    Returns an empty list while the process-global load is skipped, which is
+    what the loader does in that state — see
+    :func:`_process_dotenv_load_skipped`.  Reporting from the resolver must
+    describe *nothing in effect* there rather than files that were resolved
+    but deliberately never read (#19).
     """
+    if _process_dotenv_load_skipped():
+        return []
+
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
     sources: list[Path] = []
@@ -537,18 +567,12 @@ def load_hermes_dotenv(
     """
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
-    # A multiplex gateway hosts every profile in one process.  While a routed
-    # profile-home override is active, copying that profile's .env into
-    # os.environ would expose its credentials to sibling turns and every
-    # subsequently spawned child.  An unscoped startup load remains process
-    # configuration and must retain the normal loading path.
+    # Why the skip exists — and why resolve_env_sources() must honor the same
+    # predicate — is documented on _process_dotenv_load_skipped().
     # External secret sources still need their normal refresh path, so resolve
     # them against the existing profile-local mapping instead of simply
     # returning before all hydration work.
-    from agent.secret_scope import is_multiplex_active
-    from hermes_constants import get_hermes_home_override
-
-    if is_multiplex_active() and get_hermes_home_override() is not None:
+    if _process_dotenv_load_skipped():
         home_key = str(home_path.resolve())
         if home_key not in _SCOPED_SKIP_LOGGED:
             _SCOPED_SKIP_LOGGED.add(home_key)
