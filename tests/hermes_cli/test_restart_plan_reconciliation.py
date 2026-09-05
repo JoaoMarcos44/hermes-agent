@@ -298,3 +298,78 @@ def test_mixed_fleet_only_the_missed_one_escalates(capsys):
     assert "ghost" in missed_block
     assert "[default]" not in missed_block
     assert "[work]" not in missed_block
+
+
+def _row(profile: str, pid: int, state: str = "current", sha: str = "abc123") -> dict:
+    """A `collect_fleet_versions` row shape."""
+    return {"profile": profile, "pid": pid, "code_sha": sha, "code_version": "1.0", "state": state}
+
+
+def test_fleet_row_on_a_new_pid_credits_a_gateway_no_bookkeeping_names():
+    """#103679: restart bookkeeping is recorded in each platform's OWN vocabulary
+    (launchd label ``ai.hermes.gateway``, an SCM service name, ...). A spelling this
+    module does not know made a verified-healthy restart ``unaccounted`` and failed the
+    whole update closed — right after the matrix printed the new pid as up to date.
+    The probe outranks the name check."""
+    plan = _plan(_rt("default", 400, supervisor="launchd"))
+    outcomes = match_runtime_outcomes(
+        plan, restarted_services=["some.label.this.module.never.heard.of"],
+        relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
+        failed_units=[], fleet_rows=[_row("default", 981)],
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+    assert report_unaccounted_runtimes(outcomes) is False
+
+
+def test_fleet_evidence_needs_a_current_row_on_a_different_pid():
+    """Fail-closed boundaries: the same pid is the SAME process (never restarted), and a
+    stale/down/unknown row is not proof of anything."""
+    def _outcome(rows, pid=400):
+        return match_runtime_outcomes(
+            _plan(_rt("default", pid, supervisor="launchd")), restarted_services=[],
+            relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
+            failed_units=[], fleet_rows=rows,
+        )[0]["outcome"]
+
+    # Same pid: the process the plan inventoried is still the one answering.
+    assert _outcome([_row("default", 400)]) == "unaccounted"
+    # Not provably on the new code.
+    assert _outcome([_row("default", 981, state="stale")]) == "unaccounted"
+    assert _outcome([_row("default", 981, state="down")]) == "unaccounted"
+    assert _outcome([_row("default", 981, state="unknown")]) == "unaccounted"
+    # Another profile's row never credits this one.
+    assert _outcome([_row("work", 981)]) == "unaccounted"
+    # No probe at all keeps today's behavior.
+    assert _outcome(None) == "unaccounted"
+    assert _outcome([]) == "unaccounted"
+    # Junk rows are ignored, not crashed on.
+    assert _outcome(["nonsense", {"profile": "default"}, {"profile": "default", "pid": None, "state": "current"}]) == "unaccounted"
+
+
+def test_fleet_evidence_never_overrides_a_failed_unit_or_credits_serve():
+    """The override applies ONLY where the row would have been ``unaccounted``: a unit the
+    restart phase reported as failed stays ``failed``, and a serve/dashboard is reconciled
+    in its own vocabulary (#100479) — the gateway fleet probe says nothing about it."""
+    failed = match_runtime_outcomes(
+        _plan(_rt("default", 400, supervisor="systemd")), restarted_services=[],
+        relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
+        failed_units=["hermes-gateway.service"], fleet_rows=[_row("default", 981)],
+    )
+    assert failed[0]["outcome"] == "failed"
+
+    mixed = match_runtime_outcomes(
+        _plan(_rt("default", 400, supervisor="launchd"), _serve("default", 900)),
+        restarted_services=[], relaunched_profiles=[], externally_supervised_profiles=[],
+        killed_pids=set(), failed_units=[], fleet_rows=[_row("default", 981)],
+    )
+    assert {o["pid"]: o["outcome"] for o in mixed} == {400: "restarted", 900: "unaccounted"}
+
+
+def test_fleet_evidence_does_not_resurrect_a_deliberately_stopped_gateway():
+    """A gateway the restart phase stopped stays ``stopped``; killed wins over the probe."""
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("default", 400, supervisor="manual")), restarted_services=[],
+        relaunched_profiles=[], externally_supervised_profiles=[], killed_pids={400},
+        failed_units=[], fleet_rows=[_row("default", 981)],
+    )
+    assert outcomes[0]["outcome"] == "stopped"

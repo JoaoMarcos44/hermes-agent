@@ -297,10 +297,41 @@ def _gateway_named_in(r: RuntimeRecord, names: set) -> bool:
     )
 
 
+def _fleet_proves_gateway_replaced(r: RuntimeRecord, fleet_rows) -> bool:
+    """Did the post-restart fleet probe positively observe *r*'s replacement?
+
+    Name matching answers "did some bookkeeping list mention this runtime"; the fleet probe
+    answers the question the tripwire actually exists to ask — "is anything still serving
+    pre-update modules". A row for the same profile in state ``current`` (its stamped
+    ``code_sha`` equals the fresh checkout's HEAD) whose pid differs from the planned
+    pre-update pid is direct proof the old process is gone and its successor is on the new
+    code, whatever the restart phase happened to call the unit. See #103679.
+
+    Deliberately strict, so the blind-spot tripwire stays fail-closed:
+    ``stale``/``down``/``unknown`` rows prove nothing (``unknown`` means the live gateway
+    never stamped an identity, i.e. it predates the stamp and IS old code), a missing pid on
+    either side proves nothing, and an equal pid means the very process the plan inventoried
+    is still the one answering — never restarted.
+    """
+    if r.pid is None:
+        return False
+    for row in fleet_rows or ():
+        if not isinstance(row, dict) or row.get("profile") != r.profile:
+            continue
+        if row.get("state") != "current":
+            continue
+        try:
+            if int(row.get("pid")) != int(r.pid):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def match_runtime_outcomes(
     plan: "UpdatePlan", *, restarted_services: list, relaunched_profiles: list,
     externally_supervised_profiles: list, killed_pids: set, failed_units: list,
-    stale_serve_pids: "set | None" = None,
+    stale_serve_pids: "set | None" = None, fleet_rows: "list | None" = None,
 ) -> list[dict[str, Any]]:
     """Reconcile the plan's runtimes against what the restart phase DID.
 
@@ -315,6 +346,12 @@ def match_runtime_outcomes(
     See #91277.
     They never borrow the gateway's outcome: ``relaunched_profiles`` and ``hermes-gateway*`` name a
     different process that shares the profile, nothing more. See #100479.
+
+    ``fleet_rows`` (the post-restart fleet version matrix) is the evidence fallback for a gateway no
+    bookkeeping list names: restart bookkeeping is recorded in each platform branch's OWN vocabulary
+    (systemd unit, launchd label, SCM service name), so a spelling this module does not know turns a
+    verified-healthy restart into ``unaccounted`` and fails the whole update closed. A ``current`` row
+    on a different pid outranks any name check. See #103679.
     """
     outcomes: list[dict[str, Any]] = []
     try:
@@ -342,7 +379,12 @@ def match_runtime_outcomes(
                 return "stopped"
             if _gateway_named_in(r, failed_set):
                 return "failed"
-            return "restarted" if _gateway_named_in(r, restarted_set) else "unaccounted"
+            if _gateway_named_in(r, restarted_set):
+                return "restarted"
+            # No bookkeeping list names it. Before declaring a silent miss, ask the probe that just
+            # ran: a live gateway for this profile on the fresh checkout's sha, under a pid that is
+            # not the one the plan inventoried, is a verified replacement. See #103679.
+            return "restarted" if _fleet_proves_gateway_replaced(r, fleet_rows) else "unaccounted"
 
         for r in plan.runtimes:
             if isinstance(r, RuntimeRecord):
