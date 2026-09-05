@@ -101,6 +101,8 @@ def _make_recorder_class(captured=None, record_on_run=()):
             self.suppress_status_output = None
             self.session_start = None
             self.session_id = None
+            self.tools = None
+            self.valid_tool_names = set()
             self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
 
         def run_conversation(self, *args, **kwargs):
@@ -273,6 +275,65 @@ def test_review_fork_pins_session_start_and_session_id():
 
 
 
+
+
+def test_unrouted_review_fork_inherits_entire_tool_surface():
+    """Unrouted forks preserve all advertised tools and their name index."""
+    import run_agent
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+    agent.tools = [
+        {"type": "function", "function": {"name": "base_tool"}},
+        {"type": "function", "function": {"name": "fact_store"}},
+        {"type": "function", "function": {"name": "fact_feedback"}},
+        {"type": "function", "function": {"name": "mcp_late_tool"}},
+        {"malformed": True},
+    ]
+    captured = {}
+    _Recorder = _make_recorder_class(
+        captured, record_on_run=("tools", "valid_tool_names")
+    )
+
+    with patch.object(run_agent, "AIAgent", _Recorder), \
+         patch("threading.Thread", _SyncThread):
+        agent._spawn_background_review(
+            messages_snapshot=[], review_memory=True, review_skills=False
+        )
+
+    assert captured["tools"] == agent.tools
+    assert captured["tools"] is not agent.tools
+    assert captured["tools"][0] is not agent.tools[0]
+    assert captured["valid_tool_names"] == {
+        "base_tool", "fact_store", "fact_feedback", "mcp_late_tool"
+    }
+    captured["tools"].append({"type": "function", "function": {"name": "new"}})
+    assert len(captured["tools"]) != len(agent.tools)
+
+
+def test_routed_review_fork_does_not_inherit_tool_surface():
+    """Routed forks use their own model-specific advertised surface."""
+    import run_agent
+    import agent.background_review as bg_review
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+    agent.tools = [{"type": "function", "function": {"name": "parent_tool"}}]
+    captured = {}
+    _Recorder = _make_recorder_class(captured, record_on_run=("tools",))
+    routed_runtime = {
+        "provider": "openrouter", "model": "aux-model", "api_key": "key",
+        "base_url": None, "api_mode": None, "credential_pool": None,
+        "request_overrides": {}, "max_tokens": None, "command": None,
+        "args": [], "routed": True,
+    }
+
+    with patch.object(run_agent, "AIAgent", _Recorder), \
+         patch.object(bg_review, "_resolve_review_runtime", return_value=routed_runtime), \
+         patch("threading.Thread", _SyncThread):
+        agent._spawn_background_review(
+            messages_snapshot=[], review_memory=True, review_skills=False
+        )
+
+    assert captured["tools"] is None
 
 
 def test_routed_review_fork_does_not_inherit_reasoning_config():
