@@ -75,6 +75,7 @@ class TestMalformedKey:
 class TestStringTypedGuardPreserved:
     def test_enum_off_stays_string(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        cfg.set_config_value("approvals.mode", "off")
+        with cfg._operator_approval_config_write():
+            cfg.set_config_value("approvals.mode", "off")
         v = _read(tmp_path, "approvals", "mode")
         assert v == "off" and isinstance(v, str)  # not bool False

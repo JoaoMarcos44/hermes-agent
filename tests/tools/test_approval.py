@@ -106,7 +106,12 @@ class TestDetectDangerousRm:
         real_temp = tmp_path / "real-temp"
         real_temp.mkdir()
         linked_temp = tmp_path / "linked-temp"
-        linked_temp.symlink_to(real_temp, target_is_directory=True)
+        try:
+            linked_temp.symlink_to(real_temp, target_is_directory=True)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege is unavailable for the canonical-path test")
+            raise
         basename = "hermes-verify-example.py"
 
         with mock_patch("tempfile.gettempdir", return_value=str(linked_temp)):

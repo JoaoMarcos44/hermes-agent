@@ -59,6 +59,10 @@ The full set of keys:
 | **off** | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts. |
 
 :::warning
+The approval policy is operator-only security state. `hermes config set` and `hermes config unset` refuse `approvals.*`, `security.*`, `command_allowlist`, and persistent `yolo` policy keys, including `approvals.single_query_mode`. Use the dedicated `/approvals` command for the persistent approval mode, or make other policy changes from an operator-controlled configuration session. A dangerous-command approval for a policy mutation is one-shot and is never saved as a reusable allowlist entry.
+:::
+
+:::warning
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
 :::
 

@@ -44,11 +44,12 @@ def run_approval_mode_command(requested_mode: Optional[str]) -> ApprovalModeResu
     # policy through stderr + SystemExit, and the fail-closed write guard raises RuntimeError on an
     # unparseable config.yaml; capture both for slash-command output instead of terminating the
     # interactive worker.
-    from hermes_cli.config import set_config_value
+    from hermes_cli.config import _operator_approval_config_write, set_config_value
     output = StringIO()
     try:
         with redirect_stdout(output), redirect_stderr(output):
-            set_config_value("approvals.mode", requested)
+            with _operator_approval_config_write():
+                set_config_value("approvals.mode", requested)
     except SystemExit:
         detail = output.getvalue().strip() or "Approval mode is managed and cannot be changed."
         return ApprovalModeResult(False, current, False, detail)

@@ -877,10 +877,11 @@ class GatewaySlashCommandsMixin(
         from hermes_cli.approval_mode import run_approval_mode_command
         requested = event.get_command_args().strip() or None
         # This mutates profile-wide security policy. The central slash gate can allow selected
-        # commands to non-admin users, so enforce admin again at this side-effect boundary.
-        # Unconfigured policies remain unrestricted.
+        # commands to non-admin users, so enforce admin again at this side-effect boundary. An
+        # unconfigured policy is not an operator identity, so it cannot authorize a persistent
+        # security-policy change.
         policy = policy_for_source(self.config, event.source)
-        if requested and not policy.is_admin(event.source.user_id):
+        if requested and (not policy.enabled or not policy.is_admin(event.source.user_id)):
             return "Only gateway admins can change the persistent approval mode."
         # Approval checks load config dynamically; do not evict the cached agent or alter its
         # system prompt/tool schema (prompt-cache prefix is sacred).

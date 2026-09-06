@@ -1,6 +1,8 @@
 """Configuration management for Hermes Agent: config.yaml / .env loading, saving,
 validation, migration, and the ``hermes config`` command."""
 
+import contextlib
+import contextvars
 import copy
 import difflib
 import json
@@ -33,6 +35,22 @@ from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F
 from utils import atomic_replace, atomic_yaml_write, fast_safe_load
 
 logger = logging.getLogger(__name__)
+
+# Only the user-mediated approval-mode command may write the security policy through this module.
+# A ContextVar keeps the authorization scoped to one call and cannot be inherited by a separate
+# agent turn in the shared gateway executor.
+_operator_approval_write: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "operator_approval_write", default=False)
+
+
+@contextlib.contextmanager
+def _operator_approval_config_write():
+    """Authorize the dedicated, user-mediated ``/approvals`` write path."""
+    token = _operator_approval_write.set(True)
+    try:
+        yield
+    finally:
+        _operator_approval_write.reset(token)
 
 # (config_path, mtime_ns, size) tuples already warned about, so concurrent CLI/gateway
 # loads of a broken config.yaml don't spam stderr. A changed file (new mtime) warns again.
@@ -3392,6 +3410,28 @@ def _exit_if_key_managed(key: str, action: str) -> None:
         sys.exit(1)
 
 
+_SECURITY_CONFIG_KEY_PREFIXES = ("approvals.", "security.", "command_allowlist.")
+
+
+def _is_security_config_key(key: str) -> bool:
+    """Return whether ``key`` changes an approval/security policy or its allowlist."""
+    normalized = str(key or "").strip().lower()
+    return (
+        normalized in {"approvals", "security", "command_allowlist", "yolo"}
+        or any(normalized.startswith(prefix) for prefix in _SECURITY_CONFIG_KEY_PREFIXES)
+    )
+
+
+def _refuse_security_config_write(key: str, action: str) -> None:
+    """Reject agent-reachable writes to policy keys without exposing a bypass recipe."""
+    print(
+        f"Cannot {action} '{key}': this key controls Hermes security policy and is operator-only. "
+        "Use an operator-controlled session to change it.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _guard_section_overwrite(key: str, value: Any, user_config: Dict[str, Any], force: bool) -> str:
     """Refuse (or with ``force`` allow) a single-segment key overwriting a mapping with a scalar.
     Bare ``model`` is a documented shorthand — redirected to ``model.default`` so siblings survive.
@@ -3479,6 +3519,8 @@ def set_config_value(key: str, value: str, force: bool = False):
             f"✗ Invalid config key: {key!r} — contains an empty path segment "
             "(leading, trailing, or doubled '.').")
     _exit_if_key_managed(key, "set")
+    if _is_security_config_key(key) and not _operator_approval_write.get():
+        _refuse_security_config_write(key, "set")
     if _is_env_config_key(key):
         # Unified lifecycle: also rotates any config.yaml mirror of the old value.
         from hermes_cli.credential_lifecycle import save_provider_env_credential
@@ -3570,6 +3612,8 @@ def unset_config_value(key: str):
     if is_managed():
         managed_error("unset configuration values")
         return
+    if _is_security_config_key(key) and not _operator_approval_write.get():
+        _refuse_security_config_write(key, "unset")
     _exit_if_key_managed(key, "unset")
 
     if _is_env_config_key(key):

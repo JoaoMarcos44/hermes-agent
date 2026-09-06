@@ -403,7 +403,10 @@ class TestStringTypedConfigValues:
     @pytest.mark.parametrize("value", ["off", "on", "yes", "no", "true", "false", "01"])
     def test_string_typed_values_are_not_coerced(self, _isolated_hermes_home, value):
         """Values stay strings when DEFAULT_CONFIG declares the leaf as a string."""
-        set_config_value("approvals.mode", value)
+        from hermes_cli.config import _operator_approval_config_write
+
+        with _operator_approval_config_write():
+            set_config_value("approvals.mode", value)
 
         import yaml
         saved = yaml.safe_load(_read_config(_isolated_hermes_home))
@@ -412,7 +415,7 @@ class TestStringTypedConfigValues:
 
     @pytest.mark.parametrize("key, value, expected", [
         ("terminal.persistent_shell", "off", False),
-        ("approvals.timeout", "30", 30),
+        ("agent.run_budget_seconds", "30", 30),
     ])
     def test_non_string_defaults_keep_existing_coercion(
         self, _isolated_hermes_home, key, value, expected

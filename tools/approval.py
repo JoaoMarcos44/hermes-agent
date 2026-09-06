@@ -28,7 +28,8 @@ from tools.approval_context import (
     _tirith_fail_open, get_current_session_key,
 )
 from tools.approval_detection import (
-    _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
+    _SECURITY_CONFIG_APPROVAL_KEY, _approval_key_aliases, _check_sudo_stdin_guard,
+    detect_dangerous_command, detect_hardline_command,
 )
 from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
@@ -52,6 +53,11 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
+
+# A human may approve one security-policy mutation, but that decision must never become a
+# session/permanent allowlist entry. Otherwise the first approval would authorize the agent to
+# rewrite the policy on every later turn.
+_ONE_SHOT_APPROVAL_KEYS = frozenset({_SECURITY_CONFIG_APPROVAL_KEY})
 
 # --- Consecutive-denial circuit breaker for smart approvals ---------------------------------------------------------
 # Each retry of a smart-denied command burns another guardian LLM call. After ``approvals.denial_breaker_threshold``
@@ -211,6 +217,8 @@ def submit_pending(session_key: str, approval: dict):
 
 def approve_session(session_key: str, pattern_key: str):
     """Approve a pattern for this session only."""
+    if pattern_key in _ONE_SHOT_APPROVAL_KEYS:
+        return
     with _lock:
         _session_approved.setdefault(session_key, set()).add(pattern_key)
 
@@ -291,6 +299,8 @@ def _yolo_active() -> bool:
 def is_approved(session_key: str, pattern_key: str) -> bool:
     """Session-scoped or permanent approval. Accepts the canonical key and the legacy
     regex-derived key so existing command_allowlist entries survive key migrations."""
+    if pattern_key in _ONE_SHOT_APPROVAL_KEYS:
+        return False
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         approved = _permanent_approved | _session_approved.get(session_key, set())
@@ -299,6 +309,8 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
 
 def approve_permanent(pattern_key: str):
     """Add a pattern to the permanent allowlist."""
+    if pattern_key in _ONE_SHOT_APPROVAL_KEYS:
+        return
     with _lock:
         _permanent_approved.add(pattern_key)
 
@@ -306,14 +318,18 @@ def approve_permanent(pattern_key: str):
 def load_permanent(patterns: set):
     """Bulk-load permanent allowlist entries from config."""
     with _lock:
-        _permanent_approved.update(patterns)
+        _permanent_approved.update(
+            pattern for pattern in patterns if pattern not in _ONE_SHOT_APPROVAL_KEYS
+        )
 
 
 def _persist_choice(session_key: str, choice: str, warnings: list[tuple]) -> None:
     """Persist a human ``session``/``always`` choice for each ``(key, _, is_tirith)``. Tirith
-    findings are session-max by design (no broad permanent allowlisting of content-level
-    findings), so ``always`` downgrades them to session. ``once`` persists nothing."""
+    findings), so ``always`` downgrades them to session. ``once`` persists nothing. Security-policy
+    mutations are always one-shot and are never stored."""
     for key, _, is_tirith in warnings:
+        if key in _ONE_SHOT_APPROVAL_KEYS:
+            continue
         if choice not in ("session", "always"):
             continue
         approve_session(session_key, key)
@@ -395,7 +411,7 @@ def _gateway_notify_cb(session_key: str):
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], body: str | None,
-                    smart_denied: bool) -> dict:
+                    smart_denied: bool, one_shot_only: bool = False) -> dict:
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
     ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
@@ -405,6 +421,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     pending["description"] = description
     if smart_denied:
         pending.update(smart_denied=True, allow_permanent=False)
+    if one_shot_only:
+        pending.update(allow_session=False, allow_permanent=False, choices=["once", "deny"])
     submit_pending(session_key, pending)
     if not spec.pending_keys:
         return {
@@ -426,6 +444,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     }
     if smart_denied:
         result.update(smart_denied=True, allow_permanent=False)
+    if one_shot_only:
+        result.update(allow_session=False, allow_permanent=False, choices=["once", "deny"])
     return result
 
 
@@ -445,11 +465,17 @@ class _Unattended:
         return getattr(approval_context, f"_get_{self.name}_approval_mode")()
 
     def block_message(self, subject: str, *, noun: str, advice: str) -> str:
+        if self.name == "single_query":
+            return (f"BLOCKED: {subject} but {self.clause}. {advice} "
+                    f"An operator must authorize {noun} from an operator-controlled session.")
         return (f"BLOCKED: {subject} but {self.clause}. {advice} To allow {noun} {self.scope}, set "
                 f"approvals.{self.cfg_key}: approve in config.yaml.")
 
     @property
     def exec_tail(self) -> str:
+        if self.name == "single_query":
+            return (f"{self.clause[0].upper()}{self.clause[1:]}. Use normal tools "
+                    "instead, or have an operator authorize this action from an operator-controlled session.")
         return (f"{self.clause[0].upper()}{self.clause[1:]}. Use normal tools "
                 f"instead, or set approvals.{self.cfg_key}: approve only if {self.trust}.")
 
@@ -662,7 +688,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = permanent_capable and not smart_denied
+    one_shot_only = any(key in _ONE_SHOT_APPROVAL_KEYS for key, _, _ in warnings)
+    allow_session = not smart_denied and not one_shot_only
+    allow_permanent = permanent_capable and allow_session
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -686,7 +714,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
             session_key=session_key, surface="gateway" if (is_gateway or is_ask) else "cli",
-            allow_session=not smart_denied, allow_permanent=allow_permanent,
+            allow_session=allow_session, allow_permanent=allow_permanent,
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
         if denied is not None:
@@ -712,11 +740,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
             }
             if smart_denied:
                 data["smart_denied"] = True
+            if one_shot_only:
+                data["choices"] = ["once", "deny"]
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
@@ -746,6 +776,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return _pending_result(
                 spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
                 pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                one_shot_only=one_shot_only,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -756,8 +787,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
-    choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        prompt_command, prompt_description, allow_permanent=allow_permanent,
+        allow_session=allow_session, smart_denied=smart_denied or one_shot_only,
+        approval_callback=approval_callback)
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")

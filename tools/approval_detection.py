@@ -26,6 +26,13 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
+# ``config set`` is the supported write front door for the same policy file. Keep this key
+# pattern narrow so ordinary model/display changes do not acquire an approval prompt.
+_HERMES_SECURITY_CONFIG_KEY = (
+    r"(?:approvals(?:\.[^\s\"'`]+)?|security(?:\.[^\s\"'`]+)?|"
+    r"command_allowlist(?:\.[^\s\"'`]+)?|yolo)"
+)
+_SECURITY_CONFIG_APPROVAL_KEY = "modify Hermes security policy via config"
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
@@ -305,6 +312,14 @@ DANGEROUS_PATTERNS = [
     # between `hermes` and `gateway` (`hermes -p ade gateway restart`) are allowed so a profile flag can't slip past.
     (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
+    # config.yaml contains the approval, security, and command-allowlist policy. The writer also
+    # refuses these keys, but this detector ensures an agent gets the same operator gate before it
+    # reaches any CLI or terminal entrypoint. The pattern key is deliberately one-shot in approval.py.
+    (rf"\bhermes\s+(?:-{{1,2}}\S+(?:\s+\S+)?\s+)*config\s+(?:set|unset)\s+(?:--force\s+)?[\"']?{_HERMES_SECURITY_CONFIG_KEY}[\"']?(?:\s|$)",
+     "modify Hermes security policy via config"),
+    # `python -m hermes_cli.main` is an alternate supported entrypoint to the same config writer.
+    (rf"\bpython(?:3(?:\.\d+)?)?\s+-m\s+hermes_cli\.main\s+(?:-{{1,2}}\S+(?:\s+\S+)?\s+)*config\s+(?:set|unset)\s+(?:--force\s+)?[\"']?{_HERMES_SECURITY_CONFIG_KEY}[\"']?(?:\s|$)",
+     _SECURITY_CONFIG_APPROVAL_KEY),
     # Docker/Podman daemon redirect — global flags or env that point the CLI at a DIFFERENT (often remote) daemon:
     # `docker -H ssh://prod stop app` looks local but operates on remote infra, so any redirect requires approval
     # regardless of subcommand. The flag must be in global position (before the subcommand) and -H/--host/--context
@@ -1117,11 +1132,17 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
         return False
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    # Normalize both sides before comparing. ``tempfile.gettempdir`` is normally native, but
+    # callers/tests may provide a POSIX spelling on Windows; comparing the raw operand to a
+    # native ``realpath`` incorrectly reclassifies safe verification cleanup as root deletion.
+    temp_dir = os.path.realpath(os.path.abspath(tempfile.gettempdir()))
     basename = os.path.basename(operand)
+    if ".." in re.split(r"[\\/]+", operand):
+        return False
+    operand_abs = os.path.abspath(operand)
     return (
-        operand == os.path.join(temp_dir, basename)
-        and os.path.dirname(os.path.realpath(operand)) == temp_dir
+        os.path.normcase(operand_abs) == os.path.normcase(os.path.join(temp_dir, basename))
+        and os.path.normcase(os.path.dirname(os.path.realpath(operand_abs))) == os.path.normcase(temp_dir)
         and re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
     )
 

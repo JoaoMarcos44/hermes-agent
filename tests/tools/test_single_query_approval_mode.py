@@ -144,7 +144,7 @@ class TestSingleQueryDenyMode:
             result = check_dangerous_command("rm -rf /tmp/stuff", "local")
             assert not result["approved"]
             assert "BLOCKED" in result["message"]
-            assert "single_query_mode" in result["message"]
+            assert "operator-controlled session" in result["message"]
 
     def test_safe_command_allowed_in_single_query_deny_mode(self, monkeypatch):
         """Non-dangerous commands still work even with single_query_mode=deny."""
@@ -207,7 +207,7 @@ class TestSingleQueryDenyModeAllGuards:
             result = check_all_command_guards("rm -rf /tmp/stuff", "local")
             assert not result["approved"]
             assert "BLOCKED" in result["message"]
-            assert "single_query_mode" in result["message"]
+            assert "operator-controlled session" in result["message"]
 
     def test_safe_command_allowed_in_combined_guard(self, monkeypatch):
         monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
@@ -282,7 +282,7 @@ class TestSingleQueryExecuteCode:
             result = approval_module.check_execute_code_guard("import os", "local")
             assert not result["approved"]
             assert result["outcome"] == "blocked"
-            assert "single_query_mode" in result["message"]
+            assert "operator-controlled session" in result["message"]
 
     def test_execute_code_allowed_in_single_query_approve(self, monkeypatch):
         monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")

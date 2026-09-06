@@ -8263,6 +8263,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}))
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     resp_on = server.handle_request(
         {
@@ -8468,6 +8469,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}))
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     resp = server.handle_request(
         {

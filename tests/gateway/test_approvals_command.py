@@ -57,3 +57,28 @@ async def test_gateway_rejects_non_admin_persistent_approval_change():
     run.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_gateway_rejects_change_without_enabled_admin_policy():
+    """A disabled gateway policy is not an operator identity for a persistent write."""
+    runner = _runner()
+
+    with patch("hermes_cli.approval_mode.run_approval_mode_command") as run:
+        output = await runner._handle_approvals_command(_event("/approvals off"))
+
+    assert "admin" in output.lower()
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_keeps_approval_mode_query_available_without_policy():
+    """Reading the current mode remains available when no admin policy is configured."""
+    runner = _runner()
+
+    with patch("hermes_cli.approval_mode.run_approval_mode_command") as run:
+        run.return_value = SimpleNamespace(message="Approval mode: manual")
+        output = await runner._handle_approvals_command(_event())
+
+    assert output == "Approval mode: manual"
+    run.assert_called_once_with(None)
+
+
