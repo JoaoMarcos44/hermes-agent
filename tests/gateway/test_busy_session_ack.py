@@ -212,7 +212,10 @@ class TestBusySessionAck:
             await runner._handle_active_session_busy_message(event, sk)
 
         # VERIFY: Agent was steered, NOT interrupted
-        agent.steer.assert_called_once_with("also check the tests")
+        agent.steer.assert_called_once()
+        injected = agent.steer.call_args.args[0]
+        assert injected.endswith("also check the tests")
+        assert "delivery_target: telegram:123" in injected
         agent.interrupt.assert_not_called()
 
         # VERIFY: No queueing — successful steer must NOT replay as next turn
@@ -224,6 +227,26 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         assert "Steered" in content or "steer" in content.lower()
         assert "Interrupting" not in content
+
+    def test_priority_steer_injection_carries_the_requesting_chat_origin(self):
+        """The priority busy path must preserve the same origin contract."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        event = _make_event(text="also check the tests")
+        sk = build_session_key(event.source)
+        running_agent = MagicMock()
+        running_agent.steer.return_value = True
+
+        GatewayRunner._hm_busy_steer(runner, event, running_agent, sk)
+
+        injected = running_agent.steer.call_args.args[0]
+        assert "[STEER ORIGIN" in injected
+        assert "delivery_target: telegram:123" in injected
+        assert "chat_id: 123" in injected
+        assert "user_id: user1" in injected
+        assert "message_id: msg1" in injected
+        assert injected.endswith("also check the tests")
 
     @pytest.mark.asyncio
     async def test_steer_mode_transcribes_voice_before_injection(self, monkeypatch):
@@ -256,7 +279,10 @@ class TestBusySessionAck:
         runner._enrich_message_with_transcription.assert_awaited_once_with(
             "", ["/tmp/follow-up.ogg"]
         )
-        agent.steer.assert_called_once_with('"yönü teknik mimariye çevir"')
+        agent.steer.assert_called_once()
+        injected = agent.steer.call_args.args[0]
+        assert injected.endswith('"yönü teknik mimariye çevir"')
+        assert "delivery_target: telegram:123" in injected
         agent.interrupt.assert_not_called()
         assert sk not in adapter._pending_messages
         content = adapter._send_with_retry.call_args.kwargs["content"]

@@ -335,6 +335,50 @@ class GatewayBusySessionMixin:
         return (enriched_text or text).strip() if successful_transcripts else text
 
     @staticmethod
+    def _steer_origin_for_event(event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Keep only concrete, non-payload routing fields from the inbound event."""
+        source = getattr(event, "source", None)
+        if source is None:
+            return None
+        platform_value = getattr(source, "platform", None)
+        platform = getattr(platform_value, "value", platform_value)
+        source_user_id = getattr(source, "user_id", None)
+        event_user_id = getattr(event, "user_id", None)
+        source_message_id = getattr(source, "message_id", None)
+        event_message_id = getattr(event, "message_id", None)
+        origin = {
+            "platform": platform,
+            "chat_id": getattr(source, "chat_id", None),
+            "thread_id": getattr(source, "thread_id", None),
+            "chat_type": getattr(source, "chat_type", None),
+            "user_id": (
+                source_user_id
+                if source_user_id not in (None, "")
+                else event_user_id
+            ),
+            "message_id": (
+                event_message_id
+                if event_message_id not in (None, "")
+                else source_message_id
+            ),
+            "scope_id": getattr(source, "scope_id", None),
+            "profile": getattr(source, "profile", None),
+        }
+        return {key: value for key, value in origin.items() if value not in (None, "")}
+
+    @staticmethod
+    def _steer_text_with_origin(text: str, event: MessageEvent) -> str:
+        """Prefix one steer payload with its event's routing metadata."""
+        if not text or not text.strip():
+            return text
+        from agent.prompt_builder import format_steer_origin
+
+        origin_block = format_steer_origin(
+            GatewayBusySessionMixin._steer_origin_for_event(event)
+        )
+        return f"{origin_block}\n\n{text}" if origin_block else text
+
+    @staticmethod
     def _busy_reply_to(event: MessageEvent, reply_anchor):
         # Telegram DM topics anchor on the thread; other Telegram threads send unanchored.
         return (
@@ -460,7 +504,9 @@ class GatewayBusySessionMixin:
                 len(self._pending_event_audio_paths(event)) == len(_steer_media_urls)
             )
             if steer_text and (plain_text or _steer_all_voice) and agent_live and hasattr(running_agent, "steer"):
-                steered = self._try_agent_verb(running_agent, "steer", steer_text, session_key)
+                steered = self._try_agent_verb(
+                    running_agent, "steer", steer_text, session_key, event=event
+                )
             if not steered:
                 effective_mode = "queue"
         elif (
@@ -469,7 +515,7 @@ class GatewayBusySessionMixin:
             and hasattr(running_agent, "redirect")
         ):
             redirected = self._try_agent_verb(
-                running_agent, "redirect", (event.text or "").strip(), session_key
+                running_agent, "redirect", (event.text or "").strip(), session_key, event=event
             )
         return self._BusySteerOutcome(
             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
@@ -482,10 +528,13 @@ class GatewayBusySessionMixin:
         return "queue"
 
     @staticmethod
-    def _try_agent_verb(running_agent, verb: str, text: str, session_key: str) -> bool:
+    def _try_agent_verb(
+        running_agent, verb: str, text: str, session_key: str, *, event: Optional[MessageEvent] = None
+    ) -> bool:
         """Call ``running_agent.<verb>(text)`` (steer/redirect); False + warning on failure."""
         try:
-            return bool(getattr(running_agent, verb)(text))
+            call_text = GatewayBusySessionMixin._steer_text_with_origin(text, event) if event else text
+            return bool(getattr(running_agent, verb)(call_text))
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -875,7 +924,7 @@ class GatewayBusySessionMixin:
         if not running_agent or not hasattr(running_agent, "steer"):
             return _queue_fallback("No active agent — /steer queued for the next turn.")
         try:
-            accepted = running_agent.steer(steer_text)
+            accepted = running_agent.steer(self._steer_text_with_origin(steer_text, event))
         except Exception as exc:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return f"⚠️ Steer failed: {exc}"
