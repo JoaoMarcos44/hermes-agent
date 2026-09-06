@@ -112,6 +112,28 @@ candidates are denied to remote connections.
 - [#89013](https://github.com/NousResearch/hermes-agent/pull/89013) — closed in
   favor of #90546; confirms the older gated-download auth history.
 
+## Verification receipt
+
+- Real local-server reproduction: no session header and a serialized `null`
+  header returned HTTP 401; the real test token and bearer form returned HTTP
+  200.
+- Electron regression set: 4 files, 60 tests passed.
+- Local-preview regression set: 4 files, 29 tests passed.
+- `npm run typecheck`: passed for renderer, Electron, and E2E projects.
+- Targeted ESLint and Prettier checks: passed.
+- Canonical `scripts/run_tests.sh` against `tests/hermes_cli/test_web_server_fs.py`:
+  5 tests passed.
+- Isolated `graphify update apps/desktop --no-cluster`: completed with exit 0;
+  the worktree graph contains 17,061 nodes and 58,392 edges. The post-update
+  query shows `gatedFileAuth()` calling both local-token resolution and the
+  existing OAuth decision, and the preview query shows the local filesystem
+  route.
+- The full local `npm run check` reached the UI suite but was not green under
+  the installed Node v22.16.0 runtime: 705 of 711 UI files passed and 6
+  unrelated files produced 9 failures plus worker timeouts. The changed
+  Desktop tests and the targeted UI tests pass; CI's declared Node environment
+  remains authoritative for the complete suite.
+
 ## Security boundary
 
 Local fallback credentials are never selected from a URL alone. They require an
