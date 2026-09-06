@@ -75,7 +75,7 @@ Single-query and unattended denial messages no longer tell the agent to set `app
 
 ## Related work and duplication check
 
-Open related work was searched by issue number and mechanism. PR #81108 contains an earlier candidate for the same security-policy writer boundary, and its review history was read before implementing this branch. This branch is a current-main replacement rather than a blind duplicate: it uses the current refactored config/TUI layout, keeps authorization scoped instead of exposing a boolean writer override, routes the TUI raw writer through the canonical path, and adds the exact `single_query_mode` regression plus one-shot behavior checks.
+Open related work was searched by issue number and mechanism. The issue thread links #59293 and #81101, and identifies #59337 as an earlier open fix candidate. PR #81108 is a later candidate for the same security-policy writer boundary; its review history was also read before implementing this branch. The earlier detector-only approach would still make a policy mutation an approval-prompt operation rather than an operator-only write. This branch is a current-main replacement rather than a blind duplicate: it uses the current refactored config/TUI layout, keeps authorization scoped instead of exposing a boolean writer override, routes the TUI raw writer through the canonical path, and adds the exact `single_query_mode` regression plus one-shot behavior checks.
 
 The existing candidate should not be merged independently of this current-main implementation if its branch does not contain these current-tree protections. The PR body links the relationship explicitly so maintainers can supersede or consolidate it without losing the original contributor's credit.
 
