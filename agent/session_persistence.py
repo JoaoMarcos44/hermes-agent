@@ -447,7 +447,18 @@ class SessionPersistenceMixin:
         try:
             # Mirror the SQLite flush: scaffolding is never durable transcript content.
             cleaned = [_session_log_entry(self, msg) for msg in messages if not _is_ephemeral_scaffolding(msg)]
-            if _existing_log_is_larger(log_file, len(cleaned)):
+            # A resumed agent may carry only a partial in-memory prefix; preserve the larger
+            # snapshot in that case. An intentional in-place compression boundary is the
+            # opposite transition: the active transcript was durably rewritten and the opt-in
+            # JSON snapshot must follow that boundary instead of retaining a stale active view.
+            _in_place_compaction_committed = (
+                getattr(self, "_last_compaction_in_place", False) is True
+                or getattr(self, "_last_compression_attempt_in_place", False) is True
+            )
+            if (
+                _existing_log_is_larger(log_file, len(cleaned))
+                and not _in_place_compaction_committed
+            ):
                 return
             entry = {
                 "session_id": self.session_id, "model": self.model, "base_url": self.base_url, "platform": self.platform,
