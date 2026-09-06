@@ -824,7 +824,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     import httpx as _httpx
     from openai import APIConnectionError as _APIConnectionError
     from agent import relay_llm
-    transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError)
+    transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries, model = 1, api_kwargs.get("model")
     # Accumulate streamed text so callers / compat shims can read it.
@@ -936,9 +936,26 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
+                # A raw ReadError before the stream handle exists is the unwrapped sibling of
+                # APIConnectionError <- ReadError (#103673). Retry only that pre-stream shape:
+                # once the stream opened, an inference may already be billed and replaying it
+                # could duplicate output. The generic chat-completions path has its own
+                # post-delivery gating; this Codex path must keep the single-writer token fence.
+                if isinstance(exc, _httpx.ReadError) and writer_token["value"] is not None:
+                    _log_failure(exc)
+                    raise
                 if attempt >= max_stream_retries:
                     _log_failure(exc)
                     raise
+                if (
+                    isinstance(exc, _httpx.ReadError)
+                    and event_stream is None
+                    and client is not None
+                    and callable(getattr(agent, "_abort_request_openai_client", None))
+                ):
+                    agent._abort_request_openai_client(
+                        active_client, reason="codex_prestream_transport_retry"
+                    )
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s" if event_stream is None
                     else "Codex Responses stream transport failed mid-iteration (attempt %s/%s); retrying. %s error=%s",
