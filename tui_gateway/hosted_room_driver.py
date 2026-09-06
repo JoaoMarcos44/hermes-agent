@@ -9,6 +9,7 @@ sessions reuse ``Group: <room_id>`` so a local-to-hosted migration keeps one tra
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 import uuid
@@ -148,6 +149,10 @@ class HostedRoomRuntime:
         self._blocked_rooms: set[str] = set()
         self._status_lock, self._current_tasks = threading.Lock(), {}
         self._room_schedule_cursor, self._cycles = 0, 0
+        # The idle room poll opens and closes the shared state.db every cycle. A
+        # content-touched keeper keeps SQLite from treating one of those closes
+        # as the last WAL participant while another process owns the generation.
+        self._wal_keeper: sqlite3.Connection | None = None
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -424,6 +429,8 @@ class HostedRoomRuntime:
             while not self._stop.is_set():
                 # Clear before work so a write racing the cycle forces a follow-up pass.
                 self._wake.clear()
+                if self._wal_keeper is None:
+                    self._acquire_wal_keeper()
                 try:
                     self._run_cycle()
                 except Exception as exc:  # keep independent rooms serviceable
@@ -440,6 +447,33 @@ class HostedRoomRuntime:
                 for room_thread in room_threads:
                     room_thread.join(self.active_poll_interval_seconds)
             self._release_idle_leases()
+            self._release_wal_keeper()
+
+    def _acquire_wal_keeper(self) -> None:
+        """Keep one content-touched SQLite connection open for the worker lifetime.
+
+        A failed acquire is non-fatal and retried on the next cycle. The half-open
+        connection is always closed so a transient setup failure cannot leak a
+        descriptor or silently disable future attempts.
+        """
+        if self._wal_keeper is not None:
+            return
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            self._wal_keeper = conn
+        except Exception as exc:
+            if conn is not None:
+                with suppress(Exception):
+                    conn.close()
+            self._record_error(f"wal keeper unavailable: {exc}")
+
+    def _release_wal_keeper(self) -> None:
+        conn, self._wal_keeper = self._wal_keeper, None
+        if conn is not None:
+            with suppress(Exception):
+                conn.close()
 
     def _run_cycle(self) -> None:
         with self._status_lock:
