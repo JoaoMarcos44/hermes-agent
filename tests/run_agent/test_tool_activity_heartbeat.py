@@ -109,11 +109,14 @@ def test_heartbeat_touches_periodically_and_stops():
     import agent.tool_executor as te
 
     touches: list = []
+    second_touch = threading.Event()
     stop = threading.Event()
 
     class _Agent:
         def _touch_activity(self, desc):
             touches.append(desc)
+            if len(touches) >= 2:
+                second_touch.set()
 
     thread = threading.Thread(
         target=te._run_tool_activity_heartbeat,
@@ -122,14 +125,12 @@ def test_heartbeat_touches_periodically_and_stops():
         daemon=True,
     )
     thread.start()
-    time.sleep(0.12)
+    assert second_touch.wait(timeout=2.0), "heartbeat did not produce two periodic touches"
     stop.set()
     thread.join(timeout=1.0)
 
     assert not thread.is_alive(), "heartbeat thread did not exit on stop"
-    assert len(touches) >= 2, f"expected periodic touches, got {len(touches)}"
     n = len(touches)
-    time.sleep(0.1)
     assert len(touches) == n, "heartbeat kept touching after stop_event set"
 
 
