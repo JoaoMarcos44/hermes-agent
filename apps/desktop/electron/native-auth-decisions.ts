@@ -37,11 +37,12 @@
  *      session could list files via `hermes:api` and still 401 on Download.
  *
  *   7. resolveLocalFileToken — a token/local descriptor that reaches the file
- *      save path WITHOUT its session token must fall back to this process's
- *      loopback credential (#104023: credential-less loopback fetch → the
- *      dashboard answers 401, surfaced as a download failure). The fallback
- *      fires ONLY for loopback targets so the local credential can never
- *      leak to a remote host.
+ *      save path WITHOUT its session token must fall back to the matching
+ *      local backend credential (#104023: credential-less loopback fetch →
+ *      the dashboard answers 401, surfaced as a download failure). The
+ *      fallback requires an explicit local connection marker in addition to
+ *      the loopback URL: SSH forwarding also exposes remote gateways on
+ *      127.0.0.1, so hostname-only gating would leak a local credential.
  *
  * All seven are trivial once named; the value is the test that pins the
  * contract so the god-file call sites can't drift back to the buggy shape.
@@ -176,8 +177,9 @@ export function isLoopbackGatewayUrl(baseUrl: string | null | undefined): boolea
 
 export interface LocalFileTokenCandidates {
   connectionToken?: null | string
-  envToken?: null | string
+  isLocalConnection?: boolean
   poolToken?: null | string
+  primaryToken?: null | string
 }
 
 /**
@@ -185,11 +187,12 @@ export interface LocalFileTokenCandidates {
  * token/local connection.
  *
  * Precedence: the descriptor's own token first (today's behaviour,
- * unchanged); then — ONLY for loopback targets — the pooled backend token
- * for the same backend, then the process loopback credential. A descriptor
- * that lost its token (#104023) still authenticates against the backend main
- * itself spawned, while a non-loopback target never receives either fallback.
- * Empty strings count as absent everywhere.
+ * unchanged); then — ONLY when the descriptor explicitly identifies a local
+ * connection targeting loopback — the pooled backend token for the same
+ * backend, then the primary local backend token. A descriptor that lost its
+ * token (#104023) still authenticates against the backend the main process
+ * owns, while a remote gateway reached through an SSH loopback forward never
+ * receives either local fallback. Empty strings count as absent everywhere.
  */
 export function resolveLocalFileToken(
   baseUrl: string | null | undefined,
@@ -199,11 +202,11 @@ export function resolveLocalFileToken(
     return candidates.connectionToken
   }
 
-  if (!isLoopbackGatewayUrl(baseUrl)) {
+  if (candidates.isLocalConnection !== true || !isLoopbackGatewayUrl(baseUrl)) {
     return null
   }
 
-  return candidates.poolToken || candidates.envToken || null
+  return candidates.poolToken || candidates.primaryToken || null
 }
 
 export interface AdvertisedAuthProvider {

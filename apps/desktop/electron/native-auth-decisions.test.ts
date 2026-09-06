@@ -202,7 +202,8 @@ test('resolveLocalFileToken prefers the descriptor token unchanged', () => {
   assert.equal(
     resolveLocalFileToken('http://127.0.0.1:54321', {
       connectionToken: 'descriptor-token',
-      envToken: 'env-token',
+      isLocalConnection: true,
+      primaryToken: 'primary-token',
       poolToken: 'pool-token'
     }),
     'descriptor-token'
@@ -213,23 +214,64 @@ test('resolveLocalFileToken prefers the descriptor token unchanged', () => {
   )
 })
 
-test('resolveLocalFileToken falls back to pool then env on loopback only', () => {
+test('resolveLocalFileToken falls back to pool then primary token on local loopback only', () => {
   const loopback = 'http://127.0.0.1:54321'
 
-  assert.equal(resolveLocalFileToken(loopback, { poolToken: 'pool-token', envToken: 'env-token' }), 'pool-token')
-  assert.equal(resolveLocalFileToken(loopback, { envToken: 'env-token' }), 'env-token')
+  assert.equal(
+    resolveLocalFileToken(loopback, {
+      isLocalConnection: true,
+      poolToken: 'pool-token',
+      primaryToken: 'primary-token'
+    }),
+    'pool-token'
+  )
+  assert.equal(
+    resolveLocalFileToken(loopback, { isLocalConnection: true, primaryToken: 'primary-token' }),
+    'primary-token'
+  )
   // Empty strings count as absent and fall through.
-  assert.equal(resolveLocalFileToken(loopback, { connectionToken: '', poolToken: '', envToken: 'env' }), 'env')
-  assert.equal(resolveLocalFileToken(loopback, {}), null)
+  assert.equal(
+    resolveLocalFileToken(loopback, {
+      connectionToken: '',
+      isLocalConnection: true,
+      poolToken: '',
+      primaryToken: 'primary'
+    }),
+    'primary'
+  )
+  assert.equal(resolveLocalFileToken(loopback, { isLocalConnection: true }), null)
   assert.equal(resolveLocalFileToken(loopback), null)
+})
+
+test('resolveLocalFileToken never leaks fallbacks to a remote loopback target', () => {
+  const sshForward = 'http://127.0.0.1:54321'
+
+  // An SSH gateway is reached through a local port, but it is still remote;
+  // URL host alone is not proof that the backend is local.
+  assert.equal(
+    resolveLocalFileToken(sshForward, {
+      isLocalConnection: false,
+      poolToken: 'pool-token',
+      primaryToken: 'primary-token'
+    }),
+    null
+  )
+  assert.equal(resolveLocalFileToken(sshForward, { primaryToken: 'primary-token' }), null)
 })
 
 test('resolveLocalFileToken never leaks fallbacks to a non-loopback target', () => {
   const remote = 'https://gateway.example.com'
 
-  assert.equal(resolveLocalFileToken(remote, { poolToken: 'pool-token', envToken: 'env-token' }), null)
-  assert.equal(resolveLocalFileToken(remote, { envToken: 'env-token' }), null)
-  assert.equal(resolveLocalFileToken('not-a-url', { envToken: 'env-token' }), null)
-  assert.equal(resolveLocalFileToken(null, { envToken: 'env-token' }), null)
-  assert.equal(resolveLocalFileToken(undefined, { envToken: 'env-token' }), null)
+  assert.equal(
+    resolveLocalFileToken(remote, {
+      isLocalConnection: true,
+      poolToken: 'pool-token',
+      primaryToken: 'primary-token'
+    }),
+    null
+  )
+  assert.equal(resolveLocalFileToken(remote, { isLocalConnection: true, primaryToken: 'primary-token' }), null)
+  assert.equal(resolveLocalFileToken('not-a-url', { isLocalConnection: true, primaryToken: 'primary-token' }), null)
+  assert.equal(resolveLocalFileToken(null, { isLocalConnection: true, primaryToken: 'primary-token' }), null)
+  assert.equal(resolveLocalFileToken(undefined, { isLocalConnection: true, primaryToken: 'primary-token' }), null)
 })

@@ -254,6 +254,7 @@ import {
 import { registerMcpOauthCallbackIpc } from './mcp-oauth-callback-ipc'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
 import {
+  isLoopbackGatewayUrl,
   oauthGuardMayHardFail,
   oauthSessionIsLive,
   oauthTicketFailureAuthMessage,
@@ -8074,6 +8075,7 @@ function readGatewayErrorText(res): Promise<string> {
 interface GatewayFileConnection extends RegistryBackendRequestScope {
   authMode?: 'oauth' | 'token'
   baseUrl: string
+  mode?: 'local' | 'remote'
   token?: null | string
 }
 
@@ -8089,6 +8091,31 @@ interface GatewayFileSavePayload {
   suggestedName?: unknown
 }
 
+async function primaryLocalFileToken(connection: GatewayFileConnection): Promise<string | null> {
+  if (connection.mode !== 'local' || !isLoopbackGatewayUrl(connection.baseUrl)) {
+    return null
+  }
+
+  const primaryConnectionPromise = backendConnectionState.getPromise()
+
+  if (!primaryConnectionPromise) {
+    return null
+  }
+
+  try {
+    const primaryConnection = await primaryConnectionPromise
+
+    return primaryConnection.mode === 'local' && primaryConnection.baseUrl === connection.baseUrl
+      ? (primaryConnection.token ?? null)
+      : null
+  } catch {
+    // A restart may invalidate the primary attempt while a file save is in
+    // flight. The descriptor/pool path remains usable, so a failed primary
+    // lookup must not mask it or change the request's normal auth handling.
+    return null
+  }
+}
+
 async function gatedFileAuth(connection: GatewayFileConnection) {
   const nativeAt =
     connection.authMode === 'oauth' ? await ensureNativeAccessToken(connection.baseUrl).catch(() => null) : null
@@ -8098,13 +8125,18 @@ async function gatedFileAuth(connection: GatewayFileConnection) {
     // (#104023: the loopback fetch goes out credential-less and the
     // dashboard answers 401, surfaced as a download failure). Resolve through
     // the loopback ladder — descriptor token first, then the pooled backend
-    // token for the same backend, then this process's loopback credential —
+    // token for the same backend, then the primary local backend token —
     // so the save still authenticates against the backend main itself
-    // spawned. Non-loopback targets never receive either fallback.
+    // spawned.
+    //
+    // The explicit mode check is part of the security boundary. An SSH
+    // gateway is reached through a local port too, so a loopback URL alone
+    // cannot prove that the backend is local or authorize a local fallback.
     const token = resolveLocalFileToken(connection.baseUrl, {
       connectionToken: connection.token,
-      envToken: process.env.HERMES_DASHBOARD_SESSION_TOKEN,
-      poolToken: matchPoolTokenForGatewayUrl(connection.baseUrl, backendPool.values())
+      isLocalConnection: connection.mode === 'local',
+      poolToken: matchPoolTokenForGatewayUrl(connection.baseUrl, backendPool.values()),
+      primaryToken: connection.token ? null : await primaryLocalFileToken(connection)
     })
 
     if (token) {
@@ -13113,14 +13145,6 @@ async function startHermes() {
       childAlive: () => hermesProcess.exitCode === null && !hermesProcess.killed,
       rememberLog
     })
-
-    // Publish the adopted loopback credential for credential-less loopback
-    // consumers in this process (gated file downloads, #104023). The child
-    // already receives it via spawn env; without this mirror the main process
-    // itself holds no copy when a resolved descriptor drops its token.
-    if (authToken) {
-      process.env.HERMES_DASHBOARD_SESSION_TOKEN = authToken
-    }
 
     // Verify the WebSocket session token before declaring backend ready.
     const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`

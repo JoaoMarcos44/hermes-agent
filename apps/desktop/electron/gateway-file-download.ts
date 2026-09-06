@@ -134,11 +134,11 @@ export interface PoolTokenEntry {
 
 /**
  * The pooled backend token for the backend serving `baseUrl`, matched by
- * port. Pooled local children keep per-profile tokens that must never be
- * mirrored into the single process env slot, so the file-save path looks
- * them up here instead. Only entries carrying a token can match (ssh/remote
- * pool entries never set one); returns null when no pool entry serves that
- * port.
+ * port. Pooled local children keep per-profile tokens; the primary local token
+ * is resolved from the live connection state instead of process.env, so the
+ * file-save path looks them up here instead. Only entries carrying a token can
+ * match (ssh/remote pool entries never set one); returns null when no pool entry
+ * serves that port.
  */
 export function matchPoolTokenForGatewayUrl(baseUrl: string, entries: Iterable<PoolTokenEntry>): string | null {
   let port = ''
