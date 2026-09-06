@@ -15,6 +15,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from tui_gateway.hosted_room_driver import HostedRoomRuntime
 
 from tests.tui_gateway.test_hosted_room_driver_runtime import (
@@ -45,6 +47,7 @@ def _set_wal_mode(db: Path) -> None:
         conn.close()
 
 
+@pytest.mark.linux_only
 def test_driver_keeps_wal_sidecars_across_ephemeral_cycles(tmp_path: Path):
     db = tmp_path / "state.db"
     _set_wal_mode(db)
