@@ -86,6 +86,25 @@ def _release_active_session_slot(session: dict | None) -> bool:
     return True
 
 
+def _release_detached_idle_lease(sid: str, session: dict) -> bool:
+    """Release an idle Desktop lease when WS orphan reaping is intentionally disabled.
+
+    ``ws_orphan_reap_grace_s=0`` parks a detached runtime indefinitely. That is safe for an
+    idle session only after its lane has stopped owning delegated/pending work: a later turn
+    crosses the normal ownership gate and can reacquire the lease. Keeping the lease in this
+    state makes a dead transport indistinguishable from a live writer forever, so a second
+    surface is fenced out until backend restart.
+    """
+    if _WS_ORPHAN_REAP_GRACE_S > 0 or _session_source(session).strip().lower() != "desktop":
+        return False
+    if session.get("active_session_lease") is None:
+        return False
+    with session.get("history_lock") or contextlib.nullcontext():
+        if not _session_is_lru_evictable(sid, session):
+            return False
+        return _release_active_session_slot(session)
+
+
 def _own_live_lease_ids(*, exclude=None) -> set[str]:
     """Snapshot leases still backed by this process's live session records."""
     with _sessions_lock:
@@ -610,6 +629,12 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
                     # must not arm its first timer over a reconnect's newer detachment.
                     with contextlib.suppress(Exception):
                         _schedule_ws_orphan_reap(sid)
+                    try:
+                        _release_detached_idle_lease(sid, current)
+                    except Exception:
+                        logger.warning(
+                            "failed to release idle detached Desktop lease for sid=%s; preserving ownership",
+                            sid, exc_info=True)
         if claimed_for_teardown is not None:
             reaped += _teardown_popped_session(claimed_for_teardown, end_reason=end_reason)
         elif should_schedule_reap:
