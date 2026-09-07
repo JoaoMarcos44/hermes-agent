@@ -410,7 +410,9 @@ def _ensure_codex_session(agent) -> None:
     )
 
 
-def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> None:
+def _persist_projected_messages(
+    agent, turn, messages: List[Dict[str, Any]], user_message: Any = None,
+) -> None:
     """Splice the projected messages into ``messages`` and flush them to the session DB.
 
     Bypasses conversation_loop's per-step _persist_session(); the flush dedups via _DB_PERSISTED_MARKER so
@@ -419,7 +421,28 @@ def _persist_projected_messages(agent, turn, messages: List[Dict[str, Any]]) -> 
     if not turn.projected_messages:
         return
     from agent.message_metadata import append_message
-    for projected_message in turn.projected_messages:
+    projected_messages = turn.projected_messages
+    # ``turn/start`` materializes the submitted input as the leading
+    # ``userMessage`` item. That item is a transport echo, not a second user
+    # action: build_turn_context already appended and persisted the same input
+    # before this early-return runtime was entered. The session records the
+    # exact text serialized into the wire input after rich-content coercion;
+    # use that value rather than the original Hermes shape. Drop only an exact
+    # leading match so a later real user projection (for example a steer) is
+    # preserved.
+    first_projected = projected_messages[0]
+    submitted_user_text = getattr(turn, "submitted_user_text", None)
+    if submitted_user_text is None and isinstance(user_message, str):
+        # Compatibility for older or mocked TurnResult shapes.
+        submitted_user_text = user_message
+    if (
+        isinstance(first_projected, dict)
+        and first_projected.get("role") == "user"
+        and first_projected.get("content") == submitted_user_text
+    ):
+        projected_messages = projected_messages[1:]
+
+    for projected_message in projected_messages:
         append_message(messages, projected_message)
     if getattr(agent, "_session_db", None) is None:
         return
@@ -459,7 +482,7 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
     return usage_result
 
 
-def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: List[Dict[str, Any]],
+def run_codex_app_server_turn(agent, *, user_message: Any, original_user_message: Any, messages: List[Dict[str, Any]],
                               effective_task_id: str, should_review_memory: bool = False) -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
@@ -484,7 +507,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     if getattr(turn, "should_retire", False):
         logger.warning("codex app-server session retired (turn error: %s)", turn.error)
         _close_codex_session(agent)
-    _persist_projected_messages(agent, turn, messages)
+    _persist_projected_messages(agent, turn, messages, user_message=user_message)
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )

@@ -14,13 +14,18 @@ The fix has the codex runtime flush its own projected messages via
 skips its own ``append_to_transcript`` DB write. This is critical: the inbound
 user turn is already flushed at turn start (``turn_context._persist_session``),
 and ``append_message`` is a raw INSERT with no dedup — a gateway re-write would
-duplicate the user turn (#860 / #42039). This test locks in:
+duplicate the user turn (#860 / #42039). Codex also projects the submitted
+input back as a leading ``userMessage`` transport echo; that echo is not a
+second user action and must not become a second durable row. This test locks in:
 
 1. ``run_codex_app_server_turn`` flushes projected messages and returns
    ``agent_persisted=True``.
-2. Exactly-once persistence: the already-flushed user turn is NOT re-written,
-   and the new projected assistant message lands once.
-3. The gateway resolution expression preserves standard-runtime behaviour.
+2. Exactly-once persistence: the already-flushed user turn and projected input
+   echo are NOT re-written, and the new projected assistant message lands once.
+3. Assistant-only and non-matching leading projections are preserved.
+4. A later distinct user projection is preserved.
+5. Rich input is matched against the exact text submitted on the wire.
+6. The gateway resolution expression preserves standard-runtime behaviour.
 """
 
 import tempfile
@@ -33,13 +38,18 @@ from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
-def _make_turn():
+def _make_turn(*, user_echo=None, submitted_user_text=None):
+    projected_messages = []
+    if user_echo is not None:
+        projected_messages.append({"role": "user", "content": user_echo})
+    projected_messages.append({"role": "assistant", "content": "CODEX_ASSISTANT"})
     return SimpleNamespace(
         interrupted=False,
         error=None,
         thread_id="thread-1",
         turn_id="turn-1",
-        projected_messages=[{"role": "assistant", "content": "CODEX_ASSISTANT"}],
+        submitted_user_text=submitted_user_text,
+        projected_messages=projected_messages,
         tool_iterations=0,
         final_text="CODEX_ASSISTANT",
         should_retire=False,
@@ -72,7 +82,11 @@ def test_codex_success_flushes_and_reports_persisted():
         effective_task_id="task-1",
     )
     assert result["completed"] is True
-    assert isinstance(result["messages"][-1]["timestamp"], float)
+    assert [(message["role"], message.get("content")) for message in result["messages"]] == [
+        ("user", "hello"),
+        ("assistant", "CODEX_ASSISTANT"),
+    ]
+    assert isinstance(result["messages"][1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
 
@@ -105,6 +119,81 @@ def test_codex_user_interrupt_is_reported_and_cleared():
     assert agent._interrupt_requested is False
 
 
+def test_codex_drops_only_the_leading_matching_user_echo():
+    """A later distinct user projection must survive the input-echo filter."""
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.projected_messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "INTERIM"},
+        {"role": "user", "content": "STEER"},
+        {"role": "assistant", "content": "CODEX_ASSISTANT"},
+    ]
+    turn.submitted_user_text = "hello"
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert [(message["role"], message.get("content")) for message in result["messages"]] == [
+        ("user", "hello"),
+        ("assistant", "INTERIM"),
+        ("user", "STEER"),
+        ("assistant", "CODEX_ASSISTANT"),
+    ]
+
+
+def test_codex_preserves_nonmatching_leading_user_projection():
+    agent = _make_agent(session_db=None)
+    turn = _make_turn(user_echo="DIFFERENT", submitted_user_text="hello")
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert [(message["role"], message.get("content")) for message in result["messages"]] == [
+        ("user", "hello"),
+        ("user", "DIFFERENT"),
+        ("assistant", "CODEX_ASSISTANT"),
+    ]
+
+
+def test_codex_drops_echo_of_coerced_rich_wire_text():
+    rich_input = [
+        {"type": "text", "text": "caption"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+    ]
+    submitted_text = "caption\n\n[image attached]"
+    agent = _make_agent(session_db=None)
+    agent._codex_session.run_turn.return_value = _make_turn(
+        user_echo=submitted_text,
+        submitted_user_text=submitted_text,
+    )
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message=rich_input,
+        original_user_message=rich_input,
+        messages=[{"role": "user", "content": rich_input}],
+        effective_task_id="task-1",
+    )
+
+    assert [(message["role"], message.get("content")) for message in result["messages"]] == [
+        ("user", rich_input),
+        ("assistant", "CODEX_ASSISTANT"),
+    ]
+
+
 def test_codex_turn_persists_each_message_exactly_once():
     """The user turn (flushed at turn start) must not be duplicated; the
     projected assistant message must land once.  Uses a real SessionDB and the
@@ -129,7 +218,10 @@ def test_codex_turn_persists_each_message_exactly_once():
         )
         agent._session_db_created = True
         agent._codex_session = MagicMock()
-        agent._codex_session.run_turn.return_value = _make_turn()
+        agent._codex_session.run_turn.return_value = _make_turn(
+            user_echo="USER_TURN",
+            submitted_user_text="USER_TURN",
+        )
         agent.tool_progress_callback = None
 
         # Model the real flow: the inbound user turn is flushed at turn start

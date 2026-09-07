@@ -46,6 +46,9 @@ class TurnResult:
     error: Optional[str] = None  # non-recoverable turn error
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
+    # Exact text serialized into the turn/start input item. The runtime uses
+    # this to distinguish Codex's transport echo from a separate user event.
+    submitted_user_text: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
@@ -341,9 +344,11 @@ class CodexAppServerSession:
             if self._interrupt_event.is_set():
                 result.interrupted = True
             else:
+                user_input_text = _coerce_turn_input_text(user_input)
+                result.submitted_user_text = user_input_text
                 ts = self._request_for(
                     result, "turn/start",
-                    {"threadId": self._thread_id, "input": [{"type": "text", "text": _coerce_turn_input_text(user_input)}]},
+                    {"threadId": self._thread_id, "input": [{"type": "text", "text": user_input_text}]},
                     "turn/start",
                 )
                 if ts is not None:
