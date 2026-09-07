@@ -2483,8 +2483,13 @@ def ensure_gateway_service(context: str = "setup") -> bool:
     return False
 
 
-def get_systemd_linger_status() -> tuple[bool | None, str]:
-    """Linger status for the current user: ``(True, "")``, ``(False, "")``, or ``(None, detail)`` when unknown."""
+def get_systemd_linger_status(username: str | None = None) -> tuple[bool | None, str]:
+    """Linger status for *username* or the current user when omitted.
+
+    System-scope gateway installation runs as root but the service runs as a
+    configured target user, so querying the caller would validate the wrong
+    user manager.
+    """
     if is_termux():
         return None, "not supported in Termux"
     if not is_linux():
@@ -2492,7 +2497,8 @@ def get_systemd_linger_status() -> tuple[bool | None, str]:
     if not shutil.which("loginctl"):
         return None, "loginctl not found"
 
-    username = os.getenv("USER") or os.getenv("LOGNAME")
+    if username is None:
+        username = os.getenv("USER") or os.getenv("LOGNAME")
     if not username:
         try:
             import pwd
@@ -2950,18 +2956,21 @@ def _print_linger_enable_warning(username: str, detail: str | None = None) -> No
     print()
 
 
-def _ensure_linger_enabled() -> None:
-    """Enable linger when possible so the user gateway survives logout."""
+def _ensure_linger_enabled(username: str | None = None) -> None:
+    """Enable linger for *username* or the current user when possible."""
     if is_termux() or not is_linux():
         return
 
-    import getpass
-    username = getpass.getuser()
+    if username is None:
+        import getpass
+        username = getpass.getuser()
+        linger_enabled, linger_detail = get_systemd_linger_status()
+    else:
+        linger_enabled, linger_detail = get_systemd_linger_status(username)
     if Path(f"/var/lib/systemd/linger/{username}").exists():
         print("✓ Systemd linger is enabled (service survives logout)")
         return
 
-    linger_enabled, linger_detail = get_systemd_linger_status()
     if linger_enabled is True:
         print("✓ Systemd linger is enabled (service survives logout)")
         return
@@ -2981,6 +2990,18 @@ def _ensure_linger_enabled() -> None:
         print("✓ Linger enabled — gateway will persist after logout")
         return
     _print_linger_enable_warning(username, _completed_process_detail(result) or linger_detail)
+
+
+def _ensure_system_service_linger(unit_path: Path) -> None:
+    """Prepare the configured non-root service user for a user-scope worker bus.
+
+    Root/system-slice gateways use the system manager instead; only the
+    non-root system-service topology needs a persistent user manager for
+    ``systemd-run --user --scope``.
+    """
+    username = _read_systemd_user_from_unit(unit_path)
+    if username and username != "root":
+        _ensure_linger_enabled(username)
 
 
 def _select_systemd_scope(system: bool = False) -> bool:
@@ -3084,10 +3105,14 @@ def systemd_install(
             refresh_systemd_unit_if_needed(system=system)
             if enable_on_startup:
                 _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+            if system:
+                _ensure_system_service_linger(unit_path)
             print(f"✓ {scope_label.capitalize()} service definition updated")
             return
         print(f"Service already installed at: {unit_path}")
         print("Use --force to reinstall")
+        if system:
+            _ensure_system_service_linger(unit_path)
         return
 
     unit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3114,6 +3139,7 @@ def systemd_install(
         configured_user = _read_systemd_user_from_unit(unit_path)
         if configured_user:
             print(f"Configured to run as: {configured_user}")
+            _ensure_system_service_linger(unit_path)
     else:
         _ensure_linger_enabled()
 
