@@ -3234,6 +3234,8 @@ export interface Translations {
     readOnlyTranscriptSendBlocked: string
     resumeStrandedTitle: string
     resumeStrandedBody: string
+    poolSlotTimeoutBody: string
+    poolSlotTimeoutOpenSettings: string
     resumeRetry: string
     nothingToBranch: string
     branchNeedsChat: string
