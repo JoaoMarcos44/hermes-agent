@@ -17,8 +17,9 @@ thread's id != the triggering message's own id, and must keep its thread.
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from cron.scheduler_delivery import _live_route_metadata
+from cron.scheduler_delivery import _live_route_metadata, _standalone_send
 from gateway.config import Platform
+from tools.send_message_senders import _telegram_thread_kwargs
 from tools.cronjob_tools import _origin_from_env
 
 
@@ -116,3 +117,33 @@ def test_telegram_direct_topic_origin_keeps_native_cron_route():
     assert route_metadata["direct_messages_topic_id"] == "270453"
     assert "thread_id" not in route_metadata
     assert media_metadata["direct_messages_topic_id"] == "270453"
+
+
+def test_telegram_direct_topic_standalone_route_keeps_native_parameter(monkeypatch):
+    calls = {}
+
+    async def fake_send_to_platform(*args, **kwargs):
+        calls.update(kwargs)
+        return {"success": True}
+
+    monkeypatch.setattr("tools.send_message_tool._send_to_platform", fake_send_to_platform)
+    target = SimpleNamespace(
+        job={"id": "job-1"},
+        where="telegram:775566675",
+        platform=Platform.TELEGRAM,
+        pconfig=SimpleNamespace(),
+        chat_id="775566675",
+        thread_id="270453",
+        origin={"thread_id_kind": "direct_messages_topic"},
+        origin_target=True,
+        is_relay=False,
+    )
+
+    result, error = _standalone_send(target, "cron follow-up", [])
+
+    assert result == {"success": True}
+    assert error is None
+    assert calls["thread_id_kind"] == "direct_messages_topic"
+    assert _telegram_thread_kwargs("270453", "direct_messages_topic") == {
+        "direct_messages_topic_id": 270453,
+    }
