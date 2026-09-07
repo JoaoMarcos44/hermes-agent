@@ -835,6 +835,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     request_token = getattr(agent, "_active_codex_stream_request_token", None)
     # Delta-sink claim for the CURRENT physical attempt (None until the stream opens).
     writer_token = {"value": None}
+    attempt_chunks_received = {"count": 0}
 
     def _request_is_current() -> bool:
         return request_token is None or getattr(agent, "_active_codex_stream_request_token", None) is request_token
@@ -848,6 +849,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._fire_stream_delta(text)
 
     def _on_event(event: Any) -> None:  # TTFB watchdog and activity touch — once per SSE event.
+        attempt_chunks_received["count"] += 1
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
@@ -874,6 +876,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         writer_token["value"] = claim_stream_writer(agent)
 
     def _accept_codex_chunk(_chunk: Any) -> bool:
+        attempt_chunks_received["count"] += 1
         token = writer_token["value"]
         if token is None or stream_writer_is_current(agent, token):
             return True
@@ -915,6 +918,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise InterruptedError("Agent interrupted before Codex stream retry")
         intercepted_events: list = []
         writer_token["value"] = event_stream = None
+        attempt_chunks_received["count"] = 0
         try:
             try:
                 event_stream = relay_llm.stream(
@@ -936,12 +940,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
                 )
             except transport_errors as exc:
-                # A raw ReadError before the stream handle exists is the unwrapped sibling of
-                # APIConnectionError <- ReadError (#103673). Retry only that pre-stream shape:
-                # once the stream opened, an inference may already be billed and replaying it
-                # could duplicate output. The generic chat-completions path has its own
-                # post-delivery gating; this Codex path must keep the single-writer token fence.
-                if isinstance(exc, _httpx.ReadError) and writer_token["value"] is not None:
+                stream_delivered = bool(
+                    attempt_chunks_received["count"] > 0
+                    or intercepted_events
+                    or agent._codex_streamed_text_parts
+                )
+                # A raw ReadError before the stream delivers events is the transport-level sibling
+                # of pre-stream APIConnectionError <- ReadError (#103673, #104303, #104452).
+                # Retry only when no chunks or deltas were delivered on this attempt: once the
+                # stream yields content, an inference may already be billed and replaying it could
+                # duplicate output. When retrying pre-stream, abort the request-local client so
+                # the failed socket/pool is not reused.
+                if isinstance(exc, _httpx.ReadError) and stream_delivered:
                     _log_failure(exc)
                     raise
                 if attempt >= max_stream_retries:
@@ -949,7 +959,6 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     raise
                 if (
                     isinstance(exc, _httpx.ReadError)
-                    and event_stream is None
                     and client is not None
                     and callable(getattr(agent, "_abort_request_openai_client", None))
                 ):
@@ -957,9 +966,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         active_client, reason="codex_prestream_transport_retry"
                     )
                 logger.debug(
-                    "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s" if event_stream is None
+                    "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s" if not stream_delivered
                     else "Codex Responses stream transport failed mid-iteration (attempt %s/%s); retrying. %s error=%s",
-                    attempt + 1, max_stream_retries + 1, agent._client_log_context(), exc,
+                    attempt + 1, max_stream_retries + 1,
+                    getattr(agent, "_client_log_context", lambda: "")(), exc,
                 )
                 continue
             except RuntimeError:
@@ -973,10 +983,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             if not agent._interrupt_requested:
                 _drain_for_finalizer(event_stream)
             if final.status in {"incomplete", "failed"}:
-                logger.warning("Codex Responses stream terminal status=%s "
-                               "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",
-                               final.status, final.incomplete_details, final.error,
-                               sum(len(p) for p in agent._codex_streamed_text_parts), agent._client_log_context())
+                logger.warning(
+                    "Codex Responses stream terminal status=%s "
+                    "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",
+                    final.status, final.incomplete_details, final.error,
+                    sum(len(p) for p in agent._codex_streamed_text_parts),
+                    getattr(agent, "_client_log_context", lambda: "")(),
+                )
             return final
         finally:
             _close_event_stream(event_stream)
