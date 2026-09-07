@@ -2961,16 +2961,18 @@ def _ensure_linger_enabled(username: str | None = None) -> None:
     if is_termux() or not is_linux():
         return
 
+    explicit_username = username is not None
     if username is None:
         import getpass
         username = getpass.getuser()
-        linger_enabled, linger_detail = get_systemd_linger_status()
-    else:
-        linger_enabled, linger_detail = get_systemd_linger_status(username)
     if Path(f"/var/lib/systemd/linger/{username}").exists():
         print("✓ Systemd linger is enabled (service survives logout)")
         return
 
+    if explicit_username:
+        linger_enabled, linger_detail = get_systemd_linger_status(username)
+    else:
+        linger_enabled, linger_detail = get_systemd_linger_status()
     if linger_enabled is True:
         print("✓ Systemd linger is enabled (service survives logout)")
         return
