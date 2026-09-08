@@ -121,46 +121,46 @@ hermes doctor       # Diagnose any issues
 
 ### Restricted or high-latency networks (no proxy needed)
 
-The installer and updater try the official endpoints first. If a dependency
-endpoint is slow or unreachable, configure only the affected channel before
-retrying; Hermes does not infer location or select a mirror from your IP.
+The installer and updater try official endpoints first. If the Git repository
+fetch or locked Python sync fails, Hermes retries that same channel through a
+configured fallback only after the measured failure. It never selects a mirror
+from an IP address or inferred region.
+
+The fallback endpoints are community-operated, not Hermes infrastructure. Set
+your own endpoints, or disable either fallback by exporting an empty value:
 
 ```bash
-# npm packages
+export GIT_FALLBACK_REPO_URL=https://your-mirror.example/NousResearch/hermes-agent.git
+export UV_FALLBACK_INDEX=https://your-mirror.example/simple
+# export GIT_FALLBACK_REPO_URL=
+# export UV_FALLBACK_INDEX=
+```
+
+After a fresh mirror clone, `origin` is restored to the official repository and
+the checkout passes Git object verification. Existing checkouts keep their
+current remote identity (a fork may be intentional), so inspect it with
+`git remote -v`. Object hashes prove internal consistency, not upstream
+provenance; for a high-assurance install, pin and verify a full commit SHA with
+`--commit <40-char-sha>`.
+The locked `uv sync` keeps the hashes in `uv.lock` enabled. An explicit
+`UV_DEFAULT_INDEX` always wins over the failure-triggered fallback.
+
+Use explicit channel overrides for the remaining downloads:
+
+```bash
 export npm_config_registry=https://registry.npmmirror.com
-
-# Python packages used by `uv sync` (the installer intentionally ignores local
-# uv.toml files; this environment variable is the supported override)
 export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
-
-# Python runtimes downloaded by uv
-export UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download
-
-# Electron and Playwright downloads (optional; these are explicit opt-ins)
+export UV_PYTHON_INSTALL_MIRROR=https://your-mirror.example/python-build-standalone
 export ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
 ```
 
-For a GitHub mirror, use Git's standard URL rewrite only for the install or
-update command, then verify that the checkout still has the official remote:
-
-```bash
-git -c url."https://<your-mirror>/https://github.com/".insteadOf=https://github.com/ clone \
-  --depth 1 https://github.com/NousResearch/hermes-agent.git
-git remote -v
-```
-
-`npm` checks lockfile `sha512` integrity and `uv` checks the hashes recorded in
-`uv.lock`; changing an index does not disable those checks. Git verifies object
-hashes, but a mirror can still serve the wrong history, so pin and verify the
-expected commit when provenance matters. Playwright's browser download does
-not currently provide the same per-file checksum guarantee; use that override
-only when you accept the residual mirror risk. The optional cua-driver
-installer has no mirror or checksum hook and remains best-effort.
-
-If an install or update fails, inspect the channel-specific error before
-changing all sources: the official endpoint may be healthy while only GitHub,
-npm, PyPI, Electron, or Playwright is being throttled.
+`npm` checks lockfile `sha512` integrity; `uv` checks `uv.lock`; Electron's
+downloader checks its release checksum. Playwright browser downloads do not yet
+have the same per-file checksum guarantee, and the optional `cua-driver`
+installer has no mirror or checksum hook. Use those two overrides only when you
+accept the residual risk. If a run still fails, inspect the channel-specific
+error before changing every source at once.
 
 ---
 

@@ -37,6 +37,67 @@ If you want to install & run Hermes Desktop after a command-line only install, s
 hermes desktop
 ```
 
+### Restricted or high-latency networks (no proxy needed)
+
+Hermes uses an official-first, failure-triggered fallback ladder for the two
+channels that can block a first install or update: the Git repository and the
+locked Python dependency sync. It does not inspect your IP address or infer a
+region. A mirror is tried only after the official request returns a failure,
+and a user-supplied override is never replaced.
+
+The default fallback endpoints are community-operated services, not Hermes
+infrastructure. They can be overridden or disabled for a stricter supply-chain
+policy:
+
+```bash
+# Use a different Git mirror, or disable the Git fallback for this run.
+export GIT_FALLBACK_REPO_URL=https://your-mirror.example/NousResearch/hermes-agent.git
+# export GIT_FALLBACK_REPO_URL=
+
+# Use a different Python Simple API mirror, or disable the uv fallback.
+export UV_FALLBACK_INDEX=https://your-mirror.example/simple
+# export UV_FALLBACK_INDEX=
+
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+```
+
+The installer leaves a fresh mirror clone's `origin` pointing at the official
+GitHub repository and runs Git object verification before accepting the
+checkout. Existing checkouts keep their current remote identity (a fork may be
+intentional), so inspect it after a mirror-assisted update. Git object hashes
+prove that the received objects are internally consistent, not that a mirror
+served the intended upstream history. For a release or a high-assurance
+deployment, pin and verify the expected commit:
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- \
+  --commit <full-40-character-commit-sha>
+git -C ~/.hermes/hermes-agent remote -v
+```
+
+For an existing checkout, the same fallback is used after an official fetch
+fails; the checkout's existing remote identity is preserved. The locked `uv
+sync` keeps the hashes in `uv.lock` enabled regardless of which index served
+the files. The fallback index is not used when `UV_DEFAULT_INDEX` is already
+set, so an explicit user choice always wins.
+
+Other download channels remain explicit knobs rather than automatic fallbacks:
+
+```bash
+export npm_config_registry=https://registry.npmmirror.com
+export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+export UV_PYTHON_INSTALL_MIRROR=https://your-mirror.example/python-build-standalone
+export ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
+export PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
+```
+
+`npm` verifies lockfile `sha512` integrity, `uv` verifies `uv.lock` hashes, and
+Electron's downloader verifies its release checksum. Playwright's browser
+download does not currently provide the same per-file checksum guarantee, and
+the optional `cua-driver` installer has no mirror or checksum hook; use those
+overrides only when you accept that residual risk. The official entry point,
+Node.js downloads, and PyPI when healthy need no override.
+
 ### What the Installer Does
 
 The installer handles everything automatically — all dependencies (Python, Node.js, ripgrep, ffmpeg), the repo clone, virtual environment, global `hermes` command setup, and LLM provider configuration. By the end, you're ready to chat.
