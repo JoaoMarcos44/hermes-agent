@@ -275,8 +275,12 @@ def _refence_resurrected_lane(sid: str, session: dict) -> None:
     Caller holds ``_session_resume_lock`` + ``_sessions_lock``; the single
     targeted acquire nests its registry ``FileLock`` innermost (the established
     order — never the multi-home sweep). On refusal or error the record stays
-    detached so the next submit re-fences instead of running rowless. See #104691.
+    detached so the next submit re-fences instead of running rowless. If an
+    admitted turn is pending or running, it is cleanly aborted so it cannot
+    execute without an active lease. See #104691.
     """
+    fresh = None
+    limit_message = None
     try:
         # The session's own home spelling — the same value this lease was acquired
         # with — so alias spellings resolve to the swept file at the OS level; an
@@ -286,12 +290,49 @@ def _refence_resurrected_lane(sid: str, session: dict) -> None:
             surface=_session_source(session), profile_home=session.get("profile_home"))
     except Exception as exc:
         logger.warning("Re-fencing resurrected lane %s failed; staying detached: %s", sid, exc)
-        return
+        limit_message = exc
     if fresh is None:
         logger.warning(
             "Re-fencing resurrected lane %s refused (%s); staying detached", sid, limit_message)
+        _abort_refence_failed_turn(sid, session, limit_message)
         return
     session["active_session_lease"] = fresh
+
+
+def _abort_refence_failed_turn(sid: str, session: dict, reason: Any = None) -> None:
+    """Abort and refuse an admitted or running turn when re-fencing fails.
+
+    Called under ``_session_resume_lock`` + ``_sessions_lock`` after the reaper sweep
+    detached a stale lease and the repair acquire failed (e.g. a foreign backend won
+    the active session slot). Keeps an already-admitted turn from running rowless
+    concurrently with the new owner. See #104691.
+    """
+    try:
+        _interrupt_fn = globals().get("_interrupt_session_turn")
+        if not callable(_interrupt_fn):
+            from .session_lifecycle import _interrupt_session_turn as _interrupt_fn
+        _interrupt_fn(sid, session)
+    except Exception:
+        logger.debug("Interrupting turn on refence failure failed", exc_info=True)
+    lock = session.get("history_lock")
+    with (lock if lock is not None else contextlib.nullcontext()):
+        session["_turn_cancel_requested"] = True
+        rt = session.get("_run_thread")
+        if rt is None or not getattr(rt, "is_alive", lambda: False)():
+            session["running"] = False
+            with contextlib.suppress(Exception):
+                _clear_fn = globals().get("_clear_inflight_turn")
+                if not callable(_clear_fn):
+                    from .session_history import _clear_inflight_turn as _clear_fn
+                _clear_fn(session)
+    if reason is not None:
+        with contextlib.suppress(Exception):
+            _emit_fn = globals().get("_emit")
+            if not callable(_emit_fn):
+                from .server import _emit as _emit_fn
+            msg = str(reason)
+            reason_code = getattr(reason, "reason", "SESSION_NOT_OWNED")
+            _emit_fn("error", sid, {"message": msg, "reason": reason_code})
 
 
 # Soft LRU cap on in-memory sessions: the TTL reaper only frees sessions idle for hours, so a heavy reconnecting

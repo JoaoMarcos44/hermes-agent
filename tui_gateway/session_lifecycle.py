@@ -435,25 +435,26 @@ def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None =
         if should_interrupt or session.get("_compute_host_active"):
             _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
     else:
-        run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
-    with session["history_lock"]:
+        run_thread_alive = (rt := session.get("_run_thread")) is not None and getattr(rt, "is_alive", lambda: False)()
+    lock = session.get("history_lock")
+    with (lock if lock is not None else contextlib.nullcontext()):
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
     if not use_compute_host:
-        if should_interrupt:
+        if should_interrupt and session.get("agent") is not None:
             from agent.interrupt_compat import request_hard_interrupt
             request_hard_interrupt(session.get("agent"))
         if not run_thread_alive:
-            with session["history_lock"]:
+            with (lock if lock is not None else contextlib.nullcontext()):
                 if session.get("running"):
                     session["running"] = False
                     _clear_inflight_turn(session)
     _clear_pending(sid)
     with contextlib.suppress(Exception):
         from tools.approval import resolve_gateway_approval
-        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+        resolve_gateway_approval(session.get("session_key") or sid, "deny", resolve_all=True)
     return use_compute_host
 
 

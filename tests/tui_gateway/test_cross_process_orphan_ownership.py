@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
+from unittest import mock
 
 from hermes_cli import active_sessions
 from hermes_cli.active_sessions import (
@@ -1065,3 +1066,183 @@ def test_reclaim_admitted_turn_before_delete_stays_fenced(
     assert getattr(refusal, "reason", None) == "SESSION_NOT_OWNED"
     assert fresh is not None
     fresh.release()
+
+
+def test_reclaim_foreign_acquire_wins_aborts_admitted_local_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admitted turn must be aborted when a foreign backend wins the repair acquire (#105540).
+
+    When a dead lane is judged reclaimable at snapshot time, a local turn is admitted
+    mid-sweep, and a foreign backend acquires the lease during the sweep window,
+    the local lane's re-fencing fails. The admitted turn must be kept from executing:
+    it must be interrupted, running reset to False, turn cancel requested, and the
+    record left detached and unowned.
+    """
+    _pin_reclaim_env(monkeypatch)
+    stale = _acquire_root_lease("zombie-session", "runtime-a")
+    old = time.time() - 7200.0
+    record = {
+        **_dead_lane_record(stale, last_active=old, created_at=old),
+        "history_lock": threading.Lock(),
+    }
+    monkeypatch.setattr(server, "_sessions", {"ui": record})
+    real_receipt = active_sessions.release_orphaned_leases_receipt
+    foreign_lease: active_sessions.ActiveSessionLease | None = None
+
+    def _admit_turn_and_foreign_acquire(live_ids: set[str]):
+        nonlocal foreign_lease
+        record["transport"] = object()
+        record["running"] = True
+        record["last_active"] = time.time()
+        receipt = real_receipt(live_ids)
+        foreign_lease, refusal = try_acquire_active_session(
+            session_id="zombie-session",
+            surface="desktop",
+            config={},
+            metadata={"live_session_id": "foreign-runtime"},
+            track_liveness=True,
+        )
+        assert foreign_lease is not None and refusal is None
+        return receipt
+
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.release_orphaned_leases_receipt",
+        _admit_turn_and_foreign_acquire,
+    )
+
+    server._reclaim_orphaned_leases()
+
+    try:
+        assert stale.released is True
+        assert record.get("active_session_lease") is None
+        assert record.get("running") is False
+        assert record.get("_turn_cancel_requested") is True
+
+        snapshot = active_session_registry_snapshot()
+        assert len(snapshot) == 1
+        assert snapshot[0]["session_id"] == "zombie-session"
+        assert snapshot[0]["lease_id"] == foreign_lease.lease_id
+    finally:
+        if foreign_lease is not None:
+            foreign_lease.release()
+
+
+def test_reclaim_foreign_acquire_wins_prevents_agent_run_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A running/admitted worker thread must not execute agent.run_conversation after refence failure."""
+    _pin_reclaim_env(monkeypatch)
+    stale = _acquire_root_lease("zombie-session", "runtime-a")
+    old = time.time() - 7200.0
+    mock_agent = mock.MagicMock()
+    mock_agent.run_conversation = mock.MagicMock()
+    record = {
+        **_dead_lane_record(stale, last_active=old, created_at=old),
+        "history_lock": threading.Lock(),
+        "agent": mock_agent,
+        "history": [],
+    }
+    monkeypatch.setattr(server, "_sessions", {"ui": record})
+    real_receipt = active_sessions.release_orphaned_leases_receipt
+    foreign_lease: active_sessions.ActiveSessionLease | None = None
+
+    def _admit_turn_and_foreign_acquire(live_ids: set[str]):
+        nonlocal foreign_lease
+        record["transport"] = object()
+        record["running"] = True
+        record["last_active"] = time.time()
+        receipt = real_receipt(live_ids)
+        foreign_lease, refusal = try_acquire_active_session(
+            session_id="zombie-session",
+            surface="desktop",
+            config={},
+            metadata={"live_session_id": "foreign-runtime"},
+            track_liveness=True,
+        )
+        assert foreign_lease is not None and refusal is None
+        return receipt
+
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.release_orphaned_leases_receipt",
+        _admit_turn_and_foreign_acquire,
+    )
+
+    server._reclaim_orphaned_leases()
+
+    try:
+        res = server._run_prompt_submit("r1", "ui", record, "test prompt")
+        assert res is False
+        assert mock_agent.run_conversation.call_count == 0
+        assert record.get("running") is False
+    finally:
+        if foreign_lease is not None:
+            foreign_lease.release()
+
+
+def test_reclaim_foreign_acquire_wins_aborts_in_flight_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An already-spawned turn worker thread must abort before invoking agent when refencing fails."""
+    _pin_reclaim_env(monkeypatch)
+    stale = _acquire_root_lease("zombie-session", "runtime-a")
+    old = time.time() - 7200.0
+    mock_agent = mock.MagicMock()
+    mock_agent.run_conversation = mock.MagicMock()
+    record = {
+        **_dead_lane_record(stale, last_active=old, created_at=old),
+        "history_lock": threading.Lock(),
+        "agent": mock_agent,
+        "history": [],
+    }
+    monkeypatch.setattr(server, "_sessions", {"ui": record})
+    real_receipt = active_sessions.release_orphaned_leases_receipt
+    foreign_lease: active_sessions.ActiveSessionLease | None = None
+    thread_started = threading.Event()
+    gate = threading.Event()
+
+    original_prepare = server._prepare_turn_input
+    def _paused_prepare(sid, session, st, text, images):
+        thread_started.set()
+        gate.wait(timeout=5.0)
+        return original_prepare(sid, session, st, text, images)
+
+    monkeypatch.setattr(server, "_prepare_turn_input", _paused_prepare)
+
+    def _admit_turn_and_foreign_acquire(live_ids: set[str]):
+        nonlocal foreign_lease
+        receipt = real_receipt(live_ids)
+        server._run_prompt_submit("r1", "ui", record, "test prompt")
+        assert thread_started.wait(timeout=5.0)
+        foreign_lease, refusal = try_acquire_active_session(
+            session_id="zombie-session",
+            surface="desktop",
+            config={},
+            metadata={"live_session_id": "foreign-runtime"},
+            track_liveness=True,
+        )
+        assert foreign_lease is not None and refusal is None
+        return receipt
+
+    monkeypatch.setattr(
+        "hermes_cli.active_sessions.release_orphaned_leases_receipt",
+        _admit_turn_and_foreign_acquire,
+    )
+
+    try:
+        server._reclaim_orphaned_leases()
+        gate.set()
+
+        rt = record.get("_run_thread")
+        if rt is not None:
+            rt.join(timeout=5.0)
+
+        assert stale.released is True
+        assert record.get("active_session_lease") is None
+        assert record.get("running") is False
+        assert mock_agent.run_conversation.call_count == 0
+    finally:
+        gate.set()
+        if foreign_lease is not None:
+            foreign_lease.release()
+
