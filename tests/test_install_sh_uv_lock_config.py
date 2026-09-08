@@ -50,7 +50,7 @@ def test_installers_keep_bootstrap_isolation_but_restore_project_config_for_lock
     assert 'export XDG_CONFIG_HOME="$isolated_uv_config"' in helper
     assert 'export XDG_CONFIG_DIRS="$isolated_uv_config"' in helper
     assert "$UV_CMD sync --extra all --locked" in helper
-    assert 'run_locked_uv_sync "$INSTALL_DIR/venv"' in install_text
+    assert 'run_locked_uv_sync_with_fallback "$INSTALL_DIR/venv"' in install_text
     assert 'run_locked_uv_sync "$SCRIPT_DIR/venv"' in setup_text
 
 

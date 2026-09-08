@@ -1582,12 +1582,12 @@ clone_repo() {
             # checkout has diverged (or has local-only commits), ff-only pull
             # cannot succeed — mirror ``hermes update`` and reset to the
             # fetched remote so bootstrap/install can recover.
-            if [ "$FETCH_USED_MIRROR" = true ]; then
-                if ! git merge --ff-only "origin/$BRANCH"; then
+            if [ "$FETCH_USED_MIRROR" != true ]; then
+                if ! git pull --ff-only origin "$BRANCH"; then
                     log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
                     git reset --hard "origin/$BRANCH"
                 fi
-            elif ! git pull --ff-only origin "$BRANCH"; then
+            elif ! git merge --ff-only "origin/$BRANCH"; then
                 log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
                 git reset --hard "origin/$BRANCH"
             fi
@@ -1830,29 +1830,6 @@ setup_venv() {
     log_success "Virtual environment ready (Python $PYTHON_VERSION)"
 }
 
-run_locked_uv_sync_attempt() {
-    local project_env="$1"
-    local index_override="$2"
-    local isolated_uv_config
-    local sync_rc
-
-    isolated_uv_config="$(mktemp -d)" || return 1
-    (
-        unset UV_NO_CONFIG UV_CONFIG_FILE
-        export XDG_CONFIG_HOME="$isolated_uv_config"
-        export XDG_CONFIG_DIRS="$isolated_uv_config"
-        if [ -n "$index_override" ]; then
-            export UV_DEFAULT_INDEX="$index_override"
-        else
-            unset UV_DEFAULT_INDEX
-        fi
-        UV_PROJECT_ENVIRONMENT="$project_env" "$UV_CMD" sync --extra all --locked
-    )
-    sync_rc=$?
-    rmdir "$isolated_uv_config" 2>/dev/null || true
-    return "$sync_rc"
-}
-
 run_locked_uv_sync() {
     # Bootstrap uv calls stay isolated from ambient config via UV_NO_CONFIG
     # (#21269). A locked project sync is different: uv.lock records resolver
@@ -1862,9 +1839,26 @@ run_locked_uv_sync() {
     # directory. Keep HOME unchanged so caches, credentials, and git continue
     # to work normally.
     local project_env="$1"
+    local isolated_uv_config
+    local sync_rc
+    isolated_uv_config="$(mktemp -d)" || return 1
+
+    (
+        unset UV_NO_CONFIG UV_CONFIG_FILE
+        export XDG_CONFIG_HOME="$isolated_uv_config"
+        export XDG_CONFIG_DIRS="$isolated_uv_config"
+        UV_PROJECT_ENVIRONMENT="$project_env" $UV_CMD sync --extra all --locked
+    )
+    sync_rc=$?
+    rmdir "$isolated_uv_config" 2>/dev/null || true
+    return "$sync_rc"
+}
+
+run_locked_uv_sync_with_fallback() {
+    local project_env="$1"
     local configured_index="${UV_DEFAULT_INDEX:-}"
 
-    if run_locked_uv_sync_attempt "$project_env" "$configured_index"; then
+    if run_locked_uv_sync "$project_env"; then
         UV_SELECTED_INDEX="$configured_index"
         return 0
     fi
@@ -1876,7 +1870,7 @@ run_locked_uv_sync() {
     fi
 
     log_warn "The default Python package index failed; retrying the locked sync with the configured fallback index..."
-    if run_locked_uv_sync_attempt "$project_env" "$UV_FALLBACK_INDEX"; then
+    if UV_DEFAULT_INDEX="$UV_FALLBACK_INDEX" run_locked_uv_sync "$project_env"; then
         UV_SELECTED_INDEX="$UV_FALLBACK_INDEX"
         export UV_DEFAULT_INDEX="$UV_FALLBACK_INDEX"
         log_success "Locked Python sync succeeded through the fallback index"
@@ -2044,7 +2038,7 @@ install_deps() {
         # (redirected to an empty XDG dir), preserving the #21269 guarantee.
         # Runtime code does the same before its locked syncs
         # (hermes_cli/managed_uv.py).
-        if run_locked_uv_sync "$INSTALL_DIR/venv"; then
+        if run_locked_uv_sync_with_fallback "$INSTALL_DIR/venv"; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
