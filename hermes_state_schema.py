@@ -478,6 +478,8 @@ class SessionSchemaMixin:
         foreign_holders = self._foreign_state_db_holders()
         if foreign_holders and self._defer_stale_fts_for_holders(cursor, foreign_holders):
             return False
+        if getattr(self, "_fts_setup_admitted", False):
+            return self._recover_stale_fts_locked(cursor, legacy=legacy)
         with fts_rebuild_admission(self.db_path, timeout_seconds=timeout_seconds) as admitted:
             if not admitted:
                 logger.warning(
@@ -1018,6 +1020,21 @@ class SessionSchemaMixin:
             pass  # Index already exists
 
     def _init_fts(self, cursor: sqlite3.Cursor) -> None:
+        """Serialize complete FTS bootstrap across gateway processes."""
+        with fts_rebuild_admission(self.db_path) as admitted:
+            if not admitted:
+                cursor.execute(_STALE_KEY_UPSERT_SQL, (FTS_STALE_KEY,))
+                self._drop_all_fts_triggers(cursor)
+                self._fts_stale = True
+                self._fts_enabled = self._trigram_available = self._fts_cjk_available = False
+                return
+            self._fts_setup_admitted = True
+            try:
+                self._init_fts_under_admission(cursor)
+            finally:
+                self._fts_setup_admitted = False
+
+    def _init_fts_under_admission(self, cursor: sqlite3.Cursor) -> None:
         """Create/repair the FTS objects on an FTS5-capable runtime. The DDL runs even when the
         vtable exists so CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation.
         OPT-IN v23 boundary: a legacy v22 inline install keeps its inline schema + triggers
@@ -1066,6 +1083,9 @@ class SessionSchemaMixin:
 
         See #93200.
         """
+        if getattr(self, "_fts_setup_admitted", False):
+            rebuild_fn()
+            return
         with fts_rebuild_admission(self.db_path) as admitted:
             if admitted:
                 rebuild_fn()
