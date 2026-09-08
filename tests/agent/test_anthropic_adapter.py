@@ -38,10 +38,11 @@ class TestBuildAnthropicClient:
 
     def test_api_key_uses_api_key(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client("sk-ant-api03-something")
+            client = build_anthropic_client("sk-ant-api03-something")
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["api_key"] == "sk-ant-api03-something"
-            assert "auth_token" not in kwargs
+            assert kwargs["auth_token"] is None
+            assert client.auth_token is None
             # API key auth should still get common betas
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "interleaved-thinking-2025-05-14" in betas
@@ -62,7 +63,7 @@ class TestBuildAnthropicClient:
         client here and must merge the same set.
         """
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
-            build_anthropic_client(
+            client = build_anthropic_client(
                 "sk-opencode-secret",
                 base_url="https://opencode.ai/zen/go/v1",
             )
@@ -73,6 +74,8 @@ class TestBuildAnthropicClient:
             assert headers["User-Agent"].startswith("HermesAgent/")
             # Auth branch is unchanged: x-api-key via api_key, betas kept.
             assert kwargs["api_key"] == "sk-opencode-secret"
+            assert kwargs["auth_token"] is None
+            assert client.auth_token is None
             assert "anthropic-beta" in headers
 
     def test_minimax_anthropic_endpoint_uses_bearer_auth_for_regular_api_keys(self):
@@ -135,6 +138,19 @@ class TestBuildAnthropicClient:
             build_anthropic_client("sk-ant-api03-something")
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["max_retries"] == 0
+
+    def test_third_party_endpoint_clears_env_anthropic_auth_token(self, monkeypatch):
+        """#105774: ANTHROPIC_AUTH_TOKEN in the environment must not leak to third-party endpoints."""
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sentinel-auth-token-do-not-leak")
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            client = build_anthropic_client(
+                "provider-key-xyz",
+                base_url="https://api.thirdparty.com/v1",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["api_key"] == "provider-key-xyz"
+            assert kwargs["auth_token"] is None
+            assert client.auth_token is None
 
 
 
