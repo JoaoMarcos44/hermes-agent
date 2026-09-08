@@ -8,7 +8,24 @@ import sqlite3
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from hermes_state_common import FTS_CJK_STALE_KEY, FTS_STALE_KEY, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS
+from hermes_state_common import (
+    FTS_CJK_STALE_KEY,
+    FTS_STALE_KEY,
+    _FTS_CJK_TRIGGERS,
+    _FTS_TRIGGERS,
+)
+
+
+def _execute_ddl_script_transactional(cursor: sqlite3.Cursor, ddl: str) -> None:
+    """Execute FTS DDL without executescript's implicit transaction commit."""
+    statement = ""
+    for line in ddl.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            cursor.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.OperationalError("incomplete FTS DDL statement")
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
@@ -239,7 +256,7 @@ class SessionFtsSetupMixin:
             self._fts_cjk_available = False
             return
         try:
-            cursor.executescript(FTS_CJK_TABLE_SQL)
+            _execute_ddl_script_transactional(cursor, FTS_CJK_TABLE_SQL)
             if not cjk_present:
                 # An old stale breadcrumb refers to a table that no longer exists.
                 cursor.execute("DELETE FROM state_meta WHERE key = ?", (FTS_CJK_STALE_KEY,))
@@ -259,7 +276,7 @@ class SessionFtsSetupMixin:
                 # Gap of unknown extent: do NOT reinstall triggers (see module comment).
                 self._fts_cjk_available = False
                 return
-            cursor.executescript(FTS_CJK_TRIGGER_SQL)
+            _execute_ddl_script_transactional(cursor, FTS_CJK_TRIGGER_SQL)
             backfill_pending = cursor.execute(
                 "SELECT 1 FROM state_meta WHERE key = 'fts_cjk_rebuild_high_water' LIMIT 1"
             ).fetchone()
@@ -285,7 +302,7 @@ class SessionFtsSetupMixin:
             return False
         try:
             # Run even when the table exists: recreates triggers a no-FTS5 runtime dropped.
-            cursor.executescript(ddl)
+            _execute_ddl_script_transactional(cursor, ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
