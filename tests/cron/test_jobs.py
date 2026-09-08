@@ -1801,6 +1801,22 @@ class TestAdvanceNextRuns:
         assert advance_next_run(one_ids[0]) is False
         assert advance_next_run("missing-id") is False
 
+    def test_batch_preserves_off_tick_manual_trigger_marker(self, tmp_cron_dir):
+        """A trigger scheduled between ticks must not consume the next occurrence."""
+        from cron.jobs import advance_next_runs
+
+        job = create_job(prompt="manual", schedule="every 1h")
+        triggered_at = job["next_run_at"]
+        jobs = load_jobs()
+        stored = next(item for item in jobs if item["id"] == job["id"])
+        stored["manual_run_at"] = triggered_at
+        save_jobs(jobs)
+
+        assert advance_next_runs([job["id"]]) == 0
+        preserved = get_job(job["id"])
+        assert preserved["next_run_at"] == triggered_at
+        assert preserved["manual_run_at"] == triggered_at
+
 
 # =========================================================================
 # Completed one-shot retention sweep
