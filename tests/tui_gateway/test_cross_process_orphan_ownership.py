@@ -936,6 +936,10 @@ def test_reclaim_matches_by_state_path_not_home_spelling(
     _pin_reclaim_env(monkeypatch)
     if str(real_root.resolve()) != str(real_root):
         respelled_root = real_root
+    elif os.name == "nt":
+        # Windows treats this as the same directory without requiring the
+        # SeCreateSymbolicLinkPrivilege that CI/test users commonly lack.
+        respelled_root = real_root.parent / real_root.name.upper()
     else:
         # A lease acquired against an OUT-OF-TREE alias of the real root (symlink,
         # junction, client-supplied spelling) pins a state_path the sweep never
