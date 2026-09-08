@@ -122,26 +122,33 @@ hermes doctor       # Diagnose any issues
 ### Restricted or high-latency networks (no proxy needed)
 
 The installer and updater try official endpoints first. If the Git repository
-fetch or locked Python sync fails, Hermes retries that same channel through a
+fetch or locked Python sync fails, Hermes can retry that channel through a
 configured fallback only after the measured failure. It never selects a mirror
 from an IP address or inferred region.
 
-The fallback endpoints are community-operated, not Hermes infrastructure. Set
-your own endpoints, or disable either fallback by exporting an empty value:
+The Git fallback is **opt-in** (`GIT_FALLBACK_REPO_URL` is unset by default) so
+that unauthenticated source mirrors are never contacted automatically. When
+using a Git fallback mirror, pair it with `--commit <40-char-sha>` so the
+installer verifies upstream commit provenance before accepting the tree. The
+locked Python sync defaults to a fallback Simple API mirror because `uv.lock`
+maintains Tier-0 cryptographic hash verification regardless of index:
 
 ```bash
+# Enable a Git fallback mirror (pair with --commit for provenance verification)
 export GIT_FALLBACK_REPO_URL=https://your-mirror.example/NousResearch/hermes-agent.git
+
+# Set or disable the uv fallback index (defaults to TUNA Simple API mirror)
 export UV_FALLBACK_INDEX=https://your-mirror.example/simple
-# export GIT_FALLBACK_REPO_URL=
 # export UV_FALLBACK_INDEX=
 ```
 
 After a fresh mirror clone, `origin` is restored to the official repository and
 the checkout passes Git object verification. Existing checkouts keep their
-current remote identity (a fork may be intentional), so inspect it with
-`git remote -v`. Object hashes prove internal consistency, not upstream
-provenance; for a high-assurance install, pin and verify a full commit SHA with
-`--commit <40-char-sha>`.
+current remote identity (a fork may be intentional); for a fork remote, the
+fallback stays scoped to that fork identity or fails closed rather than
+switching repositories. Pinned commit fetches (`--commit`) always fetch from
+the configured `origin` remote.
+
 The locked `uv sync` keeps the hashes in `uv.lock` enabled. An explicit
 `UV_DEFAULT_INDEX` always wins over the failure-triggered fallback.
 

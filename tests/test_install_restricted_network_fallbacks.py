@@ -48,7 +48,7 @@ command = args[0]
 if command == "clone":
     url = args[-2]
     destination = Path(args[-1])
-    if url != os.environ["FAKE_GIT_MIRROR"]:
+    if url != os.environ.get("FAKE_GIT_MIRROR"):
         raise SystemExit(1)
     if os.environ.get("FAKE_GIT_MIRROR_OK", "1") != "1":
         raise SystemExit(1)
@@ -56,9 +56,45 @@ if command == "clone":
     raise SystemExit(0)
 
 if command == "rev-parse":
+    if cwd is not None and not (cwd / ".git").exists():
+        raise SystemExit(1)
+    if "--verify" in args:
+        print(os.environ.get("FAKE_GIT_HEAD_SHA", "0123456789abcdef0123456789abcdef01234567"))
+        raise SystemExit(0)
+    for arg in args[1:]:
+        if not arg.startswith("-"):
+            if "^{commit}" in arg:
+                target = arg.replace("^{commit}", "")
+                print(os.environ.get("FAKE_GIT_EXPECTED_SHA", target))
+                raise SystemExit(0)
+            print(os.environ.get("FAKE_GIT_HEAD_SHA", arg))
+            raise SystemExit(0)
     raise SystemExit(0 if cwd is not None and (cwd / ".git").exists() else 1)
 
-if command in {"fsck", "remote", "cat-file", "checkout", "reset", "merge", "pull"}:
+if command == "cat-file":
+    if os.environ.get("FAKE_GIT_CAT_FILE_FAIL", "0") == "1":
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+if command == "remote":
+    if len(args) >= 3 and args[1] == "get-url":
+        print(os.environ.get("FAKE_GIT_ORIGIN_URL", "https://github.com/NousResearch/hermes-agent.git"))
+        raise SystemExit(0)
+    raise SystemExit(0)
+
+if command == "fetch":
+    if os.environ.get("FAKE_GIT_FETCH_FAIL", "0") == "1":
+        raise SystemExit(1)
+    if len(args) >= 2 and args[1] == "origin" and os.environ.get("FAKE_GIT_FETCH_ORIGIN_FAIL", "0") == "1":
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+if command == "checkout":
+    if os.environ.get("FAKE_GIT_CHECKOUT_FAIL", "0") == "1":
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+if command in {"fsck", "reset", "merge", "pull", "status", "ls-files", "stash", "update-ref"}:
     raise SystemExit(0)
 
 raise SystemExit(0)
@@ -105,25 +141,63 @@ def _base_env(tmp_path: Path, fake_bin: Path) -> dict[str, str]:
     }
 
 
-def _run_stage(stage: str, *, install_dir: Path, hermes_home: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_stage(
+    stage: str,
+    *,
+    install_dir: Path,
+    hermes_home: Path,
+    env: dict[str, str],
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    cmd = [
+        "/bin/bash",
+        str(INSTALL_SH),
+        "--stage",
+        stage,
+        "--non-interactive",
+        "--dir",
+        str(install_dir),
+        "--hermes-home",
+        str(hermes_home),
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
     return subprocess.run(
-        [
-            "/bin/bash",
-            str(INSTALL_SH),
-            "--stage",
-            stage,
-            "--non-interactive",
-            "--dir",
-            str(install_dir),
-            "--hermes-home",
-            str(hermes_home),
-        ],
+        cmd,
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
         timeout=90,
     )
+
+
+def test_git_fallback_is_opt_in_by_default(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = _executable(fake_bin / "git", _FAKE_GIT)
+    mirror = "mirror://hermes-agent"
+
+    home = tmp_path / "home"
+    log = tmp_path / "git.log"
+    env = _base_env(tmp_path, fake_bin)
+    env.update(
+        FAKE_GIT_LOG=str(log),
+        FAKE_GIT_MIRROR=mirror,
+    )
+    env.pop("GIT_FALLBACK_REPO_URL", None)
+    result = _run_stage(
+        "repository",
+        install_dir=tmp_path / "install",
+        hermes_home=home,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "Failed to clone repository" in result.stdout
+    assert "Cloned via fallback mirror" not in result.stdout
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert not any(mirror in line for line in calls)
 
 
 def test_git_fallback_is_official_first_and_fails_closed(tmp_path: Path) -> None:
@@ -177,6 +251,107 @@ def test_git_fallback_is_official_first_and_fails_closed(tmp_path: Path) -> None
     assert "Failed to clone repository" in failed.stdout
     assert "Cloned via fallback mirror" not in failed.stdout
     assert not (tmp_path / "failed-install").exists()
+
+
+def test_mirror_checkout_refuses_different_history_pre_effect(tmp_path: Path) -> None:
+    """Negative regression for P1: mirror returns valid Git graph but different history."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = _executable(fake_bin / "git", _FAKE_GIT)
+    mirror = "mirror://hermes-agent"
+    expected_commit = "1111111111111111111111111111111111111111"
+
+    home = tmp_path / "home"
+    log = tmp_path / "git.log"
+    install_dir = tmp_path / "install"
+    env = _base_env(tmp_path, fake_bin)
+    env.update(
+        FAKE_GIT_LOG=str(log),
+        FAKE_GIT_MIRROR=mirror,
+        GIT_FALLBACK_REPO_URL=mirror,
+        FAKE_GIT_CAT_FILE_FAIL="1",
+        FAKE_GIT_HEAD_SHA="2222222222222222222222222222222222222222",
+    )
+    result = _run_stage(
+        "repository",
+        install_dir=install_dir,
+        hermes_home=home,
+        env=env,
+        extra_args=["--commit", expected_commit],
+    )
+
+    assert result.returncode != 0
+    assert "does not contain expected commit" in result.stdout or "does not match expected upstream commit" in result.stdout
+    assert "Cloned via fallback mirror" not in result.stdout
+    assert not install_dir.exists(), "Tree must be refused and cleaned up pre-effect"
+
+
+def test_existing_checkout_fork_pins_from_configured_origin(tmp_path: Path) -> None:
+    """Regression for P1: missing commit pin on a fork must fetch from origin (the fork), not Nous."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = _executable(fake_bin / "git", _FAKE_GIT)
+    fork_url = "https://github.com/contributor-fork/hermes-agent.git"
+    fork_commit = "3333333333333333333333333333333333333333"
+
+    home = tmp_path / "home"
+    log = tmp_path / "git.log"
+    install_dir = tmp_path / "install"
+    (install_dir / ".git").mkdir(parents=True)
+
+    env = _base_env(tmp_path, fake_bin)
+    env.update(
+        FAKE_GIT_LOG=str(log),
+        FAKE_GIT_ORIGIN_URL=fork_url,
+        FAKE_GIT_CAT_FILE_FAIL="1",
+    )
+    result = _run_stage(
+        "repository",
+        install_dir=install_dir,
+        hermes_home=home,
+        env=env,
+        extra_args=["--commit", fork_commit],
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    pin_fetches = [line for line in calls if f"fetch origin {fork_commit}" in line]
+    assert pin_fetches, f"Expected fetch from fork origin, got calls: {calls}"
+    assert not any("NousResearch/hermes-agent" in line and fork_commit in line for line in calls)
+
+
+def test_existing_checkout_fork_fetch_failure_fails_closed_without_switching_origin(tmp_path: Path) -> None:
+    """Regression for P1: fetch failure on a fork fails closed and does not clobber refs with Nous mirror."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = _executable(fake_bin / "git", _FAKE_GIT)
+    fork_url = "https://github.com/contributor-fork/hermes-agent.git"
+    mirror = "mirror://hermes-agent"
+
+    home = tmp_path / "home"
+    log = tmp_path / "git.log"
+    install_dir = tmp_path / "install"
+    (install_dir / ".git").mkdir(parents=True)
+
+    env = _base_env(tmp_path, fake_bin)
+    env.update(
+        FAKE_GIT_LOG=str(log),
+        FAKE_GIT_ORIGIN_URL=fork_url,
+        FAKE_GIT_FETCH_ORIGIN_FAIL="1",
+        GIT_FALLBACK_REPO_URL=mirror,
+        FAKE_GIT_MIRROR=mirror,
+    )
+    result = _run_stage(
+        "repository",
+        install_dir=install_dir,
+        hermes_home=home,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "Refusing to overwrite fork tracking ref with upstream fallback mirror" in result.stdout
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert not any("refs/remotes/origin" in line and mirror in line for line in calls)
 
 
 def test_uv_index_fallback_is_failure_triggered_and_respects_user_override(tmp_path: Path) -> None:

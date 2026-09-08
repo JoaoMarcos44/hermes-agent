@@ -41,7 +41,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _https_branch() -> str:
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     m = re.search(
         r"log_info \"SSH failed, trying HTTPS\.\.\..*?(?=\n    fi\n)",
         text,
