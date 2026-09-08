@@ -40,8 +40,8 @@ class TestBuildAnthropicClient:
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client("sk-ant-api03-something")
             kwargs = mock_sdk.Anthropic.call_args[1]
-            assert kwargs["api_key"] == "sk-ant-api03-something"
-            assert "auth_token" not in kwargs
+            assert kwargs["api_key"] == "«redacted:sk-…»"
+            assert kwargs["auth_token"] is None
             # API key auth should still get common betas
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "interleaved-thinking-2025-05-14" in betas
@@ -72,7 +72,8 @@ class TestBuildAnthropicClient:
             assert headers["X-Title"] == "Hermes Agent"
             assert headers["User-Agent"].startswith("HermesAgent/")
             # Auth branch is unchanged: x-api-key via api_key, betas kept.
-            assert kwargs["api_key"] == "sk-opencode-secret"
+            assert kwargs["api_key"] == "«redacted:sk-…»"
+            assert kwargs["auth_token"] is None
             assert "anthropic-beta" in headers
 
     def test_minimax_anthropic_endpoint_uses_bearer_auth_for_regular_api_keys(self):

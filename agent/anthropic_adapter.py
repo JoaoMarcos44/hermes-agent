@@ -345,8 +345,10 @@ def _build_anthropic_client_with_bearer_hook(
 def _new_sdk_client(sdk, kwargs: Dict[str, Any], headers: Dict[str, str]):
     """``sdk.Anthropic(**kwargs)`` with ``headers`` attached. Bearer-only construction leaves
     ``api_key`` unset, so the SDK fills it from ANTHROPIC_API_KEY (loaded from ~/.hermes/.env) and
-    sends dual auth — X-Api-Key *and* Authorization: Bearer — on every Portal/MiniMax/OAuth/Entra
-    request; clear it whenever we intentionally authenticated via auth_token."""
+    sends dual auth — X-Api-Key *and* Authorization: Bearer *** on every Portal/MiniMax/OAuth/Entra
+    request; clear it whenever we intentionally authenticated via auth_token. ``auth_token`` is
+    explicitly set to None for API-key clients so the SDK cannot inherit ANTHROPIC_AUTH_TOKEN from
+    the process environment and leak it to a third-party endpoint."""
     if headers:
         kwargs["default_headers"] = headers
     client = sdk.Anthropic(**kwargs)
@@ -392,6 +394,8 @@ def build_anthropic_client(api_key, base_url: str = None, timeout: float = None,
     common_betas = _common_betas_for_base_url(normalized_base_url, drop_context_1m_beta=drop_context_1m_beta)
     style = _auth_style(api_key, base_url, normalized_base_url)
     kwargs["auth_token" if style in ("bearer", "oauth") else "api_key"] = api_key
+    if style not in ("bearer", "oauth"):
+        kwargs["auth_token"] = None
     headers = _beta_header(common_betas + _OAUTH_ONLY_BETAS if style == "oauth" else common_betas)
     if style == "kimi":
         headers = {**_attribution_headers(), **headers}
