@@ -52,6 +52,11 @@ _CEILING_NO_TEXT = (
     "continuation attempt — its reasoning consumed the entire budget each time.\n\nTo fix this:\n"
     "→ Lower reasoning effort: `/reasoning low` or `/reasoning none`\n→ Or raise max_tokens for this model"
 )
+_CONTEXT_OVERFLOW_PARTIAL_FINAL = (
+    "The conversation exceeded the provider's context or payload limit after partial delivery, "
+    "so the partial response was not continued. Start a new session (or /new) to continue "
+    "with a clean transcript."
+)
 
 
 def normalize_response_for_agent(agent: Any, response: Any) -> Any:
@@ -325,6 +330,23 @@ def recover_from_truncation(
         f"{agent.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens",
         force=True,
     )
+
+    # A stream that died after delivery because the request was already too large
+    # cannot be safely continued: appending the recovered fragment or a nudge
+    # makes every later request larger. End through the normal persistence/recovery
+    # contract without mutating the transcript (#106260).
+    if getattr(st.response, "_overflow_terminal", False):
+        agent._flush_status_buffer()
+        agent._vprint(
+            f"{agent.log_prefix}⚠️  Stream ended on a context/payload limit after partial "
+            "delivery — not continuing the oversized transcript.",
+            force=True,
+        )
+        return st.end_turn(
+            _CONTEXT_OVERFLOW_PARTIAL_FINAL,
+            error=_CONTEXT_OVERFLOW_PARTIAL_FINAL,
+            failed=True,
+        )
 
     _trunc_msg = normalize_response_for_agent(agent, response)
     _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None

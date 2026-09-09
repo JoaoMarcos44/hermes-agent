@@ -2174,11 +2174,14 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
-    dropped_tool_names=None):
+    dropped_tool_names=None, overflow_terminal=False):
     """Stub for an SSE stream that ended without ``finish_reason`` after
     delivering content. Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH``
     so the loop enters its continuation/retry path instead of accepting
-    truncated output as a complete turn (#32086)."""
+    truncated output as a complete turn (#32086). An overflow-terminal stub
+    carries no recovered content and ends the turn without continuation: adding
+    the partial fragment would make an already oversized transcript grow
+    monotonically (#106260)."""
     return SimpleNamespace(
         id=PARTIAL_STREAM_STUB_ID,
         model=model_name,
@@ -2190,6 +2193,7 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
         )],
         usage=usage_obj,
         _dropped_tool_names=dropped_tool_names or None,
+        _overflow_terminal=overflow_terminal,
     )
 
 
@@ -3244,10 +3248,32 @@ class _StreamingCall(StreamingWaitMonitor):
         """Tokens already reached the platform: a finish_reason="length" stub fires the
         continuation machinery; tool_calls=None blocks executing incomplete calls.
         Content may be EMPTY on purpose — the loop skips appending an empty stub and
-        only sends the nudge (placeholder text leaked into the stitched response)."""
+        only sends the nudge (placeholder text leaked into the stitched response).
+        A context/payload-overflow failure is terminal: the partial content is
+        already too large to replay safely, so it is not seeded for continuation."""
         error = self.result["error"]
         _partial_text = (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip() or None
         _partial_names = list(self.result.get("partial_tool_names") or [])
+        _classification = None
+        try:
+            from agent.error_classifier import classify_api_error
+            _classification = classify_api_error(
+                error,
+                provider=str(getattr(self.agent, "provider", "") or ""),
+                model=str(getattr(self.agent, "model", "") or ""),
+            )
+        except Exception as classification_error:
+            # Classification is advisory here; preserving the established partial
+            # recovery path is safer than turning an unclassifiable stream failure
+            # into a terminal turn.
+            logger.debug(
+                "Partial-stream error classification unavailable (%s); preserving normal recovery",
+                type(classification_error).__name__,
+            )
+        _overflow_terminal = _classification is not None and _classification.reason in (
+            FailoverReason.context_overflow,
+            FailoverReason.payload_too_large,
+        )
         if _partial_names:
             # User-visible warning so the user and model both know what was attempted.
             _name_str = ", ".join(_partial_names[:3])
@@ -3260,21 +3286,29 @@ class _StreamingCall(StreamingWaitMonitor):
             logger.warning(
                 "Partial stream dropped tool call(s) %s after %s chars of text; surfaced warning to user: %s",
                 _partial_names, len(_partial_text or ""), error)
-        else:
+        if _overflow_terminal:
+            logger.warning(
+                "Partial stream ended on a context/payload limit after %s chars; "
+                "dropping recovered content instead of seeding continuation",
+                len(_partial_text or ""),
+            )
+        elif not _partial_names:
             logger.warning(
                 "Partial stream delivered before error; returning length-truncated stub with %s chars of "
                 "recovered content so the loop can continue from where the stream died: %s",
                 len(_partial_text or ""), error)
+        if _overflow_terminal:
+            _reset_stale_streak(self.agent)
+            return _build_partial_stream_stub(
+                "assistant", None, None, getattr(self.agent, "model", "unknown"), None,
+                dropped_tool_names=_partial_names, overflow_terminal=True,
+            )
         # Classify content filtering (MiniMax 1027, Azure content_filter, Anthropic refusal)
         # before the error is swallowed into the stub: the loop reads the tag and falls back.
         _stub = _build_partial_stream_stub("assistant", _partial_text, None,
             getattr(self.agent, "model", "unknown"), None, dropped_tool_names=_partial_names)
-        with contextlib.suppress(Exception):
-            from agent.error_classifier import classify_api_error
-            _cls = classify_api_error(
-                error, provider=str(getattr(self.agent, "provider", "") or ""), model=str(getattr(self.agent, "model", "") or ""))
-            if _cls.reason == FailoverReason.content_policy_blocked:
-                _stub._content_filter_terminated = True
+        if _classification is not None and _classification.reason == FailoverReason.content_policy_blocked:
+            _stub._content_filter_terminated = True
         _reset_stale_streak(self.agent)  # deltas fired => provider responsive: clear the breaker
         return _stub
 
