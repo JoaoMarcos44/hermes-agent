@@ -11580,10 +11580,11 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
           )
           await stopPoolBackend(key)
 
-          if (source.kind === 'ssh') {
-            await sshBootstrapCoordinator.cancelAndWait(key)
-            await teardownSshConnection(key)
-          }
+          // The SSH transport is shared by the primary backend and its pooled
+          // siblings. Retiring one remote serve must not close that transport:
+          // doing so also disconnects the primary backend and interrupts live
+          // turns there (#106935). The next ensure path reuses the still-live
+          // SSH connection and starts only this pool entry again.
         }
       })
     )
