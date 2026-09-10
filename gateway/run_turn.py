@@ -1643,6 +1643,25 @@ class GatewayTurnMixin:
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
 
+    @staticmethod
+    def _hmwa_failed_turn_boundary_entry(*, session_id, event, prepared, content, ts):
+        """Build a stable, machine-owned boundary for one failed inbound event."""
+        import uuid
+        identity = prepared.persistence_owner or (
+            str(event.message_id) if getattr(event, "message_id", None) else None
+        )
+        boundary_key = f"gateway:{identity}" if identity else f"gateway:{session_id}:{uuid.uuid4()}"
+        return {
+            "role": "assistant",
+            "content": content,
+            "timestamp": ts,
+            "display_kind": "gateway_failed_turn_boundary",
+            "display_metadata": {"gateway_failed_turn_boundary": boundary_key},
+            "_gateway_boundary_platform_message_id": (
+                str(event.message_id) if getattr(event, "message_id", None) else None
+            ),
+        }
+
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -1698,7 +1717,10 @@ class GatewayTurnMixin:
                 # provider details; this row is gateway-owned and was not written by the agent.
                 await store.append_to_transcript(
                     sid,
-                    {"role": "assistant", "content": failed_turn_notice, "timestamp": ts},
+                    self._hmwa_failed_turn_boundary_entry(
+                        session_id=sid, event=event, prepared=prepared,
+                        content=failed_turn_notice, ts=ts,
+                    ),
                 )
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
@@ -1806,11 +1828,10 @@ class GatewayTurnMixin:
                     )
                 await self.async_session_store.append_to_transcript(
                     session_entry.session_id,
-                    {
-                        "role": "assistant",
-                        "content": self._PARTIAL_FAILED_TURN_NOTICE,
-                        "timestamp": time.time(),
-                    },
+                    self._hmwa_failed_turn_boundary_entry(
+                        session_id=session_entry.session_id, event=event, prepared=prepared,
+                        content=self._PARTIAL_FAILED_TURN_NOTICE, ts=time.time(),
+                    ),
                 )
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)

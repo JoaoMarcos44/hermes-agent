@@ -307,6 +307,96 @@ class SessionMessagesMixin:
         # holding the lock for seconds (VACUUM, checkpoint) can't kill it.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def append_user_message_if_absent(self, session_id: str, message: Dict[str, Any]) -> bool:
+        """Append a platform user message once, atomically keyed by its platform id."""
+        platform_message_id = message.get("platform_message_id") or message.get("message_id")
+        if not session_id or not platform_message_id:
+            raise ValueError("Atomic user deduplication requires a platform message id")
+        msg = {**message, "platform_message_id": str(platform_message_id)}
+        owner = (msg.get("display_metadata") or {}).get("gateway_input_owner")
+        tool_calls = _parse_tool_calls(msg.get("tool_calls"))
+        message_timestamp = _coerce_timestamp(msg.get("timestamp"), time.time())
+        params = self._message_row_params(
+            session_id, "user", msg, tool_calls, message_timestamp, keep_reasoning=False)
+
+        def _do(conn):
+            existing = conn.execute(
+                """WITH RECURSIVE lineage(id) AS (
+                    SELECT ? UNION
+                    SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
+                    JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
+                ) SELECT 1 FROM messages m JOIN lineage l ON m.session_id = l.id
+                WHERE m.role = 'user' AND (m.active = 1 OR m.compacted = 1) AND m.observed = 0
+                  AND m.platform_message_id = ?
+                  AND CASE WHEN json_valid(m.display_metadata)
+                       THEN json_extract(m.display_metadata, '$.gateway_input_owner') END = ? LIMIT 1""",
+                (session_id, str(platform_message_id), owner),
+            ).fetchone()
+            if existing is not None:
+                return False
+            self._check_transcript_write_guards(conn, session_id, None)
+            conn.execute(_INSERT_MESSAGE_SQL, params)
+            self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
+            return True
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def append_gateway_failed_turn_boundary(
+        self, session_id: str, message: Dict[str, Any], boundary_key: str,
+        *, legacy_platform_message_id: Optional[str] = None,
+    ) -> bool:
+        """Append one failed-turn boundary, atomically deduplicated by its stable gateway key.
+
+        The legacy content probe prevents a rollout from adding a second boundary after a row written
+        by the pre-marker implementation.
+        """
+        if not session_id or not boundary_key:
+            raise ValueError("Failed-turn boundary requires a session and stable key")
+        msg = dict(message)
+        metadata = dict(msg.get("display_metadata") or {})
+        metadata["gateway_failed_turn_boundary"] = boundary_key
+        msg["display_kind"] = "gateway_failed_turn_boundary"
+        msg["display_metadata"] = metadata
+        tool_calls = _parse_tool_calls(msg.get("tool_calls"))
+        message_timestamp = _coerce_timestamp(msg.get("timestamp"), time.time())
+        params = self._message_row_params(
+            session_id, "assistant", msg, tool_calls, message_timestamp, keep_reasoning=True)
+        encoded_content = self._encode_content(msg.get("content"))
+        legacy_id = str(legacy_platform_message_id) if legacy_platform_message_id else None
+
+        def _do(conn):
+            existing = conn.execute(
+                """WITH RECURSIVE lineage(id) AS (
+                    SELECT ? UNION
+                    SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
+                    JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
+                ) SELECT 1 FROM messages m JOIN lineage l ON m.session_id = l.id
+                   WHERE m.role = 'assistant'
+                     AND (m.active = 1 OR m.compacted = 1)
+                     AND (
+                         (m.display_kind = 'gateway_failed_turn_boundary'
+                          AND CASE WHEN json_valid(m.display_metadata)
+                               THEN json_extract(m.display_metadata, '$.gateway_failed_turn_boundary') END = ?)
+                         OR (
+                             ? IS NOT NULL AND m.content = ?
+                             AND m.id > COALESCE((
+                                 SELECT MAX(mu.id) FROM messages mu JOIN lineage lu ON mu.session_id = lu.id
+                                 WHERE mu.role = 'user'
+                                   AND (mu.active = 1 OR mu.compacted = 1) AND mu.platform_message_id = ?
+                             ), 0)
+                         )
+                     ) LIMIT 1""",
+                (session_id, boundary_key, legacy_id, encoded_content, legacy_id),
+            ).fetchone()
+            if existing is not None:
+                return False
+            self._check_transcript_write_guards(conn, session_id, None)
+            conn.execute(_INSERT_MESSAGE_SQL, params)
+            self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
+            return True
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def append_delegation_delivery(self, session_id: str, content: str, metadata: Dict[str, Any]) -> int:
         """Record a detached API result once, between client turns, including replay after rotation.
 

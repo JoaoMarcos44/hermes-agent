@@ -333,6 +333,18 @@ class SessionTranscriptMixin:
             # into the ambient store.
             raise RuntimeError(
                 f"no owning session store for {session_id}; deferring transcript write")
+        if message.get("role") == "user" and (message.get("platform_message_id") or message.get("message_id")):
+            _db.append_user_message_if_absent(session_id, message)
+            return
+        if message.get("display_kind") == "gateway_failed_turn_boundary":
+            metadata = message.get("display_metadata") or {}
+            _db.append_gateway_failed_turn_boundary(
+                session_id,
+                message,
+                str(metadata.get("gateway_failed_turn_boundary") or ""),
+                legacy_platform_message_id=message.get("_gateway_boundary_platform_message_id"),
+            )
+            return
         is_assistant = message.get("role") == "assistant"
         _db.append_message(
             session_id=session_id,
