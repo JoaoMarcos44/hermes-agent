@@ -13,6 +13,7 @@ os.environ.update(keep)
 os.environ.update(
     HOME=str(HOME),
     HERMES_HOME=str(HOME),
+    USERPROFILE=str(HOME),
     HERMES_DISABLE_PLUGINS="1",
     NO_PROXY="127.0.0.1,localhost",
 )

@@ -100,6 +100,24 @@ def _stale_holder(row, now: float) -> bool:
 
 
 class SessionMessagesMixin:
+    def append_user_message_if_absent(self, session_id: str, message: Dict[str, Any]) -> bool:
+        """Atomically append an unobserved gateway-owned user message once."""
+        owner = (message.get("display_metadata") or {}).get("gateway_input_owner")
+        if not owner:
+            self.append_message(session_id, "user", **{k: v for k, v in message.items() if k != "role"})
+            return True
+        msg = dict(message)
+        msg["display_metadata"] = self._encode_display_metadata(msg.get("display_metadata"))
+        params = self._message_row_params(session_id, "user", msg, _parse_tool_calls(msg.get("tool_calls")),
+                                          _coerce_timestamp(msg.get("timestamp"), time.time()), keep_reasoning=True)
+        def _do(conn):
+            if conn.execute("SELECT 1 FROM messages WHERE session_id = ? AND role = 'user' AND active = 1 AND observed = 0 AND json_valid(display_metadata) AND json_extract(display_metadata, '$.gateway_input_owner') = ? LIMIT 1", (session_id, owner)).fetchone():
+                return False
+            row_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            self._bump_session_counters(conn, session_id, 1, 0, unit=True)
+            return bool(row_id)
+        return bool(self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S))
+
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:

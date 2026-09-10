@@ -1666,13 +1666,8 @@ class GatewayTurnMixin:
                 # Transient failure / hidden-reasoning incomplete: persist only the user message (the
                 # assistant error text is a gateway hint, not model output). Dedupe on platform
                 # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
-                    logger.info(
-                        "Skipping duplicate user turn (message_id=%s) in session %s",
-                        event.message_id, sid,
-                    )
-                else:
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                if not agent_persisted:
+                    await store.append_user_message_if_absent(sid, _user_row)
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
                 # counts session_meta entries stripped before the agent saw them.
@@ -1770,13 +1765,9 @@ class GatewayTurnMixin:
         # Replay can coalesce inputs; only this input's durable marker establishes ownership.
         try:
             if prepared.message_text is not None and session_entry is not None:
-                _owned = await self.async_session_store.has_input_owner(
-                    prepared.persistence_session_id, prepared.persistence_owner,
+                await self.async_session_store.append_user_message_if_absent(
+                    session_entry.session_id, self._hmwa_user_transcript_entry(event, prepared, time.time()),
                 )
-                if not _owned:
-                    await self.async_session_store.append_to_transcript(
-                        session_entry.session_id, self._hmwa_user_transcript_entry(event, prepared, time.time()),
-                    )
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
         # Never expose raw exception types/messages to end users (info-leakage risk).

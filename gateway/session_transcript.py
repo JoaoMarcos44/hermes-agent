@@ -51,6 +51,17 @@ _ASSISTANT_ONLY_KEYS = (
 
 
 class SessionTranscriptMixin:
+    def append_user_message_if_absent(self, session_id: str, message: Dict[str, Any]) -> bool:
+        """Append a gateway-owned user row with the check in the write transaction."""
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return False
+        with self._get_transcript_drain_lock():
+            canonical = self._follow_reroutes(session_id)
+            if self.has_input_owner(canonical, (message.get("display_metadata") or {}).get("gateway_input_owner", "")):
+                return False
+            return db.append_user_message_if_absent(canonical, message)
+
     """SessionStore transcript I/O: SQLite append with a per-session retry queue,
     compression-reroute following, FTS corruption recovery, rewrite/rewind/load."""
 
