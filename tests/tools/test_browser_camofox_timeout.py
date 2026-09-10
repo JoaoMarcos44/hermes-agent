@@ -13,7 +13,8 @@ class TestCamofoxCommandTimeout:
 
         # Clear cache
         import tools.browser_camofox as mod
-        mod._cmd_timeout_cache.clear()
+        with mod._cache_lock:
+            mod._cmd_timeout_cache.clear()
 
         with patch("tools.browser_camofox.read_raw_config", return_value={}):
             assert _get_command_timeout() == 30
@@ -23,7 +24,8 @@ class TestCamofoxCommandTimeout:
         from tools.browser_camofox import _get_command_timeout
 
         import tools.browser_camofox as mod
-        mod._cmd_timeout_cache.clear()
+        with mod._cache_lock:
+            mod._cmd_timeout_cache.clear()
 
         with patch("tools.browser_camofox.read_raw_config", side_effect=Exception("no config")):
             assert _get_command_timeout() == 30
@@ -39,7 +41,8 @@ class TestCamofoxCommandTimeout:
         profile_a.mkdir()
         profile_b = tmp_path / "profile-b"
         profile_b.mkdir()
-        mod._cmd_timeout_cache.clear()
+        with mod._cache_lock:
+            mod._cmd_timeout_cache.clear()
 
         def _profile_config():
             home = get_hermes_home()
@@ -55,7 +58,8 @@ class TestCamofoxCommandTimeout:
                     timeout_b = _get_command_timeout()
         finally:
             ss.set_multiplex_active(False)
-            mod._cmd_timeout_cache.clear()
+            with mod._cache_lock:
+                mod._cmd_timeout_cache.clear()
 
         assert timeout_a == 11
         assert timeout_b == 22

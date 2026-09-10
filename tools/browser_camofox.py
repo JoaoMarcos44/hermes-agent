@@ -23,7 +23,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
 
-from agent.secret_scope import get_secret
+from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, tool_error
@@ -41,13 +41,16 @@ _vnc_cache: Dict[tuple[Optional[str], str], Optional[str]] = {}
 
 # Config is profile-scoped under gateway multiplexing even though the value is not secret.
 _cmd_timeout_cache: Dict[Optional[str], int] = {}
+_cache_lock = threading.Lock()
 
 
 def _get_command_timeout() -> int:
     """``browser.command_timeout`` (floor 5s, default 30s), cached per profile."""
     scope = check_fn_cache_scope()
-    if scope != CHECK_FN_CACHE_BYPASS and scope in _cmd_timeout_cache:
-        return _cmd_timeout_cache[scope]
+    if scope != CHECK_FN_CACHE_BYPASS:
+        with _cache_lock:
+            if scope in _cmd_timeout_cache:
+                return _cmd_timeout_cache[scope]
 
     result = _DEFAULT_TIMEOUT
     try:
@@ -57,7 +60,8 @@ def _get_command_timeout() -> int:
     except Exception as exc:
         logger.debug("Could not read browser.command_timeout: %s", exc)
     if scope != CHECK_FN_CACHE_BYPASS:
-        _cmd_timeout_cache[scope] = result
+        with _cache_lock:
+            _cmd_timeout_cache[scope] = result
     return result
 
 
@@ -116,7 +120,9 @@ def check_camofox_available() -> bool:
         resp = requests.get(f"{url}/health", timeout=5)
     except Exception:
         return False
-    if resp.status_code == 200 and scope != CHECK_FN_CACHE_BYPASS and cache_key not in _vnc_cache:
+    with _cache_lock:
+        vnc_cached = cache_key in _vnc_cache
+    if resp.status_code == 200 and scope != CHECK_FN_CACHE_BYPASS and not vnc_cached:
         vnc_url = None
         try:
             vnc_port = resp.json().get("vncPort")
@@ -124,7 +130,8 @@ def check_camofox_available() -> bool:
                 vnc_url = f"http://{urlsplit(url).hostname or 'localhost'}:{vnc_port}"
         except (ValueError, KeyError):
             pass
-        _vnc_cache[cache_key] = vnc_url
+        with _cache_lock:
+            _vnc_cache.setdefault(cache_key, vnc_url)
     return resp.status_code == 200
 
 
@@ -134,16 +141,19 @@ def get_vnc_url() -> Optional[str]:
     An unresolved multiplex scope bypasses the cache and returns no endpoint rather than
     risking reuse of another profile's VNC URL.
     """
-    url = get_camofox_url()
-    if not url:
-        return None
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
         return None
+    url = get_camofox_url()
+    if not url:
+        return None
     cache_key = (scope, url)
-    if cache_key not in _vnc_cache:
+    with _cache_lock:
+        vnc_cached = cache_key in _vnc_cache
+    if not vnc_cached:
         check_camofox_available()
-    return _vnc_cache.get(cache_key)
+    with _cache_lock:
+        return _vnc_cache.get(cache_key)
 
 
 def _get_camofox_config() -> Dict[str, Any]:
@@ -265,8 +275,13 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     task_id = task_id or "default"
     cache_key = _session_cache_key(task_id)
     bypass = cache_key[0] == CHECK_FN_CACHE_BYPASS
+    if bypass:
+        raise UnscopedSecretError(
+            "Camofox session creation requires a resolved profile runtime scope; "
+            "refusing to create an uncached multiplex session."
+        )
     with _sessions_lock:
-        if not bypass and cache_key in _sessions:
+        if cache_key in _sessions:
             return _adopt_existing_tab(_sessions[cache_key])
         camofox_cfg = _get_camofox_config()
         identity = _camofox_identity_override(task_id, camofox_cfg)
@@ -279,8 +294,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
             managed, adopt = True, _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
         session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
                    "managed": managed, "adopt_existing_tab": adopt}
-        if not bypass:
-            _sessions[cache_key] = session
+        _sessions[cache_key] = session
         return _adopt_existing_tab(session)
 
 
@@ -303,6 +317,9 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
     """Drop only the local tracking entry (``True``) for managed profiles, which must
     survive across agent tasks; ``False`` for ephemeral sessions so the caller falls back
     to :func:`camofox_close`."""
+    if check_fn_cache_scope() == CHECK_FN_CACHE_BYPASS:
+        logger.debug("Camofox cleanup skipped because the profile scope is unresolved")
+        return False
     camofox_cfg = _get_camofox_config()
     if _managed_persistence_enabled(camofox_cfg) or _camofox_identity_override(task_id, camofox_cfg):
         _drop_session(task_id)

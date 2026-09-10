@@ -43,8 +43,9 @@ def _clear_session_state():
     yield
     with mod._sessions_lock:
         mod._sessions.clear()
-    mod._vnc_cache.clear()
-    mod._cmd_timeout_cache.clear()
+    with mod._cache_lock:
+        mod._vnc_cache.clear()
+        mod._cmd_timeout_cache.clear()
 
 
 class TestManagedPersistenceToggle:
@@ -130,6 +131,7 @@ class TestConfiguredCamofoxIdentity:
         self, tmp_path, monkeypatch
     ):
         from agent import secret_scope
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "https://default.example")
@@ -144,6 +146,7 @@ class TestConfiguredCamofoxIdentity:
             }
         }
         secret_scope.set_multiplex_active(True)
+        home_token = set_hermes_home_override(str(tmp_path))
         token = secret_scope.set_secret_scope(
             {
                 "CAMOFOX_URL": "https://secondary.example",
@@ -166,6 +169,7 @@ class TestConfiguredCamofoxIdentity:
                 request_body = mock_post.call_args.kwargs["json"]
         finally:
             secret_scope.reset_secret_scope(token)
+            reset_hermes_home_override(home_token)
             secret_scope.set_multiplex_active(False)
 
         assert result["success"] is True
@@ -177,6 +181,7 @@ class TestConfiguredCamofoxIdentity:
         self, tmp_path, monkeypatch
     ):
         from agent import secret_scope
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_USER_ID", "default-profile-user")
@@ -190,12 +195,14 @@ class TestConfiguredCamofoxIdentity:
             }
         }
         secret_scope.set_multiplex_active(True)
+        home_token = set_hermes_home_override(str(tmp_path))
         token = secret_scope.set_secret_scope({})
         try:
             with patch("tools.browser_camofox.load_config", return_value=config):
                 session = _get_session("config-fallback")
         finally:
             secret_scope.reset_secret_scope(token)
+            reset_hermes_home_override(home_token)
             secret_scope.set_multiplex_active(False)
 
         assert session["user_id"] == "secondary-config-user"
@@ -205,17 +212,20 @@ class TestConfiguredCamofoxIdentity:
         self, tmp_path, monkeypatch
     ):
         from agent import secret_scope
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_USER_ID", "default-profile-user")
         monkeypatch.setenv("CAMOFOX_SESSION_KEY", "default-profile-session")
         secret_scope.set_multiplex_active(True)
+        home_token = set_hermes_home_override(str(tmp_path))
         token = secret_scope.set_secret_scope({})
         try:
             with patch("tools.browser_camofox.load_config", return_value={}):
                 session = _get_session("fail-closed")
         finally:
             secret_scope.reset_secret_scope(token)
+            reset_hermes_home_override(home_token)
             secret_scope.set_multiplex_active(False)
 
         assert session["user_id"].startswith("hermes_")
@@ -297,6 +307,28 @@ class TestCrossProfileCacheIsolation:
 
         assert session_a["user_id"] != session_b["user_id"]
         assert session_a["session_key"] != session_b["session_key"]
+
+    def test_unresolved_multiplex_scope_fails_closed_before_session_creation(self):
+        from agent import secret_scope as ss
+        from agent.secret_scope import UnscopedSecretError
+        import tools.browser_camofox as mod
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope(None)
+        try:
+            with patch(
+                "tools.browser_camofox.load_config",
+                return_value={"browser": {"camofox": {"managed_persistence": True}}},
+            ):
+                with pytest.raises(UnscopedSecretError):
+                    _get_session("unscoped-task")
+                assert camofox_soft_cleanup("unscoped-task") is False
+
+            with mod._sessions_lock:
+                assert mod._sessions == {}
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
 
     def test_vnc_endpoint_isolated_per_profile(self, tmp_path):
         from agent import secret_scope as ss
