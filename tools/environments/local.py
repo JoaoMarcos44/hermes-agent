@@ -644,11 +644,47 @@ def _sweep_escaped_descendants(descendants: list, pgid: int) -> None:
             continue
 
 
+def _kill_processes_individually(proc, descendants: list) -> None:
+    """Kill the known wrapper and descendants without broadcasting to a process group.
+
+    This is the safe fallback when the wrapper shares the caller's process group or
+    the caller's group cannot be determined. Each operation is best effort so one
+    process that already exited cannot prevent the remaining known processes from
+    being terminated.
+    """
+    for child in descendants:
+        try:
+            child.kill()
+        except Exception:
+            logger.debug("Could not kill snapshotted descendant %s", getattr(child, "pid", "?"), exc_info=True)
+    try:
+        proc.kill()
+    except Exception:
+        logger.debug("Could not kill process %s", getattr(proc, "pid", "?"), exc_info=True)
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=2.0)
+
+
+def _process_group_is_safe_to_signal(pgid: int) -> bool:
+    """Return whether *pgid* is known not to be this process's group.
+
+    Darwin's spawn workaround can make a tool inherit the gateway's group. If the
+    current group cannot be read, fail closed: an uncertain group must not receive
+    a broadcast signal.
+    """
+    try:
+        return pgid != os.getpgrp()
+    except (AttributeError, OSError):
+        logger.debug("Could not determine current process group; skipping killpg")
+        return False
+
+
 def _kill_process_group_posix(proc) -> None:
     """TERM the group, wait, KILL, then sweep setsid escapees. Descendants are
     snapshotted BEFORE the first signal — once the wrapper dies they reparent to
     init — and we wait on the group, not the wrapper, which can exit before
-    grandchildren under load. POSIX-only (_IS_WINDOWS handled by the caller)."""
+    grandchildren under load. A group matching this process's group is never
+    broadcast to; POSIX-only (_IS_WINDOWS handled by the caller)."""
     try:
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:
@@ -659,9 +695,15 @@ def _kill_process_group_posix(proc) -> None:
         descendants = psutil.Process(proc.pid).children(recursive=True)
     except Exception:
         descendants = []
+    if not _process_group_is_safe_to_signal(pgid):
+        _kill_processes_individually(proc, descendants)
+        return
     try:
         os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
         if not _wait_for_group_exit(proc, pgid, 1.0):
+            if not _process_group_is_safe_to_signal(pgid):
+                _kill_processes_individually(proc, descendants)
+                return
             os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX only (see _IS_WINDOWS gate in caller)
             _wait_for_group_exit(proc, pgid, 2.0)
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
