@@ -3,7 +3,7 @@
 When the gateway persists a user message after a transient provider
 failure (429/timeout/auth error), subsequent retries of the same
 Telegram message must not stack duplicate user turns in the transcript.
-The dedupe guard checks has_platform_message_id before persisting.
+The failure path uses an owner-scoped atomic insert instead of a check-then-act guard.
 """
 
 import concurrent.futures
@@ -70,8 +70,8 @@ class TestDedupeOnTransientFailure:
 
         # Simulate a second attempt to persist the same message
         assert store.has_platform_message_id("s1", "msg-789")
-        # The gateway code checks this before calling append_to_transcript,
-        # so the second append should never fire.
+        # The gateway uses the atomic writer for the actual persistence path;
+        # this lower-level probe remains a compatibility check for the index.
 
     def test_failed_turn_boundary_is_atomic_and_reload_safe(self, tmp_path):
         """Concurrent duplicate delivery creates one boundary and reloads role-safe."""
@@ -123,5 +123,51 @@ class TestDedupeOnTransientFailure:
 
         assert sum(results) == 1
         assert db.message_count("s1") == 1
+        foreign = {**message, "display_metadata": {"gateway_input_owner": "owner-2"}}
+        assert db.append_user_message_if_absent("s1", foreign)
+        assert db.message_count("s1") == 2
         db.close()
+
+    def test_exception_fallback_is_atomic_for_duplicate_events(self, tmp_path):
+        """Concurrent exception handlers persist one user/boundary pair."""
+        import asyncio
+
+        from gateway.config import GatewayConfig, Platform
+        from gateway.platforms.event import MessageEvent
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource, SessionStore
+
+        async def exercise():
+            store = SessionStore(tmp_path / "sessions", GatewayConfig())
+            runner = object.__new__(GatewayRunner)
+            runner.session_store = store
+
+            async def stop_typing(event, source):
+                return None
+
+            runner._hmwa_stop_typing_for_turn = stop_typing
+            source = SessionSource(
+                platform=Platform.TELEGRAM, chat_id="atomic-exception", user_id="fixture"
+            )
+            session = store.get_or_create_session(source)
+            prepared = runner._PreparedTurn(
+                [], "", "mutate record", [{"type": "text", "text": "mutate record"}],
+                1700000000, None, session.session_id, "exception-owner",
+            )
+            event = MessageEvent(text="mutate record", source=source, message_id="msg-exception")
+            await asyncio.gather(*(
+                runner._hmwa_agent_error_reply(
+                    RuntimeError("controlled"), event, source, session,
+                    session.session_key, prepared,
+                )
+                for _ in range(8)
+            ))
+
+            db = store._db_for_session_id(session.session_id)
+            rows = db.get_messages(session.session_id, include_inactive=True)
+            assert [row["role"] for row in rows] == ["user", "assistant"]
+            assert rows[-1]["display_kind"] == "gateway_failed_turn_boundary"
+            db.close()
+
+        asyncio.run(exercise())
 

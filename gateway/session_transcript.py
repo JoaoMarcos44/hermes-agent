@@ -5,6 +5,7 @@ bound onto ``SessionStore`` via the MRO."""
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import threading
 from agent.turn_context import extract_api_content_sidecar
@@ -31,6 +32,17 @@ def _plain_text(content) -> str:
         parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
         return "\n".join(t for t in parts if t)
     return content if isinstance(content, str) else ""
+
+
+def _gateway_input_owner(message: Dict[str, Any]) -> Optional[str]:
+    """Read the gateway ownership marker from dict or serialized legacy metadata."""
+    metadata = message.get("display_metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return metadata.get("gateway_input_owner") if isinstance(metadata, dict) else None
 
 
 def _spool_dropped(session_id: str, message: Dict[str, Any]):
@@ -333,7 +345,11 @@ class SessionTranscriptMixin:
             # into the ambient store.
             raise RuntimeError(
                 f"no owning session store for {session_id}; deferring transcript write")
-        if message.get("role") == "user" and (message.get("platform_message_id") or message.get("message_id")):
+        if message.get("role") == "user" and (
+            message.get("platform_message_id")
+            or message.get("message_id")
+            or _gateway_input_owner(message)
+        ):
             _db.append_user_message_if_absent(session_id, message)
             return
         if message.get("display_kind") == "gateway_failed_turn_boundary":

@@ -1704,13 +1704,7 @@ class GatewayTurnMixin:
                 # Transient failure / hidden-reasoning incomplete: persist the user message without
                 # the provider error text (a gateway hint, not model output). Dedupe on platform
                 # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
-                    logger.info(
-                        "Skipping duplicate user turn (message_id=%s) in session %s",
-                        event.message_id, sid,
-                    )
-                else:
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                 # Close the failed turn with a durable assistant boundary. Leaving a user-only tail
                 # lets alternation repair merge this request into an unrelated future message and
                 # can replay stale side effects. Persist only the stable safety statement, not raw
@@ -1819,13 +1813,9 @@ class GatewayTurnMixin:
         # Replay can coalesce inputs; only this input's durable marker establishes ownership.
         try:
             if prepared.message_text is not None and session_entry is not None:
-                _owned = await self.async_session_store.has_input_owner(
-                    prepared.persistence_session_id, prepared.persistence_owner,
+                await self.async_session_store.append_to_transcript(
+                    session_entry.session_id, self._hmwa_user_transcript_entry(event, prepared, time.time()),
                 )
-                if not _owned:
-                    await self.async_session_store.append_to_transcript(
-                        session_entry.session_id, self._hmwa_user_transcript_entry(event, prepared, time.time()),
-                    )
                 await self.async_session_store.append_to_transcript(
                     session_entry.session_id,
                     self._hmwa_failed_turn_boundary_entry(

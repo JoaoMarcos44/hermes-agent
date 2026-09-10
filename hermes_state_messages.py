@@ -308,29 +308,48 @@ class SessionMessagesMixin:
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
     def append_user_message_if_absent(self, session_id: str, message: Dict[str, Any]) -> bool:
-        """Append a platform user message once, atomically keyed by its platform id."""
+        """Append one gateway user message, atomically keyed by its event owner."""
         platform_message_id = message.get("platform_message_id") or message.get("message_id")
-        if not session_id or not platform_message_id:
-            raise ValueError("Atomic user deduplication requires a platform message id")
-        msg = {**message, "platform_message_id": str(platform_message_id)}
-        owner = (msg.get("display_metadata") or {}).get("gateway_input_owner")
+        msg = dict(message)
+        if platform_message_id:
+            platform_message_id = str(platform_message_id)
+            msg["platform_message_id"] = platform_message_id
+        metadata = msg.get("display_metadata")
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = None
+        owner = metadata.get("gateway_input_owner") if isinstance(metadata, dict) else None
+        if not session_id or not platform_message_id and not owner:
+            raise ValueError("Atomic user deduplication requires a platform message id or owner")
         tool_calls = _parse_tool_calls(msg.get("tool_calls"))
         message_timestamp = _coerce_timestamp(msg.get("timestamp"), time.time())
         params = self._message_row_params(
             session_id, "user", msg, tool_calls, message_timestamp, keep_reasoning=False)
+        if platform_message_id:
+            identity_clause = (
+                "m.platform_message_id = ? AND CASE WHEN json_valid(m.display_metadata) "
+                "THEN json_extract(m.display_metadata, '$.gateway_input_owner') END = ?"
+            )
+            identity_params = (platform_message_id, owner)
+        else:
+            identity_clause = (
+                "m.platform_message_id IS NULL AND CASE WHEN json_valid(m.display_metadata) "
+                "THEN json_extract(m.display_metadata, '$.gateway_input_owner') END = ?"
+            )
+            identity_params = (owner,)
 
         def _do(conn):
             existing = conn.execute(
-                """WITH RECURSIVE lineage(id) AS (
+                f"""WITH RECURSIVE lineage(id) AS (
                     SELECT ? UNION
                     SELECT s.parent_session_id FROM sessions s JOIN lineage l ON s.id = l.id
                     JOIN sessions p ON p.id = s.parent_session_id WHERE p.end_reason = 'compression'
                 ) SELECT 1 FROM messages m JOIN lineage l ON m.session_id = l.id
                 WHERE m.role = 'user' AND (m.active = 1 OR m.compacted = 1) AND m.observed = 0
-                  AND m.platform_message_id = ?
-                  AND CASE WHEN json_valid(m.display_metadata)
-                       THEN json_extract(m.display_metadata, '$.gateway_input_owner') END = ? LIMIT 1""",
-                (session_id, str(platform_message_id), owner),
+                  AND {identity_clause} LIMIT 1""",
+                (session_id, *identity_params),
             ).fetchone()
             if existing is not None:
                 return False
