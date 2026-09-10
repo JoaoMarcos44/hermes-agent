@@ -103,7 +103,13 @@ def turn_in_flight() -> Optional[bool]:
     try:
         import tui_gateway.server as gateway
         with gateway._sessions_lock:
-            return any(s.get("running") for s in gateway._sessions.values())
+            if any(s.get("running") for s in gateway._sessions.values()):
+                return True
+        # Cron runs in the scheduler's pool rather than registering a GUI session.  The
+        # dashboard backend can therefore be otherwise idle while a cron execution is
+        # still using this interpreter; include that shared activity source here.
+        from cron.scheduler import get_running_job_ids
+        return bool(get_running_job_ids())
     except Exception:
         if not _probe_failure_logged:
             _probe_failure_logged = True
