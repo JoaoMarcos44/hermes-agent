@@ -581,6 +581,74 @@ class TestWebServerEndpoints:
         # Must swallow — reads fall back to the per-poll probe heal.
         _web_server_lifecycle._eager_reconcile_own_session_db()
 
+    def test_startup_eager_reconcile_opens_read_only_and_closes_handle(self, monkeypatch):
+        """A healthy store must NOT get a gratuitous second writable SessionDB open.
+
+        Regression for #107688 (concurrent-FTS-rebuild corruption vector): the
+        dashboard's startup reconcile previously called unconditional writable
+        ``acquire()`` on `state.db`, creating a second writable SessionDB owner
+        alongside the running gateway. It now routes through read-only
+        ``_open_session_db_at_path(..., read_only=True)`` and explicitly closes
+        the handle via ``release_or_close(db)`` to prevent file descriptor leaks.
+        """
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        import hermes_state
+        import hermes_state_registry
+        import hermes_cli.web_server_sessions as _web_server_sessions
+
+        open_calls = []
+        closed_handles = []
+
+        fake_db = SimpleNamespace(closed=False, close=lambda: None)
+
+        def fake_open(db_path: Path, *, read_only: bool):
+            open_calls.append((str(db_path), read_only))
+            return fake_db
+
+        def fake_release_or_close(db):
+            closed_handles.append(db)
+
+        monkeypatch.setattr(hermes_state, "_default_db_path", lambda: "/tmp/fake-state.db")
+        monkeypatch.setattr(
+            _web_server_sessions, "_open_session_db_at_path", fake_open,
+        )
+        monkeypatch.setattr(
+            hermes_state_registry, "release_or_close", fake_release_or_close,
+        )
+
+        _web_server_lifecycle._eager_reconcile_own_session_db()
+
+        assert open_calls == [(str(Path("/tmp/fake-state.db")), True)], (
+            "eager reconcile must open state.db read-only on a healthy store"
+        )
+        assert closed_handles == [fake_db], (
+            "eager reconcile must release/close the opened handle to prevent descriptor leaks"
+        )
+
+    def test_startup_eager_reconcile_healthy_db_real_path(self):
+        """Real-path execution of eager reconcile against a healthy state.db."""
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("real-reconcile-test", source="cli")
+        finally:
+            seed.close()
+
+        # Must succeed on real database and keep it healthy
+        _web_server_lifecycle._eager_reconcile_own_session_db()
+
+        verify = SessionDB(db_path=db_path, read_only=True)
+        try:
+            rows = verify.list_sessions_rich(limit=5, compact_rows=True)
+            assert [r["id"] for r in rows] == ["real-reconcile-test"]
+        finally:
+            verify.close()
+
     def test_heal_gives_up_when_reconcile_cannot_fix_the_store(self, monkeypatch):
         """A probe failure reconciliation can't cure must not retry forever.
 
