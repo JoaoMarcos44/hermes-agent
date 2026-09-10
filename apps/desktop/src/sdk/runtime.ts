@@ -14,10 +14,18 @@ import * as jsxRuntime from 'react/jsx-runtime'
 import * as sdk from './index'
 
 const GLOBALS = {
-  __HERMES_PLUGIN_SDK__: sdk,
-  __HERMES_REACT__: React,
-  __HERMES_REACT_JSX__: jsxRuntime,
-  __HERMES_REACT_JSX_DEV__: jsxDevRuntime
+  get __HERMES_PLUGIN_SDK__() {
+    return sdk
+  },
+  get __HERMES_REACT__() {
+    return React
+  },
+  get __HERMES_REACT_JSX__() {
+    return jsxRuntime
+  },
+  get __HERMES_REACT_JSX_DEV__() {
+    return jsxDevRuntime
+  }
 } as const
 
 export function installPluginSdk(): void {
@@ -27,7 +35,8 @@ export function installPluginSdk(): void {
 /** Build a shim ESM blob that re-exports a global namespace's live members.
  *  Export names come from the namespace itself, so the list can't drift. */
 function shimUrl(globalKey: keyof typeof GLOBALS): string {
-  const names = Object.keys(GLOBALS[globalKey]).filter(name => name !== 'default' && /^[A-Za-z_$][\w$]*$/.test(name))
+  const namespace = GLOBALS[globalKey]
+  const names = Object.keys(namespace ?? {}).filter(name => name !== 'default' && /^[A-Za-z_$][\w$]*$/.test(name))
 
   const source =
     `const m = globalThis.${globalKey};\n` +

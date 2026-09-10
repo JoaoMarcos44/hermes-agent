@@ -395,4 +395,14 @@ describe('PluginsTab catalog UX', () => {
 
     await waitFor(() => expect($pluginInstallRequest.get()).not.toBeNull())
   })
+
+  it('triggers rescanAll when the rescan button is clicked', async () => {
+    render(<PluginsTab profile={null} />)
+
+    const initialCalls = requestGateway.mock.calls.length
+    const rescanBtn = screen.getByRole('button', { name: 'Rescan' })
+    fireEvent.click(rescanBtn)
+
+    await waitFor(() => expect(requestGateway.mock.calls.length).toBeGreaterThan(initialCalls))
+  })
 })
