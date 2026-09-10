@@ -131,6 +131,7 @@ class TestDedupeOnTransientFailure:
     def test_exception_fallback_is_atomic_for_duplicate_events(self, tmp_path):
         """Concurrent exception handlers persist one user/boundary pair."""
         import asyncio
+        from datetime import datetime, timezone
 
         from gateway.config import GatewayConfig, Platform
         from gateway.platforms.event import MessageEvent
@@ -152,9 +153,20 @@ class TestDedupeOnTransientFailure:
             session = store.get_or_create_session(source)
             prepared = runner._PreparedTurn(
                 [], "", "mutate record", [{"type": "text", "text": "mutate record"}],
-                1700000000, None, session.session_id, "exception-owner",
+                1700000000, None, session.session_id,
+                runner._hmwa_persistence_owner(
+                    source,
+                    MessageEvent(
+                        text="mutate record", source=source, timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        raw_message={"event_id": "keyless-1"},
+                    ),
+                ),
             )
-            event = MessageEvent(text="mutate record", source=source, message_id="msg-exception")
+            event = MessageEvent(
+                text="mutate record", source=source,
+                timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                raw_message={"event_id": "keyless-1"},
+            )
             await asyncio.gather(*(
                 runner._hmwa_agent_error_reply(
                     RuntimeError("controlled"), event, source, session,
@@ -170,4 +182,42 @@ class TestDedupeOnTransientFailure:
             db.close()
 
         asyncio.run(exercise())
+
+    def test_event_owner_distinguishes_reused_platform_ids(self):
+        """A retry is stable while a later event reusing an id is distinct."""
+        from datetime import datetime, timezone
+
+        from gateway.config import Platform
+        from gateway.platforms.event import MessageEvent
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="identity", user_id="fixture")
+        first = MessageEvent(
+            text="first", source=source, message_id="42", platform_update_id=100,
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            raw_message={"id": 42, "date": "2026-01-01T00:00:00Z"},
+        )
+        retry = MessageEvent(
+            text="first", source=source, message_id="42", platform_update_id=100,
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            raw_message={"id": 42, "date": "2026-01-01T00:00:00Z"},
+        )
+        reused = MessageEvent(
+            text="second", source=source, message_id="42", platform_update_id=101,
+            timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            raw_message={"id": 42, "date": "2026-01-02T00:00:00Z"},
+        )
+
+        owner = GatewayRunner._hmwa_persistence_owner
+        assert owner(source, first) == owner(source, retry)
+        assert owner(source, first) != owner(source, reused)
+
+        prepared = GatewayRunner._PreparedTurn(
+            [], "", "first", [{"type": "text", "text": "first"}], 1.0, None, "identity", None,
+        )
+        boundary = GatewayRunner._hmwa_failed_turn_boundary_entry(
+            session_id="identity", event=first, prepared=prepared, content="failed", ts=1.0,
+        )
+        assert boundary["display_metadata"]["gateway_failed_turn_boundary"].startswith("gateway:")
 

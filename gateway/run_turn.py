@@ -9,6 +9,7 @@ import logging
 from typing import TYPE_CHECKING
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import os
@@ -1644,13 +1645,44 @@ class GatewayTurnMixin:
         return _user_entry
 
     @staticmethod
+    def _hmwa_persistence_owner(source, event):
+        """Derive one stable owner from the transport event instance and its retry-stable fields."""
+        import uuid
+
+        timestamp = getattr(event, "timestamp", None)
+        timestamp = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp or "")
+        metadata = getattr(event, "metadata", None) or {}
+        event_token = next(
+            (metadata[key] for key in ("event_id", "update_id", "receipt_key", "delivery_id")
+             if isinstance(metadata, dict) and metadata.get(key) is not None),
+            "",
+        )
+        raw_message = getattr(event, "raw_message", None)
+        raw_fingerprint = ""
+        if isinstance(raw_message, (dict, list)):
+            try:
+                raw_fingerprint = hashlib.sha256(
+                    json.dumps(raw_message, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, ValueError, RecursionError):
+                raw_fingerprint = ""
+        namespace = [
+            getattr(getattr(source, "platform", None), "value", str(getattr(source, "platform", ""))),
+            getattr(source, "profile", None), getattr(source, "scope_id", None),
+            getattr(source, "chat_id", None), getattr(source, "thread_id", None),
+            str(getattr(event, "message_id", None) or ""),
+            str(getattr(event, "platform_update_id", None) or ""), timestamp,
+            str(event_token), raw_fingerprint,
+        ]
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace, ensure_ascii=False)))
+
+    @staticmethod
     def _hmwa_failed_turn_boundary_entry(*, session_id, event, prepared, content, ts):
         """Build a stable, machine-owned boundary for one failed inbound event."""
-        import uuid
-        identity = prepared.persistence_owner or (
-            str(event.message_id) if getattr(event, "message_id", None) else None
+        identity = getattr(prepared, "persistence_owner", None) or GatewayTurnMixin._hmwa_persistence_owner(
+            getattr(event, "source", None), event
         )
-        boundary_key = f"gateway:{identity}" if identity else f"gateway:{session_id}:{uuid.uuid4()}"
+        boundary_key = f"gateway:{identity}"
         return {
             "role": "assistant",
             "content": content,
@@ -1962,11 +1994,7 @@ class GatewayTurnMixin:
         self._bind_adapter_run_generation(self._adapter_for_source(source), session_key, run_generation)
         # Delivery IDs are only unique in their transport namespace. Keyless turns
         # need their own identity, even when another process writes to this session.
-        import uuid
-        namespace = [source.platform.value, source.profile, source.scope_id,
-                     source.chat_id, source.thread_id, str(event.message_id)]
-        owner = (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
-                 if event.message_id else str(uuid.uuid4()))
+        owner = self._hmwa_persistence_owner(source, event)
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
