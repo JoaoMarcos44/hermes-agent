@@ -367,6 +367,7 @@ import { ensureLoginShellPath } from './shell-path'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
+import { createSshSpawnBatchCoordinator } from './ssh-spawn-batch'
 import { createStreamThrottle } from './stream-throttle'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
@@ -10343,6 +10344,7 @@ function clearManagedSshRecovery(connectionId, correlationId) {
 }
 
 const sshBootstrapCoordinator = createBootstrapCoordinator()
+const sshSpawnBatches = createSshSpawnBatchCoordinator()
 
 let sshQuitTeardownDone = false
 let sshQuitTeardownPromise: Promise<void> | null = null
@@ -10379,10 +10381,12 @@ async function teardownSshConnection(profile) {
   const state = sshConnections.get(scope)
 
   if (!state) {
+    sshSpawnBatches.release(scope)
     return
   }
 
   sshConnections.delete(scope)
+  sshSpawnBatches.release(scope)
 
   terminalIpc.disposeTerminalSessionsForSshScope(scope)
 
@@ -10590,12 +10594,22 @@ async function bootstrapSshConnection(
   const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
   const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
 
-  return sshBootstrapCoordinator.start(
-    scope,
-    fingerprint,
-    lease => bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, metadata, fingerprint, lease),
-    metadata
-  )
+  return sshBootstrapCoordinator
+    .start(
+      scope,
+      fingerprint,
+      lease => bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, metadata, fingerprint, lease),
+      metadata
+    )
+    .catch(error => {
+      // A failed pre-publication bootstrap has no live connection entry to
+      // own this batch. Do not let its opaque batch ID leak into a later dial.
+      if (!sshConnections.has(scope)) {
+        sshSpawnBatches.release(scope)
+      }
+
+      throw error
+    })
 }
 
 // Tear down a bootstrap result whose publication lost the managed-update
@@ -10648,6 +10662,7 @@ async function rollbackSshBootstrapResult(ssh, result, profile, sshConfig, bound
 
   if (sshConnections.get(scope)?.ssh === ssh) {
     sshConnections.delete(scope)
+    sshSpawnBatches.release(scope)
   }
 
   if (cleanupErrors.length > 0) {
@@ -10682,8 +10697,10 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
 
     ssh = null
     sshConnections.delete(scope)
+    sshSpawnBatches.release(scope)
   }
 
+  const reusingPublishedBatch = sshConnections.get(scope)?.fingerprint === fingerprint
   const created = !ssh
 
   let removeForceCleanup = () => {}
@@ -10702,6 +10719,11 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     await ssh.open({ signal: lease.signal })
   }
 
+  const registryConnectionId = String(
+    metadata.registryConnectionId ||
+      (typeof source === 'string' && source.startsWith('registry:') ? source.slice('registry:'.length) : '')
+  ).trim()
+  const sshSpawnBatchId = sshSpawnBatches.acquire(scope, registryConnectionId)
   let result: any
 
   try {
@@ -10717,6 +10739,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       profile: resolveRemoteSshDashboardProfile(sshConfig.remoteProfile, profile),
       remoteHermesPath: sshConfig.remoteHermesPath || '',
       ownershipId: sshOwnershipKey(profile),
+      sshSpawnBatchId: sshSpawnBatchId || '',
       reuseToken: reuseToken || '',
       forward: (localPort, remotePort) => ssh.forward(localPort, remotePort),
       cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
@@ -10754,6 +10777,14 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     err.sshError = error.kind || 'unknown'
     err.isSshBootstrap = true
     throw err
+  }
+
+  // A server discovered from a prior Desktop process cannot know this newly
+  // minted batch ID. Keep batch membership only when this Electron process was
+  // already managing the exact published scope; otherwise a later sibling
+  // spawn must form its own coherent server batch.
+  if (result.reused && !reusingPublishedBatch) {
+    sshSpawnBatches.release(scope)
   }
 
   try {
@@ -12242,6 +12273,7 @@ async function drainManagedSshScope(scope) {
 
       if (state && sshConnections.get(scope.key) === state) {
         sshConnections.delete(scope.key)
+        sshSpawnBatches.release(scope.key)
       }
     }
   }
