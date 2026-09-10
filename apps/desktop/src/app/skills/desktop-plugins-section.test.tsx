@@ -7,6 +7,17 @@ import { $pluginInstallRequest, closePluginInstallRequest } from '@/store/plugin
 
 import { DesktopPluginsSection } from './desktop-plugins-section'
 
+const runtimeLoaderProbe = vi.hoisted(() => ({
+  discoverRuntimePlugins: vi.fn(),
+  imported: false
+}))
+
+vi.mock('@/contrib/runtime-loader', () => {
+  runtimeLoaderProbe.imported = true
+
+  return { discoverRuntimePlugins: runtimeLoaderProbe.discoverRuntimePlugins }
+})
+
 beforeEach(() => {
   $pluginRecords.set({})
   $agentPlugins.set([])
@@ -20,6 +31,20 @@ afterEach(() => {
 })
 
 describe('DesktopPluginsSection', () => {
+  it('loads the runtime loader only when the user requests a rescan', async () => {
+    expect(runtimeLoaderProbe.imported).toBe(false)
+
+    render(<DesktopPluginsSection profile={null} />)
+    expect(runtimeLoaderProbe.imported).toBe(false)
+
+    screen.getAllByRole('button')[1].click()
+
+    await vi.waitFor(() => {
+      expect(runtimeLoaderProbe.discoverRuntimePlugins).toHaveBeenCalledTimes(1)
+    })
+    expect(runtimeLoaderProbe.imported).toBe(true)
+  })
+
   it('flags a unified-root desktop half whose agent half is missing in the scoped profile', () => {
     $pluginRecords.set({
       'pixel-overlay': {
