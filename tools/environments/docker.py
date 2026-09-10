@@ -34,6 +34,8 @@ from tools.environments.remote_common import (
 
 logger = logging.getLogger(__name__)
 
+_PROFILE_MOUNT_INDETERMINATE = object()
+
 # Docker Desktop install paths checked when 'docker' is not in PATH
 # (macOS Intel / Apple Silicon Homebrew / app bundle).
 _DOCKER_SEARCH_PATHS = [
@@ -691,6 +693,7 @@ class DockerEnvironment(BaseEnvironment):
 
         _ensure_docker_available()
 
+        self._guard_profile_boundary = not shared_container_key
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
         volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
         volume_args.extend(_readonly_skill_mount_args())
@@ -832,10 +835,14 @@ class DockerEnvironment(BaseEnvironment):
             if ":" not in vol:
                 logger.warning("Docker volume '%s' missing colon, skipping", vol)
                 continue
+            if self._guard_profile_boundary:
+                _reject_foreign_profile_source(_docker_volume_host_source(vol), "docker_volumes mount")
             volume_args.extend(["-v", vol])
         workspace_explicitly_mounted = any(":/workspace" in v for v in volume_args)
 
         host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
+        if host_cwd_abs and self._guard_profile_boundary:
+            _reject_foreign_profile_source(host_cwd_abs, "workspace cwd mount")
         bind_host_cwd = (
             auto_mount_cwd and bool(host_cwd_abs) and os.path.isdir(host_cwd_abs)
             and not workspace_explicitly_mounted)
@@ -867,6 +874,27 @@ class DockerEnvironment(BaseEnvironment):
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
         return volume_args, writable_args
 
+    def _container_foreign_profile_mount(self, container_id: str) -> Optional[str] | object:
+        """Inspect an existing container before reuse; unknown is unsafe."""
+        sibling_state = _installation_has_sibling_profiles()
+        if sibling_state is _PROFILE_MOUNT_INDETERMINATE:
+            return _PROFILE_MOUNT_INDETERMINATE
+        if not sibling_state:
+            return None
+        try:
+            result = run_capture(
+                [self._docker_exe, "inspect", container_id, "--format",
+                 "{{range .Mounts}}{{.Source}}\n{{end}}"], timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            return _PROFILE_MOUNT_INDETERMINATE
+        for source in result.stdout.splitlines():
+            owner = _foreign_profile_mount_owner(source.strip())
+            if owner is _PROFILE_MOUNT_INDETERMINATE:
+                return owner
+            if owner is not None:
+                return owner
+        return None
+
     def _attach_existing_container(self, task_label, profile_name, egress_label, network: bool) -> bool:
         """Attach to a prior process's labeled container ("ONE long-lived container shared
         across sessions"; opt out via ``docker_persist_across_processes: false``).
@@ -877,6 +905,17 @@ class DockerEnvironment(BaseEnvironment):
         if existing is None:
             return False
         container_id, state = existing
+        foreign_mount_owner = (
+            self._container_foreign_profile_mount(container_id)
+            if self._guard_profile_boundary else None
+        )
+        if foreign_mount_owner is _PROFILE_MOUNT_INDETERMINATE or foreign_mount_owner is not None:
+            logger.error("Refusing reuse of container %s with unverifiable or foreign profile mounts", container_id[:12])
+            try:
+                run_capture([self._docker_exe, "rm", "-f", container_id], timeout=30)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                logger.warning("Failed to remove unsafe container %s: %s", container_id[:12], e)
+            return False
         if not network:
             actual_mode = self._container_network_mode(container_id)
             if actual_mode != "none":

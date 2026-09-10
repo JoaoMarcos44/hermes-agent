@@ -280,7 +280,7 @@ def test_reused_container_with_foreign_mount_is_replaced(monkeypatch, two_profil
 
     assert _was_removed(calls), "the crossed container should have been removed"
     assert env._container_id == "fresh-container-id"
-    assert "bind-mounts profile 'alice'" in caplog.text
+    assert "unverifiable or foreign profile mounts" in caplog.text
 
 
 def test_reused_container_with_own_mounts_is_kept(monkeypatch, two_profiles):
