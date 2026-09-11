@@ -1907,7 +1907,9 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         logger.debug("Job '%s': failed to end session: %s", job_id, e)
     try:
         from hermes_state_registry import release_or_close
-        release_or_close(_session_db)
+        # Release the registry-owned handle, not the bounded proxy. The registry
+        # tracks ownership by SessionDB object identity.
+        release_or_close(session_db)
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
@@ -2235,7 +2237,10 @@ def run_job(
         return early
     from run_agent import AIAgent
 
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = (
+        f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{execution_id or uuid.uuid4().hex}"
+    )
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
