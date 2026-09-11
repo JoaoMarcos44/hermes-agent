@@ -28,8 +28,10 @@ def db(tmp_path):
         session_db.close()
 
 
-def _agent(session_id, session_db=None):
-    return SimpleNamespace(session_id=session_id, _session_db=session_db)
+def _agent(session_id, session_db=None, profile_name=None):
+    return SimpleNamespace(
+        session_id=session_id, _session_db=session_db, profile_name=profile_name
+    )
 
 
 def _rotate(db, parent_id: str, child_id: str) -> None:
@@ -45,6 +47,12 @@ class TestResolvePromptCacheScope:
 
     def test_no_db_falls_back_to_physical_id(self):
         assert resolve_prompt_cache_scope(_agent("root-sess")) == "root-sess"
+
+    def test_same_session_id_isolated_between_profiles(self):
+        first = resolve_prompt_cache_scope(_agent("shared-session", profile_name="alpha"))
+        second = resolve_prompt_cache_scope(_agent("shared-session", profile_name="beta"))
+
+        assert first != second
 
     def test_unrotated_session_is_its_own_scope(self, db):
         db.create_session("root-sess", source="webui")
