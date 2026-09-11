@@ -2806,7 +2806,12 @@ def _run_one_job_body(
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
         # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
         # fire_due) get at-most-times semantics. See #38758.
-        if not claim_dispatch(job["id"]):
+        if fire_owner is None:
+            dispatch_claimed = claim_dispatch(job["id"])
+        else:
+            dispatch_claimed = claim_dispatch(
+                job["id"], expected_fire_owner=fire_owner)
+        if not dispatch_claimed:
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]))
@@ -3718,10 +3723,8 @@ def tick(
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
-        # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
-        # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
-        advance_next_runs([job["id"] for job in due_jobs])
+        # Recurring occurrences are advanced atomically with fire ownership in
+        # claim_job_for_fire(); never advance the stale due snapshot here.
 
         _max_workers = _resolve_max_parallel_workers()
         if verbose:
