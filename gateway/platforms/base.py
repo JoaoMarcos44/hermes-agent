@@ -1106,6 +1106,12 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     return None
 
 
+def _is_named_profile_session_key(session_key: str) -> bool:
+    """Return whether a session key identifies a secondary profile namespace."""
+    parts = str(session_key or "").split(":", 2)
+    return len(parts) == 3 and parts[0] == "agent" and parts[1] not in {"", "main", "default"}
+
+
 def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
     """Safe absolute file path for native media delivery, else None. Default: any existing
     regular file outside the credential / system denylist (symmetric with inbound). Strict
@@ -1124,7 +1130,9 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         return None
     # Docker agents emit MEDIA:/workspace/... — map container paths to host paths first.
     resolved = _translate_docker_container_media_path(expanded, session_key=session_key)
-    if resolved is None:
+    # A named Docker session must never fall back to the ambient host path: an unresolved
+    # container path belongs to that sandbox, not to whatever happens to exist on the host.
+    if resolved is None and not (_is_named_profile_session_key(session_key) and _docker_env_active()):
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None

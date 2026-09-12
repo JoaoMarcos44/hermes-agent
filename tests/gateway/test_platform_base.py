@@ -914,6 +914,61 @@ class TestDockerContainerMediaPathTranslation:
             "/workspace/out.png"
         ) == str(media.resolve())
 
+    def test_named_docker_session_does_not_fallback_to_ambient_host(self, tmp_path, monkeypatch):
+        """Reproduce the old fallback: an unresolved container path was host-resolved."""
+        ambient = tmp_path / "ambient.png"
+        ambient.write_bytes(b"png")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr("gateway.platforms.base._docker_env_active", lambda: True)
+        monkeypatch.setattr("gateway.platforms.base._path_under_denied_prefix", lambda _path: False)
+        monkeypatch.setattr("gateway.platforms.base._media_delivery_allowed_roots", lambda: [tmp_path])
+        monkeypatch.setattr(
+            "gateway.platforms.base._translate_docker_container_media_path",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._resolve_path",
+            lambda _path, **_kwargs: ambient,
+        )
+
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "C:/root/out.png", session_key="agent:secondary:telegram:dm:123"
+        ) is None
+
+    def test_keyless_docker_path_keeps_host_fallback(self, tmp_path, monkeypatch):
+        ambient = tmp_path / "ambient.png"
+        ambient.write_bytes(b"png")
+        monkeypatch.setattr("gateway.platforms.base._docker_env_active", lambda: True)
+        monkeypatch.setattr(
+            "gateway.platforms.base._translate_docker_container_media_path",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._resolve_path",
+            lambda _path, **_kwargs: ambient,
+        )
+        monkeypatch.setattr("gateway.platforms.base._media_delivery_allowed_roots", lambda: [tmp_path])
+
+        assert BasePlatformAdapter.validate_media_delivery_path("C:/root/out.png") == str(ambient)
+
+    def test_main_profile_docker_path_keeps_host_fallback(self, tmp_path, monkeypatch):
+        ambient = tmp_path / "ambient.png"
+        ambient.write_bytes(b"png")
+        monkeypatch.setattr("gateway.platforms.base._docker_env_active", lambda: True)
+        monkeypatch.setattr(
+            "gateway.platforms.base._translate_docker_container_media_path",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._resolve_path",
+            lambda _path, **_kwargs: ambient,
+        )
+        monkeypatch.setattr("gateway.platforms.base._media_delivery_allowed_roots", lambda: [tmp_path])
+
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "C:/root/out.png", session_key="agent:main:telegram:dm:123"
+        ) == str(ambient)
+
     def test_unmapped_container_path_fails(self, monkeypatch):
         monkeypatch.delenv("TERMINAL_DOCKER_VOLUMES", raising=False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
