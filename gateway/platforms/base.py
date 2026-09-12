@@ -940,10 +940,35 @@ def _tenv(name: str, default: str = "") -> str:
     return terminal_env(name, default)
 
 
-def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
+def _profile_name_from_session_key(session_key: str) -> Optional[str]:
+    """Return the profile namespace carried by a gateway session key."""
+    parts = session_key.split(":", 2)
+    if len(parts) < 2 or parts[0] != "agent" or not parts[1]:
+        return None
+    try:
+        from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+        profile = normalize_profile_name(parts[1])
+        if profile != "default":
+            get_profile_dir(profile)
+        return profile
+    except (ValueError, FileNotFoundError):
+        return None
+
+
+def _parse_docker_volume_mounts(profile_name: Optional[str] = None) -> List[Tuple[Path, Path]]:
     """Parse ``TERMINAL_DOCKER_VOLUMES`` (JSON list of ``host:container[:mode]``) into
     ``(host_path, container_path)``; named volumes / non-absolute hosts can't resolve here."""
-    raw = _tenv("TERMINAL_DOCKER_VOLUMES", "").strip()
+    if profile_name is None:
+        raw = _tenv("TERMINAL_DOCKER_VOLUMES", "").strip()
+    else:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+            from tools.terminal_scope import build_profile_terminal_scope
+            raw = build_profile_terminal_scope(get_profile_dir(profile_name)).get(
+                "TERMINAL_DOCKER_VOLUMES", ""
+            ).strip()
+        except (ImportError, OSError, ValueError):
+            raw = ""
     try:
         import json as _json
         parsed = _json.loads(raw) if raw else []
@@ -983,7 +1008,7 @@ def _docker_sandbox_dir_candidates(session_key: str = "") -> List[str]:
         return ["default"]
     try:
         from hermes_cli.profiles import get_active_profile_name
-        profile = get_active_profile_name() or "default"
+        profile = _profile_name_from_session_key(session_key) or get_active_profile_name() or "default"
     except Exception:
         profile = "default"
     candidates: List[str] = []
@@ -1017,7 +1042,12 @@ def _docker_persistent_sandbox_roots(session_key: str, leaf: str) -> List[Path]:
         return []
     try:
         from tools.environments.base import get_sandbox_dir
-        base = get_sandbox_dir() / "docker"
+        profile = _profile_name_from_session_key(session_key)
+        if profile and profile != "default":
+            from hermes_cli.profiles import get_profile_dir
+            base = get_profile_dir(profile) / "sandboxes" / "docker"
+        else:
+            base = get_sandbox_dir() / "docker"
         return [cand for name in _docker_sandbox_dir_candidates(session_key)
                 if (cand := (base / name / leaf).resolve(strict=False)).is_dir()]
     except Exception:
@@ -1075,7 +1105,8 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     with contextlib.suppress(Exception):
         from tools.terminal_tool import _ensure_terminal_env_bridged
         _ensure_terminal_env_bridged()
-    mounts = [*_parse_docker_volume_mounts(), *_cache_dir_container_mounts()]
+    profile = _profile_name_from_session_key(session_key)
+    mounts = [*_parse_docker_volume_mounts(profile), *_cache_dir_container_mounts()]
     mounted = {c.as_posix() for _, c in mounts}
     # Synthetic /workspace mounts: profile-scoped layout first, then legacy per-session.
     if "/workspace" not in mounted:
@@ -1125,6 +1156,13 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     # Docker agents emit MEDIA:/workspace/... — map container paths to host paths first.
     resolved = _translate_docker_container_media_path(expanded, session_key=session_key)
     if resolved is None:
+        # A routed named profile must not reinterpret a container path through the
+        # ambient gateway host when its profile-scoped mounts are unavailable.
+        profile = _profile_name_from_session_key(session_key)
+        if (profile and profile != "default" and _docker_env_active()
+                and any(expanded == root or expanded.is_relative_to(root)
+                        for root in (Path("/root"), Path("/workspace"), Path("/output")))):
+            return None
         resolved = _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None

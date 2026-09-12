@@ -1471,6 +1471,23 @@ class TestDockerProfileSandboxMediaTranslation:
             "/root/note.txt", session_key=self.SESSION_KEY
         ) == str(produced.resolve())
 
+    def test_named_profile_home_mount_ignores_ambient_default(self, tmp_path, monkeypatch):
+        """A multiplexed named session resolves against its own profile sandbox."""
+        hermes_home = tmp_path / ".hermes"
+        profile_home = hermes_home / "profiles" / "public"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        self._enable_docker(monkeypatch)
+
+        produced = profile_home / "sandboxes" / "docker" / "profile_public" / "home" / "named.txt"
+        produced.parent.mkdir(parents=True)
+        produced.write_text("named")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            "/root/named.txt", session_key="agent:public:discord:thread:1:2"
+        ) == str(produced.resolve())
+
     def test_home_credential_surface_still_refused(self, monkeypatch):
         """The /root/.hermes exclusion survives profile scoping: translating
         the home mount must never expose the container's secret surface —
