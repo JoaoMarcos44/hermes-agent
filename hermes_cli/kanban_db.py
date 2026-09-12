@@ -2017,8 +2017,15 @@ def recompute_ready(
 
     ``include_blocked=False`` keeps read-time dependency reconciliation for
     ``todo`` tasks while deferring blocked-task recovery to an explicit
-    dispatcher or lifecycle path. The default preserves the full dispatcher
-    behavior, including recovery of non-sticky circuit-breaker blocks.
+    dispatcher or lifecycle path. The default (``True``) preserves the full
+    dispatcher behavior, including recovery of non-sticky circuit-breaker blocks.
+
+    Compatibility note: with ``include_blocked=False``, board read surfaces (CLI
+    ``list`` and agent ``kanban_list``) intentionally skip all blocked tasks,
+    including non-sticky circuit-breaker blocks below the failure limit. In
+    deployments operating without a continuous background dispatcher, transient
+    circuit-breaker blocks do not auto-recover on read and must be recovered via
+    the dispatcher or explicit lifecycle operations.
 
     1. The most recent block event was a worker-initiated ``kanban_block`` — those stay blocked until an
     explicit ``kanban_unblock`` (#28712).
