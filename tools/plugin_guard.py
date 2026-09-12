@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 from tools.skills_guard import (
-    Finding, ScanResult, SUSPICIOUS_BINARY_EXTENSIONS, _determine_verdict, format_scan_report,
+    Finding, ScanResult, SUSPICIOUS_BINARY_EXTENSIONS, _determine_verdict,
+    format_scan_report as _format_scan_report,
     scan_file)
 
 PLUGIN_SCANNER_VERSION = "plugin-guard-v1"
@@ -165,6 +166,11 @@ def should_allow_plugin_install(
     return False, (
         f"Blocked (dangerous verdict, {_dangerous_findings_summary(result.findings)}). "
         f"--force does not override a dangerous verdict.")
+
+
+def format_scan_report(result: ScanResult, force: bool = False) -> str:
+    """Format a plugin report using the plugin-specific install policy."""
+    return _format_scan_report(result, decision_fn=should_allow_plugin_install, force=force)
 
 
 __all__ = [
