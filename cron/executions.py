@@ -258,7 +258,12 @@ def finish_execution(
             from cron.jobs import _sanitize_persisted_error
             detail = _sanitize_persisted_error(detail)
         except Exception:
-            pass
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "cron execution error sanitizer failed; storing unsanitized detail",
+                exc_info=True,
+            )
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions

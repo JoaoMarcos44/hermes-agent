@@ -130,3 +130,25 @@ class TestExecutionsLedgerRedactsError:
         )
         assert result is not None
         assert "sk_or_key_id_abcdef123456" not in (result.get("error") or "")
+
+    def test_finish_execution_sanitizer_failure_logs_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "cron.executions.EXECUTIONS_FILE", tmp_path / "executions.db"
+        )
+        from cron.executions import create_execution, finish_execution
+
+        def _boom(*a, **k):
+            raise RuntimeError("sanitizer failed")
+
+        monkeypatch.setattr("cron.jobs._sanitize_persisted_error", _boom)
+
+        record = create_execution("job-2", source="test")
+        with caplog.at_level("WARNING"):
+            result = finish_execution(
+                record["id"], success=False, error="something went wrong"
+            )
+        assert result is not None
+        assert result.get("error") == "something went wrong"
+        assert "cron execution error sanitizer failed; storing unsanitized detail" in caplog.text
