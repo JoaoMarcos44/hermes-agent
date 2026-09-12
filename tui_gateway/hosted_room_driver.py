@@ -153,6 +153,7 @@ class HostedRoomRuntime:
         # content-touched keeper keeps SQLite from treating one of those closes
         # as the last WAL participant while another process owns the generation.
         self._wal_keeper: sqlite3.Connection | None = None
+        self._wal_keeper_disabled: bool = False
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -429,7 +430,7 @@ class HostedRoomRuntime:
             while not self._stop.is_set():
                 # Clear before work so a write racing the cycle forces a follow-up pass.
                 self._wake.clear()
-                if self._wal_keeper is None:
+                if self._wal_keeper is None and not self._wal_keeper_disabled:
                     self._acquire_wal_keeper()
                 try:
                     self._run_cycle()
@@ -457,8 +458,12 @@ class HostedRoomRuntime:
         A failed acquire is non-fatal and retried on the next cycle. The half-open
         connection is always closed so a transient setup failure cannot leak a
         descriptor or silently disable future attempts.
+
+        When the database operates in canonical DELETE mode (or on non-WAL fallbacks),
+        no WAL sidecars exist to preserve, so the runtime treats this as a stable
+        no-keeper state without retrying or recording an error.
         """
-        if self._wal_keeper is not None:
+        if self._wal_keeper is not None or self._wal_keeper_disabled:
             return
         conn = None
         try:
@@ -468,17 +473,19 @@ class HostedRoomRuntime:
 
             mode = apply_wal_with_fallback(conn, db_label=self.db_path.name)
             if mode != "wal":
-                raise sqlite3.OperationalError(
-                    f"wal keeper requires journal_mode=wal (got {mode!r})"
-                )
+                with suppress(Exception):
+                    conn.close()
+                self._wal_keeper_disabled = True
+                return
             row = conn.execute("PRAGMA journal_mode").fetchone()
             effective_mode = (
                 str(row[0]).strip().lower() if row and row[0] is not None else ""
             )
             if effective_mode != "wal":
-                raise sqlite3.OperationalError(
-                    f"effective journal mode is {effective_mode!r}, expected 'wal'"
-                )
+                with suppress(Exception):
+                    conn.close()
+                self._wal_keeper_disabled = True
+                return
             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
             self._wal_keeper = conn
         except Exception as exc:
@@ -489,6 +496,7 @@ class HostedRoomRuntime:
 
     def _release_wal_keeper(self) -> None:
         conn, self._wal_keeper = self._wal_keeper, None
+        self._wal_keeper_disabled = False
         if conn is not None:
             with suppress(Exception):
                 conn.close()

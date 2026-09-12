@@ -35,6 +35,7 @@ def _wal_path(db: Path) -> Path:
 
 
 @pytest.mark.linux_only
+@pytest.mark.requires_wal
 def test_driver_keeps_wal_sidecars_across_ephemeral_cycles(tmp_path: Path):
     """On a fresh database, the keeper must configure WAL mode and prevent
     ephemeral poll cycles from unlinking the WAL sidecar generation."""
@@ -69,6 +70,7 @@ def test_driver_keeps_wal_sidecars_across_ephemeral_cycles(tmp_path: Path):
     assert runtime._wal_keeper is None, "keeper must close on stop"
 
 
+@pytest.mark.requires_wal
 def test_fresh_database_keeper_applies_wal_policy(tmp_path: Path):
     """A fresh database must have the canonical WAL policy applied by the keeper
     before retaining it, confirming effective mode is WAL."""
@@ -90,6 +92,31 @@ def test_fresh_database_keeper_applies_wal_policy(tmp_path: Path):
     assert runtime._wal_keeper is None
 
 
+def test_forced_safe_wal_policy_acquires_and_retains_keeper(tmp_path: Path, monkeypatch):
+    """When a safe WAL policy is explicitly forced, the keeper is acquired and retained."""
+    import hermes_state_wal
+
+    monkeypatch.setattr(hermes_state_wal, "is_sqlite_wal_reset_vulnerable", lambda *a, **k: False)
+    db = tmp_path / "state.db"
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[BINDING],
+        rpc=FakeSessionRPC(),
+        turn_lock=RecordingTurnLocks(),
+        poll_interval_seconds=0.01,
+    )
+    try:
+        runtime.start()
+        _wait_for(lambda: runtime._wal_keeper is not None)
+        assert runtime._wal_keeper_disabled is False
+        row = runtime._wal_keeper.execute("PRAGMA journal_mode").fetchone()
+        assert row is not None and str(row[0]).lower() == "wal"
+    finally:
+        runtime.stop(timeout=2.0)
+    assert runtime._wal_keeper is None
+
+
+@pytest.mark.requires_wal
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_keeper_released_when_lease_cleanup_raises(tmp_path: Path, monkeypatch):
     """When _release_idle_leases() raises sqlite3.OperationalError, the nested
@@ -118,9 +145,9 @@ def test_keeper_released_when_lease_cleanup_raises(tmp_path: Path, monkeypatch):
         keeper.execute("SELECT 1")
 
 
-def test_keeper_not_retained_if_journal_mode_not_wal(tmp_path: Path, monkeypatch):
-    """If the canonical journal policy yields a non-WAL mode, the keeper
-    must not be retained, the connection closed, and an error recorded."""
+def test_canonical_delete_mode_is_stable_without_keeper_or_error(tmp_path: Path, monkeypatch):
+    """If the canonical journal policy yields a non-WAL mode (e.g. DELETE),
+    the runtime treats it as a stable no-keeper state without retrying or recording an error."""
     db = tmp_path / "state.db"
     runtime = HostedRoomRuntime(
         db_path=db,
@@ -135,9 +162,16 @@ def test_keeper_not_retained_if_journal_mode_not_wal(tmp_path: Path, monkeypatch
 
     runtime._acquire_wal_keeper()
     assert runtime._wal_keeper is None
-    assert runtime._last_error and "wal keeper unavailable" in runtime._last_error
+    assert runtime._wal_keeper_disabled is True
+    assert runtime.status()["last_error"] is None
+
+    # Subsequent acquire call must be a no-op (stable state, no retry, no error)
+    runtime._acquire_wal_keeper()
+    assert runtime._wal_keeper is None
+    assert runtime.status()["last_error"] is None
 
 
+@pytest.mark.requires_wal
 def test_keeper_acquire_retries_after_transient_failure(tmp_path: Path, monkeypatch):
     db = tmp_path / "state.db"
     runtime = HostedRoomRuntime(
