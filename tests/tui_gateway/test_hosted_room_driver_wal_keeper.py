@@ -34,18 +34,11 @@ def _wal_path(db: Path) -> Path:
     return db.with_name(db.name + "-wal")
 
 
-def _set_wal_mode(db: Path) -> None:
-    conn = sqlite3.connect(db, timeout=10)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL").fetchone()
-    finally:
-        conn.close()
-
-
 @pytest.mark.linux_only
 def test_driver_keeps_wal_sidecars_across_ephemeral_cycles(tmp_path: Path):
+    """On a fresh database, the keeper must configure WAL mode and prevent
+    ephemeral poll cycles from unlinking the WAL sidecar generation."""
     db = tmp_path / "state.db"
-    _set_wal_mode(db)
     runtime = HostedRoomRuntime(
         db_path=db,
         rooms=[BINDING],
@@ -76,9 +69,77 @@ def test_driver_keeps_wal_sidecars_across_ephemeral_cycles(tmp_path: Path):
     assert runtime._wal_keeper is None, "keeper must close on stop"
 
 
-def test_keeper_acquire_retries_after_transient_failure(tmp_path, monkeypatch):
+def test_fresh_database_keeper_applies_wal_policy(tmp_path: Path):
+    """A fresh database must have the canonical WAL policy applied by the keeper
+    before retaining it, confirming effective mode is WAL."""
     db = tmp_path / "state.db"
-    _set_wal_mode(db)
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[BINDING],
+        rpc=FakeSessionRPC(),
+        turn_lock=RecordingTurnLocks(),
+        poll_interval_seconds=0.01,
+    )
+    try:
+        runtime.start()
+        _wait_for(lambda: runtime._wal_keeper is not None)
+        row = runtime._wal_keeper.execute("PRAGMA journal_mode").fetchone()
+        assert row is not None and str(row[0]).lower() == "wal"
+    finally:
+        runtime.stop(timeout=2.0)
+    assert runtime._wal_keeper is None
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_keeper_released_when_lease_cleanup_raises(tmp_path: Path, monkeypatch):
+    """When _release_idle_leases() raises sqlite3.OperationalError, the nested
+    finally must still release the WAL keeper."""
+    db = tmp_path / "state.db"
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[BINDING],
+        rpc=FakeSessionRPC(),
+        turn_lock=RecordingTurnLocks(),
+        poll_interval_seconds=0.01,
+    )
+    runtime.start()
+    _wait_for(lambda: runtime._wal_keeper is not None)
+    keeper = runtime._wal_keeper
+    assert keeper is not None
+
+    def failing_release_idle_leases():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(runtime, "_release_idle_leases", failing_release_idle_leases)
+    stopped = runtime.stop(timeout=2.0)
+    assert stopped is True
+    assert runtime._wal_keeper is None
+    with pytest.raises(sqlite3.ProgrammingError, match="Cannot operate on a closed database"):
+        keeper.execute("SELECT 1")
+
+
+def test_keeper_not_retained_if_journal_mode_not_wal(tmp_path: Path, monkeypatch):
+    """If the canonical journal policy yields a non-WAL mode, the keeper
+    must not be retained, the connection closed, and an error recorded."""
+    db = tmp_path / "state.db"
+    runtime = HostedRoomRuntime(
+        db_path=db,
+        rooms=[BINDING],
+        rpc=FakeSessionRPC(),
+        turn_lock=RecordingTurnLocks(),
+        poll_interval_seconds=0.01,
+    )
+    import hermes_state_wal
+
+    monkeypatch.setattr(hermes_state_wal, "apply_wal_with_fallback", lambda *a, **k: "delete")
+
+    runtime._acquire_wal_keeper()
+    assert runtime._wal_keeper is None
+    assert runtime._last_error and "wal keeper unavailable" in runtime._last_error
+
+
+def test_keeper_acquire_retries_after_transient_failure(tmp_path: Path, monkeypatch):
+    db = tmp_path / "state.db"
     runtime = HostedRoomRuntime(
         db_path=db,
         rooms=[BINDING],
@@ -103,9 +164,8 @@ def test_keeper_acquire_retries_after_transient_failure(tmp_path, monkeypatch):
     assert runtime._wal_keeper is None
 
 
-def test_failed_acquire_does_not_leak_connection(tmp_path, monkeypatch):
+def test_failed_acquire_does_not_leak_connection(tmp_path: Path, monkeypatch):
     db = tmp_path / "state.db"
-    _set_wal_mode(db)
     runtime = HostedRoomRuntime(
         db_path=db,
         rooms=[BINDING],

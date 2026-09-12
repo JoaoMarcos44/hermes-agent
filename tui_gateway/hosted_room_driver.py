@@ -439,15 +439,17 @@ class HostedRoomRuntime:
                     self._cycles += 1
                 self._wake.wait(self.poll_interval_seconds)
         finally:
-            while True:
-                with self._status_lock:
-                    room_threads = tuple(t for t in self._room_threads.values() if t.is_alive())
-                if not room_threads:
-                    break
-                for room_thread in room_threads:
-                    room_thread.join(self.active_poll_interval_seconds)
-            self._release_idle_leases()
-            self._release_wal_keeper()
+            try:
+                while True:
+                    with self._status_lock:
+                        room_threads = tuple(t for t in self._room_threads.values() if t.is_alive())
+                    if not room_threads:
+                        break
+                    for room_thread in room_threads:
+                        room_thread.join(self.active_poll_interval_seconds)
+                self._release_idle_leases()
+            finally:
+                self._release_wal_keeper()
 
     def _acquire_wal_keeper(self) -> None:
         """Keep one content-touched SQLite connection open for the worker lifetime.
@@ -460,7 +462,23 @@ class HostedRoomRuntime:
             return
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path, timeout=10)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+            from hermes_state_wal import apply_wal_with_fallback
+
+            mode = apply_wal_with_fallback(conn, db_label=self.db_path.name)
+            if mode != "wal":
+                raise sqlite3.OperationalError(
+                    f"wal keeper requires journal_mode=wal (got {mode!r})"
+                )
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            effective_mode = (
+                str(row[0]).strip().lower() if row and row[0] is not None else ""
+            )
+            if effective_mode != "wal":
+                raise sqlite3.OperationalError(
+                    f"effective journal mode is {effective_mode!r}, expected 'wal'"
+                )
             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
             self._wal_keeper = conn
         except Exception as exc:
