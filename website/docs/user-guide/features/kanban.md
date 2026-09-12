@@ -848,6 +848,12 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
+`list` and the orchestrator `kanban_list` tool refresh dependency readiness for
+`todo` cards, but do not recover `blocked` cards. Blocked-task recovery remains
+owned by the dispatcher and explicit lifecycle operations, so inspecting the
+board cannot release a human-approval gate. The `promoted` value returned by
+`kanban_list` therefore counts only the `todo` cards refreshed by that query.
+
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
 ### Concurrency, scheduling, and child promotion config
