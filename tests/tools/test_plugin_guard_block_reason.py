@@ -12,8 +12,16 @@ def test_dangerous_reason_counts_and_names_blocking_findings():
         verdict="dangerous",
         findings=[
             Finding(
-                "hermes_config_mod_shell", "critical", "persistence",
+                "zeta_critical", "critical", "persistence",
                 "runtime/setup.sh", 4, "echo x > config.yaml", "writes config",
+            ),
+            Finding(
+                "alpha_critical", "critical", "persistence",
+                "runtime/other.sh", 5, "echo y > config.yaml", "writes config",
+            ),
+            Finding(
+                "zeta_critical", "critical", "persistence",
+                "runtime/again.sh", 6, "echo z > config.yaml", "writes config",
             ),
             Finding(
                 "unpinned_pip_install", "medium", "supply_chain",
@@ -29,11 +37,13 @@ def test_dangerous_reason_counts_and_names_blocking_findings():
     allowed, reason = should_allow_plugin_install(result)
 
     assert allowed is False
-    assert "1 critical of 3 findings" in reason
-    assert "hermes_config_mod_shell" in reason
+    assert "3 critical of 5 findings (alpha_critical, zeta_critical)" in reason
     assert "unpinned_pip_install" not in reason
+    forced_allowed, forced_reason = should_allow_plugin_install(result, force=True)
+    assert forced_allowed is False
+    assert "3 critical of 5 findings (alpha_critical, zeta_critical)" in forced_reason
     assert (
-        "Decision: BLOCKED — Blocked (dangerous verdict, 1 critical of 3 findings"
+        "Decision: BLOCKED — Blocked (dangerous verdict, 3 critical of 5 findings"
         in format_scan_report(result)
     )
 
