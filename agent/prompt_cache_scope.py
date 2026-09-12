@@ -27,9 +27,22 @@ def _profile_identity(agent: Any) -> str:
     Keep the empty value legacy-compatible for lightweight/background agents.
     """
     explicit = getattr(agent, "_profile_name", None) or getattr(agent, "profile_name", None)
-    if hasattr(agent, "_profile_name") or hasattr(agent, "profile_name"):
-        return str(explicit or "").strip()
+    if explicit:
+        return str(explicit).strip()
     return ""
+
+
+def is_prompt_cache_ineligible(agent: Any) -> bool:
+    """True when an agent cannot safely emit a profile-isolated prompt cache key.
+
+    A real profile-scoped agent whose profile identity failed to resolve must fail closed
+    to prevent cross-profile cache-bucket collision.
+    """
+    if getattr(agent, "_profile_unresolved", False):
+        return True
+    if getattr(agent, "_profile_scoped", False) and not _profile_identity(agent):
+        return True
+    return False
 
 
 def _lineage_root(session_id: str, session_db: Any) -> Optional[str]:
@@ -104,6 +117,8 @@ def declared_conversation_scope(agent: Any) -> Optional[str]:
     explicit fork child, and on any DB error (fail closed rather than merge a fork onto its
     parent's key).
     """
+    if is_prompt_cache_ineligible(agent):
+        return None
     key = str(getattr(agent, "_gateway_session_key", "") or "").strip()
     if not key or getattr(agent, "_persist_disabled", False):
         return None
@@ -145,6 +160,8 @@ def declared_conversation_scope(agent: Any) -> Optional[str]:
 def resolve_prompt_cache_scope(agent: Any) -> str:
     """Rotation-stable cache-scope id: declared scope, else the compression-lineage root of
     ``agent.session_id`` (the physical id without ancestry/DB). Memoized on the agent."""
+    if is_prompt_cache_ineligible(agent):
+        return ""
     sid = str(getattr(agent, "session_id", None) or "")
     if not sid:
         return ""
@@ -184,14 +201,14 @@ def resolve_prompt_cache_scope_safe(agent: Any) -> Optional[str]:
     """Never-raising variant of :func:`resolve_prompt_cache_scope` (None = use the physical id).
     At turn_context an exception inside ``set_runtime_main(...)`` would skip the whole binding.
 
-    Returns None on any failure (or when there is no scope). Consumers treat None/empty as "fall back to the
-    physical session_id", so a resolution failure degrades to pre-#79017 behavior instead of blocking the
-    caller — important at turn_context's call site, where an exception raised inside the
-    ``set_runtime_main(...)`` argument list would otherwise skip the whole runtime binding, not just the
-    cache scope.
+    Returns None on any failure (or when there is no scope). When the agent is explicitly
+    cache-ineligible (e.g. profile resolution failure on a profile-scoped agent), returns
+    ``""`` so transports fail closed rather than falling back to the physical session_id.
     """
     try:
+        if is_prompt_cache_ineligible(agent):
+            return ""
         return resolve_prompt_cache_scope(agent) or None
     except Exception:
         logger.debug("prompt-cache scope resolution failed", exc_info=True)
-        return None
+        return "" if is_prompt_cache_ineligible(agent) else None
