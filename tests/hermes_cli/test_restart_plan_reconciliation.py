@@ -164,6 +164,26 @@ def test_launchd_named_profile_and_failed_label():
     assert failed[0]["outcome"] == "failed"
 
 
+def test_launchd_root_label_credits_replaced_named_profile_from_snapshot():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("coder", 401, supervisor="launchd")),
+        restarted_services=["ai.hermes.gateway"], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+        fleet_snapshot=[{"profile": "coder", "pid": 402, "state": "current"}],
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+
+
+def test_launchd_root_label_without_named_profile_successor_stays_unaccounted():
+    outcomes = match_runtime_outcomes(
+        _plan(_rt("coder", 401, supervisor="launchd")),
+        restarted_services=["ai.hermes.gateway"], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+        fleet_snapshot=[{"profile": "other", "pid": 402, "state": "current"}],
+    )
+    assert outcomes[0]["outcome"] == "unaccounted"
+
+
 def test_untouched_runtime_is_unaccounted_and_escalates(capsys):
     """The tripwire: plan saw it, NO bookkeeping mentions it."""
     outcomes = match_runtime_outcomes(

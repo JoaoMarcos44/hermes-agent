@@ -312,7 +312,7 @@ def _gateway_named_in(r: RuntimeRecord, names: set) -> bool:
 def match_runtime_outcomes(
     plan: "UpdatePlan", *, restarted_services: list, relaunched_profiles: list,
     externally_supervised_profiles: list, killed_pids: set, failed_units: list,
-    stale_serve_pids: "set | None" = None,
+    stale_serve_pids: "set | None" = None, fleet_snapshot: "list | None" = None,
 ) -> list[dict[str, Any]]:
     """Reconcile the plan's runtimes against what the restart phase DID.
 
@@ -336,6 +336,27 @@ def match_runtime_outcomes(
         killed = {int(p) for p in (killed_pids or set())}
         stale_serves = {int(p) for p in stale_serve_pids} if stale_serve_pids is not None else None
 
+        def _launchd_successor(r: RuntimeRecord) -> bool:
+            """Credit a root LaunchAgent when its served profile proves replacement.
+
+            The unsuffixed root label identifies the installation, not the profile currently
+            served by that gateway (which may follow ``active_profile``).  Use the already
+            collected post-restart incarnation snapshot rather than guessing from the label.
+            """
+            if (
+                r.restart_via != "launchd"
+                or r.profile == "default"
+                or not fleet_snapshot
+                or "ai.hermes.gateway" not in {
+                    str(service).removesuffix(".service").rsplit("/", 1)[-1]
+                    for service in restarted_set
+                }
+            ):
+                return False
+            if r.pid is None or any(row.get("pid") == r.pid for row in fleet_snapshot):
+                return False
+            return any(row.get("profile") == r.profile and row.get("state") == "current" for row in fleet_snapshot)
+
         def _outcome(r: RuntimeRecord) -> str:
             killed_here = r.pid is not None and r.pid in killed
             if r.kind in _SERVE_KINDS:
@@ -354,7 +375,7 @@ def match_runtime_outcomes(
                 return "stopped"
             if _gateway_named_in(r, failed_set):
                 return "failed"
-            return "restarted" if _gateway_named_in(r, restarted_set) else "unaccounted"
+            return "restarted" if _gateway_named_in(r, restarted_set) or _launchd_successor(r) else "unaccounted"
 
         for r in plan.runtimes:
             if isinstance(r, RuntimeRecord):
