@@ -38,7 +38,9 @@ from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
     _set_last_init_error, get_last_init_error,
 )
-from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
+from hermes_state_readpool import (
+    _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, evict_all_idle_read_conns,
+)
 from hermes_state_sessions import SessionSessionsMixin
 from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin

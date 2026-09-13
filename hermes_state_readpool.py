@@ -240,3 +240,22 @@ def _read_budget_for(db_path) -> _PathReadBudget:
             budget = _PathReadBudget()
             _read_budgets[key] = budget
         return budget
+
+
+def evict_all_idle_read_conns() -> int:
+    """Close all currently idle pooled read connections across every SessionDB on any path in this process.
+
+    Returns the number of idle connections closed. Used during periodic housekeeping memory trim
+    to return dormant file descriptors and memory back to the OS (#110214)."""
+    with _read_budgets_lock:
+        budgets = list(_read_budgets.values())
+    evicted = 0
+    for budget in budgets:
+        with budget._lock:
+            members = list(budget._members)
+        for member in members:
+            evict = getattr(member, "evict_idle_read_conns", None)
+            if callable(evict):
+                evicted += evict()
+    return evicted
+

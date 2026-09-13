@@ -515,3 +515,29 @@ def test_evict_idle_read_conns_closes_pool_and_releases_permits(tmp_path):
     finally:
         db.close()
 
+
+def test_evict_all_idle_read_conns_across_multiple_dbs(tmp_path):
+    """evict_all_idle_read_conns drains idle connections across all registered path budgets (#110214)."""
+    from hermes_state import evict_all_idle_read_conns
+    db1 = SessionDB(db_path=tmp_path / "state1.db")
+    db2 = SessionDB(db_path=tmp_path / "state2.db")
+    try:
+        if not db1._wal_active or not db2._wal_active:
+            pytest.skip("read pool needs WAL")
+        c1 = db1._connect_read_only(timeout=5.0)
+        c2 = db2._connect_read_only(timeout=5.0)
+        assert db1._read_budget.acquire(db1)
+        assert db2._read_budget.acquire(db2)
+        db1._read_pool.put_nowait(c1)
+        db2._read_pool.put_nowait(c2)
+        assert not db1._read_pool.empty()
+        assert not db2._read_pool.empty()
+        evicted = evict_all_idle_read_conns()
+        assert evicted >= 2
+        assert db1._read_pool.empty()
+        assert db2._read_pool.empty()
+    finally:
+        db1.close()
+        db2.close()
+
+

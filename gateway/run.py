@@ -4514,12 +4514,8 @@ def _housekeeping_memory_trim() -> None:
     from hermes_cli.mem_trim import trim_memory
     trim_memory(reason="messaging gateway housekeeping")
     try:
-        from hermes_state_registry import borrow_live_shared_session_dbs
-        with borrow_live_shared_session_dbs() as _session_dbs:
-            for _sdb in _session_dbs:
-                _evict = getattr(_sdb, "evict_idle_read_conns", None)
-                if callable(_evict):
-                    _evict()
+        from hermes_state_readpool import evict_all_idle_read_conns
+        evict_all_idle_read_conns()
     except Exception:
         pass
 
