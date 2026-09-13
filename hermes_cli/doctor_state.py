@@ -3,7 +3,9 @@ Split out of ``hermes_cli/doctor.py``, which re-exports every name so ``hermes_c
 
 from __future__ import annotations
 
+import os
 import subprocess
+import time
 from pathlib import Path
 from hermes_cli.doctor_report import (
     Finding, _fail_and_issue, _section, check_bool, check_info, check_ok, check_warn, doctor_check, ensure_dir,
@@ -203,8 +205,131 @@ def _repair_state_db(f: Finding, should_fix: bool, state_db_path: Path, kind: st
     f.fixed += 1
 
 
+def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH: str) -> bool:
+    """Detect and remediate processes holding unlinked or retired WAL generations."""
+    from hermes_state_dbfile import iter_deleted_sqlite_sidecar_holders
+    from hermes_constants import profile_cli_selector
+
+    holders = iter_deleted_sqlite_sidecar_holders(state_db_path)
+    retired_dirs = sorted(state_db_path.parent.glob(f"{state_db_path.name}.retired-wal-*"))
+    profile_arg = profile_cli_selector()
+
+    if not holders:
+        if retired_dirs:
+            latest = retired_dirs[-1]
+            manifest_file = latest / "manifest.json"
+            mode = "unknown"
+            if manifest_file.exists():
+                import json
+                try:
+                    m = json.loads(manifest_file.read_text(encoding="utf-8"))
+                    mode = m.get("main", {}).get("mode", "unknown")
+                except Exception:
+                    pass
+            check_info(
+                f"Retired WAL capture preserved at {latest.name} (mode: {mode}; "
+                f"inspect with 'hermes {profile_arg}sessions recover --source {latest / 'state.db'} --inspect-only')"
+            )
+        return False
+
+    pids = sorted({pid for pid, _ in holders if pid > 0})
+    pids_desc = ", ".join(f"PID {p}" for p in pids)
+    check_warn(
+        f"{_DHH}/state.db has {len(pids)} process(es) holding an unlinked or retired WAL generation",
+        f"({pids_desc})",
+    )
+
+    if not should_fix:
+        f.issues.append(
+            f"state.db has {len(pids)} process(es) holding a retired WAL generation ({pids_desc}) — "
+            f"run 'hermes {profile_arg}doctor --fix' to stop conflicting processes and reopen cleanly"
+        )
+        return True
+
+    from gateway.status import terminate_pid
+    from hermes_state_holders import _read_proc_argv
+
+    stopped_pids = []
+    failed_pids = []
+    for pid in pids:
+        argv = _read_proc_argv(pid)
+        cmd_desc = " ".join(argv)[:60] if argv else f"PID {pid}"
+        try:
+            terminate_pid(pid, force=False)
+            exited = False
+            for _ in range(20):
+                time.sleep(0.1)
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    exited = True
+                    break
+            if not exited:
+                terminate_pid(pid, force=True)
+                for _ in range(10):
+                    time.sleep(0.1)
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        exited = True
+                        break
+            if exited:
+                stopped_pids.append((pid, cmd_desc))
+            else:
+                failed_pids.append((pid, cmd_desc))
+        except Exception as exc:
+            failed_pids.append((pid, f"{cmd_desc} ({exc})"))
+
+    if stopped_pids:
+        check_ok(
+            f"Stopped {len(stopped_pids)} process(es) holding retired WAL",
+            f"({', '.join(str(p) for p, _ in stopped_pids)})",
+        )
+        f.fixed += 1
+
+    if failed_pids:
+        check_warn(
+            f"Could not stop {len(failed_pids)} process(es) holding retired WAL",
+            f"({', '.join(f'{p}: {c}' for p, c in failed_pids)})",
+        )
+        f.manual_issues.append(
+            f"Could not automatically stop {len(failed_pids)} process(es) holding retired WAL: "
+            f"{', '.join(f'PID {p} ({c})' for p, c in failed_pids)} — stop them manually and reopen"
+        )
+
+    remaining = iter_deleted_sqlite_sidecar_holders(state_db_path)
+    if not remaining:
+        try:
+            check_ok(f"{_DHH}/state.db reopened successfully ({_session_count(state_db_path)} sessions)")
+        except Exception as e:
+            check_warn(f"{_DHH}/state.db reopened but health check reported: {e}")
+
+    if retired_dirs:
+        latest = retired_dirs[-1]
+        manifest_file = latest / "manifest.json"
+        mode = "unknown"
+        if manifest_file.exists():
+            import json
+            try:
+                m = json.loads(manifest_file.read_text(encoding="utf-8"))
+                mode = m.get("main", {}).get("mode", "unknown")
+            except Exception:
+                pass
+        check_info(
+            f"Retired WAL capture preserved at {latest.name} (mode: {mode}; "
+            f"inspect with 'hermes {profile_arg}sessions recover --source {latest / 'state.db'} --inspect-only')"
+        )
+
+    return True
+
+
 def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: str) -> None:
     """Session count + FTS write-health probe; malformed-schema path when even COUNT(*) fails."""
+    from hermes_state_dbfile import iter_deleted_sqlite_sidecar_holders
+    if iter_deleted_sqlite_sidecar_holders(state_db_path):
+        _recover_retired_wal(f, should_fix, state_db_path, _DHH)
+        return
+
     try:
         check_ok(f"{_DHH}/state.db exists ({_session_count(state_db_path)} sessions)")
         # COUNT(*) succeeds even when the FTS index is corrupt and every write fails through the triggers;
@@ -222,6 +347,10 @@ def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: st
             _repair_state_db(f, should_fix, state_db_path, "fts")
     except Exception as e:
         from hermes_state import is_malformed_db_error
+        from hermes_state_errors import DeletedWalGenerationError
+        if isinstance(e, DeletedWalGenerationError) or "deleted state.db-wal" in str(e):
+            _recover_retired_wal(f, should_fix, state_db_path, _DHH)
+            return
         if not is_malformed_db_error(e):
             return check_warn(f"{_DHH}/state.db exists but has issues: {e}")
         # sqlite_master itself is malformed (e.g. duplicate messages_fts): every statement fails before it runs,
@@ -253,22 +382,37 @@ def _state_db_wal(f: Finding, should_fix: bool, state_db_path: Path) -> None:
     with warn_on_error(""):
         size = wal_size()
         if size > 50 * 1024 * 1024:  # 50 MB
-            check_warn(f"WAL file is large ({size // (1024*1024)} MB)", "(may indicate missed checkpoints)")
-            if not should_fix:
-                return f.issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
-            # Checkpoint-lock premise (#40177): a bare connect runs WAL recovery and the checkpoint joins the
-            # live WAL — under a running gateway that second-writer handling corrupts state.db. Skip instead.
             from hermes_state_holders import live_writer_holds_db
             from hermes_state_repair import _connect_repair_durable
-            if live_writer_holds_db(state_db_path, connect_repair_durable=_connect_repair_durable):
+            is_held = live_writer_holds_db(state_db_path, connect_repair_durable=_connect_repair_durable)
+            if not should_fix:
+                if is_held:
+                    check_warn(
+                        f"WAL file is large ({size // (1024*1024)} MB)",
+                        "(normal while Desktop/gateway are running; only checkpoint with them stopped)",
+                    )
+                    return f.issues.append(
+                        f"Large WAL file ({size // (1024*1024)} MB) — normal while Desktop/gateway are "
+                        "running; stop them first before checkpointing with 'hermes doctor --fix'"
+                    )
+                check_warn(
+                    f"WAL file is large ({size // (1024*1024)} MB)",
+                    "(may indicate missed checkpoints; only checkpoint with Desktop/gateway stopped)",
+                )
+                return f.issues.append(
+                    "Large WAL file — run 'hermes doctor --fix' to checkpoint (ensure Desktop/gateway are stopped)"
+                )
+            # Checkpoint-lock premise (#40177): a bare connect runs WAL recovery and the checkpoint joins the
+            # live WAL — under a running gateway that second-writer handling corrupts state.db. Skip instead.
+            if is_held:
                 # Honest disjunction (gate C1): a True here means "held OR
                 # unprovable" — the DatabaseError lane fires when SQLite
                 # cannot open the file at all, with nobody holding it. Never
                 # assert a live writer as fact.
                 check_warn("WAL checkpoint skipped: cannot prove state.db is quiet",
-                           "(a live writer holds it, or it is unreadable — stop the profile's gateway "
-                           "and re-run 'hermes doctor --fix')")
-                return f.issues.append("Large WAL file — cannot prove state.db is quiet (stop the profile's "
+                           "(a live writer holds it, or it is unreadable — stop Desktop and the profile's gateway "
+                           "first, then re-run 'hermes doctor --fix')")
+                return f.issues.append("Large WAL file — cannot prove state.db is quiet (stop Desktop and the profile's "
                                        "gateway first, then re-run 'hermes doctor --fix' to checkpoint)")
             import contextlib
             import sqlite3
