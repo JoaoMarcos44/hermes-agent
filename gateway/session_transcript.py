@@ -162,6 +162,12 @@ class SessionTranscriptMixin:
             logger.warning(
                 "JSONL divert failed for replaced state.db transcript on %s", session_id,
                 exc_info=True)
+        from hermes_state_errors import RecoverableDeletedWalGenerationError
+        if isinstance(exc, RecoverableDeletedWalGenerationError):
+            from gateway.run import _gateway_runner_ref
+            runner = _gateway_runner_ref()
+            if runner is not None:
+                runner.request_restart(detached=False, via_service=True)
 
     def _live_compression_child(self, session_id: str) -> str:
         """Transitive compression tip of *session_id* if it is a different, still-live row, else ""

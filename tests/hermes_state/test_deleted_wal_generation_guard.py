@@ -23,6 +23,7 @@ from hermes_state import (
     DeletedWalGenerationError, SessionDB, StateDbReplacedError, _close_time_checkpoint_configurable,
     classify_persistence_error, refuse_deleted_wal_generation,
 )
+from hermes_state_errors import RecoverableDeletedWalGenerationError
 from hermes_state_dbfile import _pread_db_header, iter_deleted_sqlite_sidecar_holders
 from tests.hermes_state._wal_generation_harness import (
     gateway_writer, integrity_ok_path, lose_sidecars, make_db, message_count, pin_wal, require_wal,
@@ -46,6 +47,35 @@ def test_classify_deleted_wal_separately_from_main_file_replacement():
     replaced = StateDbReplacedError("state.db was replaced underneath this process")
     assert classify_persistence_error(replaced) == "replaced"
     assert classify_persistence_error(str(replaced)) == "replaced"
+
+
+def test_supervised_deleted_wal_requests_fresh_process_error(monkeypatch):
+    db = object.__new__(SessionDB)
+    db._db_replaced = False
+    db._db_wal_generation_lost = False
+    db._disable_close_time_checkpoint = lambda: None
+    db._capture_retired_generation = lambda trigger: None
+    db._db_file_was_replaced = lambda: False
+    db._wal_generation_was_lost = lambda: True
+    monkeypatch.setattr("gateway.restart.is_gateway_supervisor_process", lambda: True)
+
+    with pytest.raises(RecoverableDeletedWalGenerationError):
+        db._halt_if_db_generation_changed()
+
+
+def test_unsupervised_deleted_wal_keeps_fail_closed_error(monkeypatch):
+    db = object.__new__(SessionDB)
+    db._db_replaced = False
+    db._db_wal_generation_lost = False
+    db._disable_close_time_checkpoint = lambda: None
+    db._capture_retired_generation = lambda trigger: None
+    db._db_file_was_replaced = lambda: False
+    db._wal_generation_was_lost = lambda: True
+    monkeypatch.setattr("gateway.restart.is_gateway_supervisor_process", lambda: False)
+
+    with pytest.raises(DeletedWalGenerationError) as exc_info:
+        db._halt_if_db_generation_changed()
+    assert not isinstance(exc_info.value, RecoverableDeletedWalGenerationError)
 
 
 def test_iter_holders_empty_on_non_linux(monkeypatch, tmp_path):

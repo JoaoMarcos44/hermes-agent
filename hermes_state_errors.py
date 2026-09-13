@@ -164,6 +164,14 @@ class DeletedWalGenerationError(StateDbReplacedError):
     transcripts on a replaced store handles this identically."""
 
 
+class RecoverableDeletedWalGenerationError(DeletedWalGenerationError):
+    """Deleted WAL loss in a gateway process owned by a supervisor.
+
+    The handle remains fail-closed; the subtype lets the gateway request a
+    fresh supervised process after the retired generation is captured.
+    """
+
+
 # SQLite header application_id (offset 68). Distinct from inode: ``cp`` onto the
 # same path keeps st_ino and truncates+rewrites.
 _STATE_DB_APPLICATION_ID_OFFSET = 68

@@ -1140,7 +1140,15 @@ class SessionDB(
                     "the capture and refuses to settle without it.", self.db_path, exc,
                 )
             logger.error(_DELETED_WAL_GENERATION_MSG)
-            raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
+            error_type = DeletedWalGenerationError
+            # Reopening in-process is unsafe while this process owns the retired
+            # sidecar descriptor; only a supervised gateway may request a fresh
+            # process. Other callers retain the fail-closed recovery contract.
+            from gateway.restart import is_gateway_supervisor_process
+            if is_gateway_supervisor_process():
+                from hermes_state_errors import RecoverableDeletedWalGenerationError
+                error_type = RecoverableDeletedWalGenerationError
+            raise error_type(_DELETED_WAL_GENERATION_MSG)
 
     def _capture_retired_generation(self, trigger: str) -> Path:
         """Durably capture the lost WAL generation this handle still holds open, once per handle.
