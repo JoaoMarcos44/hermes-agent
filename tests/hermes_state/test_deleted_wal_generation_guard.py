@@ -455,3 +455,59 @@ def test_refuse_helper_raises_while_deleted_wal_held(tmp_path, force_wal):
         assert not wal.exists()
     finally:
         raw.close()
+
+
+def test_fd_is_truly_unlinked_handles_vanished_descriptor(tmp_path):
+    """Vanished or closed fd returns False, preventing race false-positives (#110214)."""
+    from hermes_state_dbfile import _fd_is_truly_unlinked
+    watched = tmp_path / "state.db-wal"
+    watched.write_bytes(b"dummy")
+    assert _fd_is_truly_unlinked(str(tmp_path / "nonexistent_fd"), str(watched)) is False
+
+
+def test_fd_is_truly_unlinked_tolerates_in_process_checkpointed_wal(tmp_path):
+    """In-process descriptor on cleanly checkpointed WAL with intact -shm returns False (#110214)."""
+    from hermes_state_dbfile import _fd_is_truly_unlinked
+    base = tmp_path / "state.db"
+    base.write_bytes(b"SQLite format 3\x00" + b"\x00" * 84)
+    shm = tmp_path / "state.db-shm"
+    shm.write_bytes(b"shm_data")
+    wal_path = tmp_path / "state.db-wal"  # does not exist
+    # fd_path pointing to an existing file on the same filesystem
+    assert _fd_is_truly_unlinked(str(base), str(wal_path), pid=os.getpid()) is False
+
+
+def test_wal_generation_was_lost_tolerates_checkpointed_wal_with_intact_shm(tmp_path):
+    """Absent -wal with intact -shm is treated as clean checkpoint, not lost generation (#110214)."""
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    shm = Path(str(db_path) + "-shm")
+    shm.write_bytes(b"shm_data")
+    wal_path = Path(str(db_path) + "-wal")
+    if wal_path.exists():
+        wal_path.unlink()
+    shm_ident = hermes_state_dbfile._stat_db_file_identity(shm)
+    db._db_file_identity = hermes_state_dbfile._stat_db_file_identity(db_path)
+    db._db_sidecar_identity = {"-wal": (shm_ident[0], 999999), "-shm": shm_ident}
+    assert db._wal_generation_was_lost() is False
+    assert "-wal" not in db._db_sidecar_identity
+    assert db._db_sidecar_identity["-shm"] == shm_ident
+
+
+def test_evict_idle_read_conns_closes_pool_and_releases_permits(tmp_path):
+    """evict_idle_read_conns drains all idle read connections and releases permits (#110214)."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        if not db._wal_active:
+            pytest.skip("read pool needs WAL")
+        conn = db._connect_read_only(timeout=5.0)
+        assert db._read_budget.acquire(db)
+        db._read_pool.put_nowait(conn)
+        assert not db._read_pool.empty()
+        evicted = db.evict_idle_read_conns()
+        assert evicted >= 1
+        assert db._read_pool.empty()
+    finally:
+        db.close()
+

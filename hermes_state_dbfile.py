@@ -10,6 +10,7 @@ call time, so tests that monkeypatch ``hermes_state.<name>`` keep intercepting.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -144,7 +145,7 @@ def _watched_sqlite_sidecar_paths(db_path) -> Dict[str, str]:
     return {_canonical_sqlite_path(path): path for path in literal}
 
 
-def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
+def _fd_is_truly_unlinked(fd_path: str, watched_path: str, pid: Optional[int] = None) -> bool:
     """Confirm a `` (deleted)`` /proc fd target really names an orphaned generation, not the
     CURRENT watched sidecar.
 
@@ -154,17 +155,45 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
     keep a surviving hard link (a backup, an operator copy) after the watched path itself is
     removed or replaced, leaving ``st_nlink >= 1`` on a truly orphaned inode. So compare
     identity, not link count: only an exact ``(st_dev, st_ino)`` match between the fd and the
-    CURRENT watched path proves they are the same live file. A mismatch, or a watched path
-    that cannot be stat'd at all, means the fd holds a generation the watched path no longer
-    names — the guard keeps failing closed."""
+    CURRENT watched path proves they are the same live file.
+
+    Benign races and in-process sidecar churn (#110214):
+    - A descriptor closed between /proc readlink and stat (or an exited process) raises
+      FileNotFoundError/EBADF/ESRCH: a descriptor that no longer exists cannot keep an
+      orphaned WAL generation alive, so it is benign.
+    - If the watched sidecar does not currently exist on disk (e.g. SQLite checkpointed
+      and cleanly unlinked state.db-wal while a long-running gateway handle remains open),
+      this process's own descriptors on the intact main database are not an orphaned
+      replacement generation: no replacement WAL exists on disk, so no split-brain is possible.
+    """
     try:
         fd_stat = os.stat(fd_path)
-    except OSError:
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (errno.ENOENT, errno.EBADF, errno.ESRCH):
+            return False
         return True
+
     try:
         watched_stat = os.stat(watched_path)
+    except FileNotFoundError:
+        current_pid = os.getpid()
+        is_self = (pid == current_pid) if pid is not None else (
+            f"/{current_pid}/" in fd_path or fd_path.startswith("/proc/self/")
+        )
+        if is_self and watched_path.endswith("-wal"):
+            base_db = watched_path.removesuffix("-wal")
+            try:
+                base_stat = os.stat(base_db)
+                if os.path.exists(base_db + "-shm") and base_stat.st_dev == fd_stat.st_dev:
+                    return False
+            except OSError:
+                pass
+        return True
     except OSError:
         return True
+
     return (fd_stat.st_dev, fd_stat.st_ino) != (watched_stat.st_dev, watched_stat.st_ino)
 
 
@@ -197,7 +226,7 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
         for pid, target, fd_path in _iter_proc_fd_targets():
             canonical = _canonical_sqlite_path(target)
             if (" (deleted)" in target and canonical in watched
-                    and _fd_is_truly_unlinked(fd_path, watched[canonical])):
+                    and _fd_is_truly_unlinked(fd_path, watched[canonical], pid=pid)):
                 holders.append((pid, target))
     except Exception as exc:
         logger.debug("deleted-WAL holder scan failed for %s: %s", db_path, exc)

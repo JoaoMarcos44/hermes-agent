@@ -788,10 +788,20 @@ class SessionDB(
         finally:
             self._read_budget.release()
 
+    def evict_idle_read_conns(self) -> int:
+        """Close all currently idle pooled read connections and release their permits.
+
+        Returns the number of idle connections closed. Useful during periodic housekeeping
+        to return dormant file descriptors and memory back to the OS (#110214)."""
+        evicted = 0
+        while self._evict_one_idle_read_conn():
+            evicted += 1
+        return evicted
+
     def _checkout_read_conn(self) -> Optional[sqlite3.Connection]:
         """Borrow a read connection, opening on a miss; None when the read path is unavailable.
         A pool hit costs no permit (the connection already holds one)."""
-        if not self._wal_active or self.read_only:
+        if not self._wal_active or self.read_only or self._db_wal_generation_lost:
             return None
         try:
             return self._read_pool.get_nowait()
@@ -1096,9 +1106,27 @@ class SessionDB(
         recorded = self._db_sidecar_identity or {}
         base = os.fspath(self.db_path)
         if recorded:
-            return any(
-                _stat_db_file_identity(Path(base + suffix)) != ident for suffix, ident in recorded.items()
-            )
+            # If -wal was cleanly checkpointed and removed while -shm and main DB remain intact,
+            # this is an idle checkpoint rather than a lost/retired generation (#110214).
+            wal_recorded = recorded.get("-wal")
+            if wal_recorded is not None:
+                wal_current = _stat_db_file_identity(Path(base + "-wal"))
+                if wal_current is None:
+                    shm_recorded = recorded.get("-shm")
+                    shm_current = _stat_db_file_identity(Path(base + "-shm"))
+                    if shm_recorded is not None and shm_current == shm_recorded and not self._db_file_was_replaced():
+                        recorded = {k: v for k, v in recorded.items() if k != "-wal"}
+                        self._db_sidecar_identity = recorded
+            if recorded:
+                for suffix, ident in recorded.items():
+                    if _stat_db_file_identity(Path(base + suffix)) != ident:
+                        return True
+                # If -wal was dropped during a clean checkpoint and recreated, re-adopt it
+                if "-wal" not in recorded:
+                    wal_ident = _stat_db_file_identity(Path(base + "-wal"))
+                    if wal_ident is not None:
+                        self._db_sidecar_identity["-wal"] = wal_ident
+                return False
         if not self._wal_active:  # no sidecar generation to lose; keep /proc off the hot path
             return False
         if sys.platform.startswith("linux"):
@@ -1107,7 +1135,7 @@ class SessionDB(
                 for target, fd_path in _proc_fd_targets(os.getpid()):
                     canonical = _canonical_sqlite_path(target)
                     if (" (deleted)" in target and canonical in watched
-                            and _fd_is_truly_unlinked(fd_path, watched[canonical])):
+                            and _fd_is_truly_unlinked(fd_path, watched[canonical], pid=os.getpid())):
                         return True
             except OSError:
                 return False

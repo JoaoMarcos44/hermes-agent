@@ -82,3 +82,23 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     assert set(opened) == set(closed)
 
 
+def test_ledger_connect_passes_wal_false(monkeypatch, tmp_path):
+    """Delivery ledger connection opener must not force WAL mode (#110214)."""
+    _point_ledger(monkeypatch, tmp_path)
+    from hermes_cli import sqlite_util
+    captured_kwargs = {}
+    real_open_db = sqlite_util.open_db
+
+    def mock_open_db(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return real_open_db(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite_util, "open_db", mock_open_db)
+    conn = dl._connect()
+    try:
+        assert captured_kwargs.get("wal") is False
+    finally:
+        conn.close()
+
+
+

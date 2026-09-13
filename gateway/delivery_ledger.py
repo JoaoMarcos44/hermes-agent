@@ -146,9 +146,11 @@ def _connect() -> sqlite3.Connection:
     from hermes_cli.sqlite_util import open_db
 
     # Shared state.db: SessionDB owns the durable PRAGMA set; this opener keeps the plain-tuple rows
-    # and the 10 s busy timeout it always had.
+    # and the 10 s busy timeout it always had. wal=False: SessionDB owns state.db's journal mode;
+    # forcing WAL from short-lived ledger connections triggers close-time checkpoints that churn
+    # sidecar generations under WSL (#110214).
     return open_db(_db_path(), db_label="state.db (delivery_ledger)", busy_timeout_ms=10_000,
-                   row_factory=None, initialize=_initialize_schema)
+                   wal=False, row_factory=None, initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
