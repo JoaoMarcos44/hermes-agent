@@ -937,17 +937,34 @@ def _is_attestation_fresh(data: dict, max_age_seconds: float = _DEFAULT_ATTESTAT
         return False
     ts_val = data.get("timestamp")
     if isinstance(ts_val, (int, float)):
-        return (time.time() - float(ts_val)) <= max_age_seconds
+        age = time.time() - float(ts_val)
+        return -60.0 <= age <= max_age_seconds
     ts_str = data.get("ts")
     if isinstance(ts_str, str):
         try:
             dt = datetime.fromisoformat(ts_str)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            return (datetime.now(timezone.utc) - dt).total_seconds() <= max_age_seconds
+            age = (datetime.now(timezone.utc) - dt).total_seconds()
+            return -60.0 <= age <= max_age_seconds
         except Exception:
             return False
     return False
+
+
+def _start_times_match(recorded: Any, current: Any) -> bool:
+    """Compare recorded and current process start times, supporting seconds and centiseconds."""
+    if recorded is None or current is None:
+        return True
+    try:
+        r, c = float(recorded), float(current)
+        if r > 1e10:
+            r = r / 100.0
+        if c > 1e10:
+            c = c / 100.0
+        return abs(r - c) <= 2.0
+    except (ValueError, TypeError):
+        return False
 
 
 def _attested_pid_exited_cleanly(pid: int, expected_create_time: float | None = None) -> bool:
@@ -962,11 +979,8 @@ def _attested_pid_exited_cleanly(pid: int, expected_create_time: float | None = 
         return False
     ledger_start = data.get("start_time")
     if expected_create_time is not None and ledger_start is not None:
-        try:
-            if abs(float(ledger_start) - float(expected_create_time)) > 2.0:
-                return False
-        except (ValueError, TypeError):
-            pass
+        if not _start_times_match(ledger_start, expected_create_time):
+            return False
     return True
 
 
@@ -1012,7 +1026,7 @@ def attested_gateway_died(
                 if expected_st is not None:
                     try:
                         actual_st = get_process_start_time(pid)
-                        if actual_st is not None and abs(float(actual_st) - float(expected_st)) <= 2.0:
+                        if actual_st is not None and _start_times_match(expected_st, actual_st):
                             return False  # Same process is still running
                     except Exception:
                         return False

@@ -332,3 +332,26 @@ def test_attested_probe_malformed_payload_fails_closed(attest_home):
     ]:
         marker.write_text(bad, encoding="utf-8")
         assert gateway_windows.attested_gateway_died(current_pids=[]) is False
+
+
+def test_attested_probe_clock_skew_and_start_time_units():
+    """Verify clock-skew tolerance and process start-time comparison across units."""
+    # Clock skew: minor negative age (-10s, NTP step) tolerated; future time (-70s) rejected
+    assert gateway_windows._is_attestation_fresh({"timestamp": time.time() + 10.0}) is True
+    assert gateway_windows._is_attestation_fresh({"timestamp": time.time() + 70.0}) is False
+
+    # Start times matching: None matches as wildcard
+    assert gateway_windows._start_times_match(None, 12345.0) is True
+    assert gateway_windows._start_times_match(12345.0, None) is True
+
+    # Seconds unit (e.g. float epoch ~ 1.7e9): within 2.0s is match
+    assert gateway_windows._start_times_match(1726000000.0, 1726000001.5) is True
+    assert gateway_windows._start_times_match(1726000000.0, 1726000005.0) is False
+
+    # Centiseconds unit (Windows psutil: ~ 1.7e11): within 200 centiseconds is match
+    assert gateway_windows._start_times_match(172600000000, 172600000150) is True
+    assert gateway_windows._start_times_match(172600000000, 172600000500) is False
+
+    # Non-numeric gracefully handled
+    assert gateway_windows._start_times_match("invalid", 123) is False
+
