@@ -33,11 +33,13 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     """
     from hermes_cli.active_sessions import active_session_registry_snapshot
     from hermes_state import SessionDB
+    from hermes_state_registry import acquire_shared_if_active
 
     home = Path(profile_home).resolve()
-    if not (home / "state.db").is_file():
+    db_path = home / "state.db"
+    if not db_path.is_file():
         return None
-    db = SessionDB(db_path=home / "state.db", read_only=True)
+    db = acquire_shared_if_active(db_path) or SessionDB(db_path=db_path, read_only=True)
     try:
         row = db.get_session_by_title("Bot Chat")
         session_id = db.get_compression_tip(row["id"]) if row else None
@@ -139,8 +141,10 @@ def _matches(home: Path | str, record: dict, owner: dict) -> bool:
     if pinned["session_id"] == owner["session_id"]:
         return True
     from hermes_state import SessionDB
+    from hermes_state_registry import acquire_shared_if_active
 
-    db = SessionDB(db_path=Path(home) / "state.db", read_only=True)
+    db_path = Path(home) / "state.db"
+    db = acquire_shared_if_active(db_path) or SessionDB(db_path=db_path, read_only=True)
     try:
         return db.get_compression_tip(pinned["session_id"]) == owner["session_id"]
     finally:

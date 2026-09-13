@@ -271,8 +271,8 @@ class SessionManager:
         ``DEFAULT_DB_PATH``, so test fixtures that change the env var later are honoured."""
         if self._db_instance is None:
             try:
-                from hermes_state import SessionDB
-                self._db_instance = SessionDB(db_path=get_hermes_home() / "state.db")
+                from hermes_state_registry import acquire
+                self._db_instance = acquire(get_hermes_home() / "state.db")
             except Exception:
                 logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
         return self._db_instance

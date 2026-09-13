@@ -110,13 +110,21 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     import sqlite3
 
     from hermes_state import SessionDB, is_malformed_schema_error
-    from hermes_state_registry import acquire, release_or_close
+    from hermes_state_registry import acquire, acquire_shared_if_active, release_or_close
 
     # Read-only file/sidecar preflight (port of kilocode#12508): repair-or-refuse BEFORE the first
     # connection so users get an actionable message instead of an opaque "attempt to write a readonly
     # database" from deep inside _init_schema.
     if not read_only:
         return acquire(db_path)
+
+    # When a shared SessionDB generation is already active in this process for db_path,
+    # borrow it instead of opening a duplicate connection (#110276).
+    # Single-process multi-handle WAL generation splits on macOS/POSIX occur when an
+    # unmanaged read-only connection closes and strips all process advisory locks.
+    shared = acquire_shared_if_active(db_path)
+    if shared is not None:
+        return shared
 
     def _needs_bootstrap() -> bool:
         try:

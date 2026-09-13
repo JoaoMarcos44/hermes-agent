@@ -178,6 +178,7 @@ def _teardown_generation(
 
 def _db_path_of(db: "SessionDB") -> Optional[Path]:
     """``Path(db.db_path)`` or None when absent/unconvertible."""
+    db = getattr(db, "_session_db", db)
     path = getattr(db, "db_path", None)
     try:
         return None if path is None else Path(path)
@@ -273,6 +274,44 @@ def acquire(db_path: Optional[Path] = None) -> "SessionDB":
         return winner
 
 
+def has_live_generation(db_path: Optional[Path] = None) -> bool:
+    """True if there is an active, non-retired shared SessionDB generation for *db_path*."""
+    from hermes_state import _default_db_path
+
+    raw_path = Path(db_path) if db_path is not None else Path(_default_db_path())
+    try:
+        path = raw_path.resolve()
+    except OSError:
+        path = raw_path
+    with _lock:
+        generation = _generations.get(path)
+        return generation is not None and not generation.retired
+
+
+def acquire_shared_if_active(db_path: Optional[Path] = None) -> Optional["SessionDB"]:
+    """Return the shared SessionDB for *db_path* with refcount incremented ONLY IF
+    a generation is already live; returns None otherwise without opening a new connection."""
+    from hermes_state import _default_db_path
+
+    raw_path = Path(db_path) if db_path is not None else Path(_default_db_path())
+    try:
+        path = raw_path.resolve()
+    except OSError:
+        path = raw_path
+    with _lock:
+        generation = _generations.get(path)
+        if generation is not None and not generation.retired:
+            current = _stat_db_file_identity(path)
+            if current is not None and generation.identity is not None and current != generation.identity:
+                generation.retired = True
+                del _generations[path]
+                _retired[id(generation.db)] = generation
+                return None
+            generation.refcount += 1
+            return generation.db
+        return None
+
+
 def release(db: "SessionDB") -> bool:
     """Decrement the refcount of a shared SessionDB. ``True`` if *db* was shared; ``False``
     if it is not registry-managed (caller owns close()). The final release tears the
@@ -280,6 +319,7 @@ def release(db: "SessionDB") -> bool:
     old generation release into its retired record, not into whatever the path names."""
     if db is None:
         return False
+    db = getattr(db, "_session_db", db)
     key = id(db)
     teardown_barrier: Optional[_TeardownBarrier] = None
     with _lock:

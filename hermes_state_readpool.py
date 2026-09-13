@@ -178,6 +178,13 @@ class _PathReadBudget:
                 handles, db.db_path, _READ_POOL_MAX,
             )
 
+    def unregister(self, db: "SessionDB") -> None:
+        """Drop *db* from registered handles; unsets warning latch when count recovers."""
+        with self._lock:
+            self._members.discard(db)
+            if len(self._members) <= _HANDLES_PER_PATH_WARN:
+                self._duplicate_handles_warned = False
+
     def acquire(self, requester: "SessionDB") -> bool:
         """Take a permit for a new read connection, or refuse (caller degrades to the
         locked writer connection). Gates, broadest first: fd headroom, process

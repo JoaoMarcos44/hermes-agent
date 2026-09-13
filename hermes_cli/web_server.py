@@ -144,6 +144,18 @@ async def _lifespan(app: "FastAPI"):
     # module globals) so they bind to the running loop, not the import-time one.
     app.state.chat_argv_lock = asyncio.Lock()
 
+    # Pin the launch SessionDB handle for the duration of this server's lifespan (#110276).
+    # Keeps refcount >= 1 so poll requests and the cron ticker share this handle
+    # without torn connections, POSIX advisory lock drops, or WAL generation splits.
+    launch_db = None
+    try:
+        from hermes_state import _default_db_path
+        from hermes_state_registry import acquire
+
+        launch_db = acquire(Path(_default_db_path()))
+    except Exception as exc:
+        _log.warning("Could not pin launch database during lifespan: %s", exc)
+
     # Bring state.db schema current BEFORE the first session-list poll
     # (#79531/#80037): a store left behind by `hermes update` otherwise 500s
     # every poll while the read-probe heal loses to sibling lock contention.
@@ -269,6 +281,10 @@ async def _lifespan(app: "FastAPI"):
             pass
         if os.getenv("HERMES_DESKTOP") == "1":
             _terminate_desktop_managed_gateway()
+        if launch_db is not None:
+            from hermes_state_registry import release_or_close
+
+            release_or_close(launch_db)
 
 
 def _app_state_default(app: "FastAPI", name: str, factory):

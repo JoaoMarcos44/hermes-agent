@@ -1369,6 +1369,9 @@ class SessionDB(
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
             atexit.unregister(hook)
+        budget = getattr(self, "_read_budget", None)
+        if budget is not None:
+            budget.unregister(self)
         # Closed flag first: an in-flight reader then closes its own connection.
         with self._read_conns_lock:
             self._read_conns_closed = True

@@ -374,14 +374,15 @@ async def _advisory_pressure(status: Dict[str, Any], home: Path) -> None:
 
     try:
         from hermes_state import SessionDB as _SDB
+        from hermes_state_registry import acquire_shared_if_active as _acquire_shared, release_or_close as _release_or_close
         from hermes_constants import get_hermes_home as _ghh
         _db_path = _ghh() / "state.db"
         if _db_path.exists():
-            _sdb = _SDB(db_path=_db_path, read_only=True)
+            _sdb = _acquire_shared(_db_path) or _SDB(db_path=_db_path, read_only=True)
             try:
                 _rebuild = _sdb.fts_rebuild_status()
             finally:
-                _sdb.close()
+                _release_or_close(_sdb)
             if _rebuild is not None:
                 status["fts_rebuild"] = _rebuild
     except Exception:

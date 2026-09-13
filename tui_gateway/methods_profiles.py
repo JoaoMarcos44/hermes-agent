@@ -5,6 +5,7 @@ onto server.py, so they must not collide with its globals.
 """
 
 import contextlib
+from pathlib import Path
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -214,7 +215,10 @@ def _profile_session_fields(row, profile_path):
     db_path = Path(profile_path) / "state.db"
     db = None
     if _try(db_path.exists, False):
-        db = _try(lambda: _lazy("hermes_state", "SessionDB")(db_path=db_path, read_only=True), None)
+        from hermes_state_registry import acquire_shared_if_active
+        db = _try(lambda: acquire_shared_if_active(db_path), None)
+        if db is None:
+            db = _try(lambda: _lazy("hermes_state", "SessionDB")(db_path=db_path, read_only=True), None)
     try:
         row["last_session"], row["worker_session"] = _latest_profile_session_rows(db)
         # Resolved server-side on every listing so no client carries a session pointer.
