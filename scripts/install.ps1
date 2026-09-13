@@ -766,7 +766,7 @@ function Install-Uv {
         }
         if ($exitCode -eq 0 -and $versionOutput.Count -gt 0) {
             $version = ($versionOutput -join " ").Trim()
-            if ($version) { return $version }
+            if ($version -match '^uv\s+\d+\.\d+') { return $version }
         }
         return $null
     }
@@ -810,16 +810,29 @@ function Install-Uv {
         & $psHostExe -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex" 2>&1 | Tee-Object -Variable astralOut | Out-Null
         $installerOutput += "--- uv installer source: astral.sh ---"
         $installerOutput += @($astralOut | ForEach-Object { "$_" })
-        if (Test-Path $managedUv) {
+        $managedUvVersion = if (Test-Path $managedUv) {
+            Get-UsableUvVersion $managedUv
+        }
+        if ($managedUvVersion) {
             Write-Info "uv installer succeeded via astral.sh"
         } else {
+            if (Test-Path $managedUv) {
+                Write-Info "astral.sh produced an unusable uv; removing it before trying the mirror ..."
+                Remove-Item $managedUv -Force -ErrorAction SilentlyContinue
+            }
             Write-Info "astral.sh uv installer did not produce $managedUv; trying GitHub releases mirror ..."
             $ghOut = @()
             & $psHostExe -ExecutionPolicy ByPass -c "irm https://github.com/astral-sh/uv/releases/latest/download/uv-installer.ps1 | iex" 2>&1 | Tee-Object -Variable ghOut | Out-Null
             $installerOutput += "--- uv installer source: GitHub releases ---"
             $installerOutput += @($ghOut | ForEach-Object { "$_" })
-            if (Test-Path $managedUv) {
+            $managedUvVersion = if (Test-Path $managedUv) {
+                Get-UsableUvVersion $managedUv
+            }
+            if ($managedUvVersion) {
                 Write-Info "uv installer succeeded via GitHub releases"
+            } elseif (Test-Path $managedUv) {
+                Write-Info "GitHub uv installer produced an unusable binary; removing it ..."
+                Remove-Item $managedUv -Force -ErrorAction SilentlyContinue
             }
         }
 
@@ -830,17 +843,15 @@ function Install-Uv {
         # the managed location so the managed-first invariant holds
         # (hermes_cli/managed_uv.py looks only at $HermesHome\bin\uv.exe).
         if (-not (Test-Path $managedUv)) {
-            $existingUv = $null
             $uvOnPath = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue |
                 Select-Object -First 1
-            if ($uvOnPath -and $uvOnPath.Source -and (Test-Path $uvOnPath.Source)) {
-                $existingUv = $uvOnPath.Source
+            $salvageCandidates = @()
+            if ($uvOnPath -and $uvOnPath.Source) {
+                $salvageCandidates += $uvOnPath.Source
             }
-            if (-not $existingUv) {
-                $defaultUv = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
-                if (Test-Path $defaultUv) { $existingUv = $defaultUv }
-            }
-            if ($existingUv) {
+            $salvageCandidates += (Join-Path $env:USERPROFILE ".local\bin\uv.exe")
+            foreach ($existingUv in ($salvageCandidates | Select-Object -Unique)) {
+                if (-not (Test-Path $existingUv)) { continue }
                 Write-Info "Salvaging existing uv from $existingUv"
                 try {
                     Copy-Item $existingUv $managedUv -Force
@@ -850,6 +861,7 @@ function Install-Uv {
                     if (-not $version) {
                         throw "uv --version failed for salvaged candidate"
                     }
+                    break
                 } catch {
                     Write-Info "Existing uv at $existingUv could not be salvaged: $_"
                     Remove-Item $managedUv -Force -ErrorAction SilentlyContinue

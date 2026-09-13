@@ -136,6 +136,20 @@ def test_no_unvalidated_managed_uv_version_invocations_remain(source: str):
     assert not re.search(r"\$version\s*=\s*&\s*\$managedUv\s+--version", body)
 
 
+def test_unusable_installer_output_falls_through_to_mirror(source: str):
+    body = _install_uv_body(source)
+    assert "astral.sh produced an unusable uv" in body
+    assert "GitHub uv installer produced an unusable binary" in body
+    assert body.count("Get-UsableUvVersion $managedUv") >= 3
+
+
+def test_broken_path_candidate_does_not_hide_default_uv_candidate(source: str):
+    body = _install_uv_body(source)
+    assert "$salvageCandidates" in body
+    assert "Select-Object -Unique" in body
+    assert '".local\\bin\\uv.exe"' in body
+
+
 def test_failure_path_keeps_manual_install_pointer_and_shows_output(source: str):
     body = _install_uv_body(source)
     assert "https://docs.astral.sh/uv/getting-started/installation/" in body, (
