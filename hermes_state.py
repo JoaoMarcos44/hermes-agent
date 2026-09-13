@@ -1106,27 +1106,29 @@ class SessionDB(
         recorded = self._db_sidecar_identity or {}
         base = os.fspath(self.db_path)
         if recorded:
-            # If -wal was cleanly checkpointed and removed while -shm and main DB remain intact,
-            # this is an idle checkpoint rather than a lost/retired generation (#110214).
+            # Check -shm first: -shm is the shared-memory anchor for WAL coordination.
+            shm_recorded = recorded.get("-shm")
+            if shm_recorded is not None:
+                shm_current = _stat_db_file_identity(Path(base + "-shm"))
+                if shm_current != shm_recorded:
+                    return True  # -shm unlinked or replaced: lost generation
+
+            # Check -wal: single stat avoids duplicate syscalls on hot write path (#110214)
             wal_recorded = recorded.get("-wal")
+            wal_current = _stat_db_file_identity(Path(base + "-wal"))
             if wal_recorded is not None:
-                wal_current = _stat_db_file_identity(Path(base + "-wal"))
                 if wal_current is None:
-                    shm_recorded = recorded.get("-shm")
-                    shm_current = _stat_db_file_identity(Path(base + "-shm"))
-                    if shm_recorded is not None and shm_current == shm_recorded and not self._db_file_was_replaced():
-                        recorded = {k: v for k, v in recorded.items() if k != "-wal"}
-                        self._db_sidecar_identity = recorded
-            if recorded:
-                for suffix, ident in recorded.items():
-                    if _stat_db_file_identity(Path(base + suffix)) != ident:
-                        return True
-                # If -wal was dropped during a clean checkpoint and recreated, re-adopt it
-                if "-wal" not in recorded:
-                    wal_ident = _stat_db_file_identity(Path(base + "-wal"))
-                    if wal_ident is not None:
-                        self._db_sidecar_identity["-wal"] = wal_ident
-                return False
+                    # Clean checkpoint unlinked -wal while -shm and main DB are intact
+                    if shm_recorded is not None and not self._db_file_was_replaced():
+                        self._db_sidecar_identity = {k: v for k, v in recorded.items() if k != "-wal"}
+                        return False
+                    return True
+                if wal_current != wal_recorded:
+                    return True  # Replaced WAL generation
+            elif wal_current is not None:
+                # -wal was dropped during clean checkpoint and is now recreated: re-adopt
+                self._db_sidecar_identity["-wal"] = wal_current
+            return False
         if not self._wal_active:  # no sidecar generation to lose; keep /proc off the hot path
             return False
         if sys.platform.startswith("linux"):
