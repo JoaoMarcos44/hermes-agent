@@ -10,12 +10,14 @@ call time, so tests that monkeypatch ``hermes_state.<name>`` keep intercepting.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import logging
 import os
 import shutil
 import sqlite3
+import stat
 import struct
 import sys
 import threading
@@ -213,6 +215,83 @@ def refuse_deleted_wal_generation(db_path) -> None:
         return
     logger.error(_DELETED_WAL_GENERATION_MSG)
     raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
+
+
+# ── Owner-only mode tightening ──────────────────────────────────────────────────────────────────
+#
+# Tightening state.db and its -wal/-shm to 0600 has to satisfy two constraints at once:
+#
+#   * Never close an ordinary descriptor for one of those inodes. POSIX record locks are owned per
+#     (process, inode), so close() on ANY fd for the file cancels every lock this process holds on
+#     it -- including the locks of an already-open SQLite connection (howtocorrupt §2.2). A holder
+#     that silently loses its locks lets a sibling opener take the shared-memory DMS exclusively at
+#     its own close, checkpoint, and unlink the sidecars while the holder keeps writing to the
+#     deleted inodes, which is the deleted-WAL-generation outage (#109728, #109786, #109687).
+#   * Never let the mode land on an inode that was not the one inspected. A missing O_NOFOLLOW lets
+#     a symlink planted at the sidecar path redirect the chmod onto any file the user can write
+#     (#109509), and an lstat()-then-chmod() pair resolves the name twice, so the second resolution
+#     can see a file the first one never checked.
+#
+# O_PATH satisfies both on Linux: the name is resolved exactly once, O_NOFOLLOW refuses a symlink
+# at open time, and the descriptor is not an open file description for I/O -- filp_close() skips
+# locks_remove_posix() for FMODE_PATH, so closing it cannot cancel a lock. chmod(2) through
+# /proc/self/fd/<fd> then applies to the pinned inode and not to whatever the path names by then.
+# Where os.chmod takes follow_symlinks=False (lchmod on macOS/BSD) the chmod itself cannot be
+# redirected through a symlink. Anything else keeps the lstat-then-chmod pair: lock-safe, and
+# best-effort against a swapped path.
+_O_PATH_CHMOD = (
+    sys.platform.startswith("linux") and hasattr(os, "O_PATH") and os.path.isdir("/proc/self/fd")
+)
+_LCHMOD = os.chmod in getattr(os, "supports_follow_symlinks", frozenset())
+
+
+def _tighten_db_file_mode_by_path(path: Path, mode: int) -> None:
+    """lstat-then-chmod fallback for platforms without O_PATH (see the section comment)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    # lstat never follows the link, so S_ISREG rejects the planted symlink O_NOFOLLOW would
+    # refuse; directories, FIFOs and devices are not databases either.
+    if not stat.S_ISREG(st.st_mode):
+        return
+    if _LCHMOD:
+        # A symlink swapped in after the lstat gets its own (ignored) mode bits rewritten
+        # instead of redirecting 0600 onto the file it points at.
+        os.chmod(path, mode, follow_symlinks=False)
+    else:
+        os.chmod(path, mode)
+
+
+def tighten_db_file_mode(path: Path, mode: int = 0o600) -> None:
+    """Set an existing state.db / -wal / -shm to *mode* without disturbing SQLite's locks.
+
+    Never opens a lockable descriptor on the file and never chmods an inode it did not inspect
+    (see the section comment). Missing paths, symlinks and non-regular files are left alone --
+    sqlite3.connect() raises the canonical error for those, and none of them leak row data.
+    """
+    if not _O_PATH_CHMOD:
+        _tighten_db_file_mode_by_path(path, mode)
+        return
+    try:
+        fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            return  # a symlink at the path (O_NOFOLLOW), or a non-directory component
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return
+        try:
+            os.chmod(f"/proc/self/fd/{fd}", mode)
+            return
+        except FileNotFoundError:
+            pass  # /proc is not mounted in this namespace; the path fallback still applies
+    finally:
+        os.close(fd)  # O_PATH: closing this descriptor cancels no lock
+    _tighten_db_file_mode_by_path(path, mode)
 
 
 # ── Retired WAL generation capture ──────────────────────────────────────────────────────────────

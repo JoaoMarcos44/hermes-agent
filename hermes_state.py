@@ -15,7 +15,6 @@ import queue
 import random
 import re
 import sqlite3
-import stat
 import sys
 import threading
 import time
@@ -50,7 +49,7 @@ from hermes_state_dbfile import (
     _canonical_sqlite_path, _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
     _watched_sqlite_sidecar_paths, has_invalid_sqlite_header_preopen, is_zeroed_state_db, quarantine_cross_process_lock,
-    quarantine_invalid_state_db,
+    quarantine_invalid_state_db, tighten_db_file_mode,
     RetiredGenerationCaptureError, capture_retired_wal_generation, refuse_deleted_wal_generation,
 )
 from hermes_state_messages import SessionMessagesMixin
@@ -226,21 +225,24 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
     the process umask (commonly 0644 under 0022). Read-only SessionDB
     attachments never call this helper and remain observational.
 
-    Existing files are tightened with ``chmod(2)`` on the path: opening the
-    file and closing that descriptor would drop every POSIX ``fcntl`` lock the
-    process holds on its inode — including the locks of an already-open SQLite
-    connection to the same database. A lock-losing close in one process lets a
-    sibling's connection take the shared-memory DMS exclusively at its own
-    close, checkpoint, and unlink the sidecars while long-lived holders
-    (gateway, desktop ``hermes serve``) keep using the deleted inodes.
+    Existing files are tightened through :func:`tighten_db_file_mode`, which
+    never opens a lockable descriptor on them: closing any ordinary descriptor
+    for the database drops every POSIX ``fcntl`` lock this process holds on
+    that inode — including the locks of an already-open SQLite connection. A
+    lock-losing close in one process lets a sibling's connection take the
+    shared-memory DMS exclusively at its own close, checkpoint, and unlink the
+    sidecars while long-lived holders (gateway, desktop ``hermes serve``) keep
+    using the deleted inodes.
     """
     if os.name == "nt":
         return
 
     main_path = db_path
     if create_main:
-        # O_EXCL: only a brand-new inode gets a descriptor. Opening an existing
-        # file here and closing it would drop this process's POSIX locks on it.
+        # O_EXCL: only a brand-new inode gets a descriptor, so this close cannot
+        # cancel locks — nothing can hold a lock on an inode created right here.
+        # An existing file (symlink included: O_CREAT|O_EXCL fails EEXIST on one)
+        # takes the descriptor-free path below.
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -250,9 +252,10 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
             fd = os.open(main_path, flags, 0o600)
         except FileExistsError:
             pass
-        except IsADirectoryError:
-            # Not a database file at all; sqlite3.connect() raises the
-            # canonical error for this, and a directory leaks no row data.
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            # Not a database file we can create (missing parent, a directory in
+            # the way); sqlite3.connect() raises the canonical error for these,
+            # and neither leaks row data.
             return
         else:
             os.close(fd)
@@ -262,20 +265,7 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
         db_path.with_name(db_path.name + "-wal"),
         db_path.with_name(db_path.name + "-shm"),
     ):
-        # fchmod on an fd of a pre-existing file cannot be used here: close(fd)
-        # would release this process's POSIX locks on that inode, stripping the
-        # locks of any live SQLite connection to the same database. chmod(2)
-        # never opens the file, so it leaves the lock state untouched.
-        try:
-            st = os.lstat(path)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(st.st_mode):
-            # Refuse a planted symlink exactly like O_NOFOLLOW would.
-            continue
-        if not stat.S_ISREG(st.st_mode):
-            continue
-        os.chmod(path, 0o600)
+        tighten_db_file_mode(path)
 
 
 # Openings of the background-review harness prompts (agent/background_review.py).
