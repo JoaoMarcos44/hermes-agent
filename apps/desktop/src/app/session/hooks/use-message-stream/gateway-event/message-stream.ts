@@ -378,6 +378,20 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
           label: 'Recover',
           onClick: () => {
             void runDoctor(true)
+              .then(() => {
+                notify({
+                  kind: 'success',
+                  title: 'Recovery started',
+                  message: 'Hermes doctor is repairing database access in the background.'
+                })
+              })
+              .catch((err: unknown) => {
+                notify({
+                  kind: 'error',
+                  title: 'Recovery failed to start',
+                  message: err instanceof Error ? err.message : String(err)
+                })
+              })
           }
         }
       })

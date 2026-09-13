@@ -232,7 +232,8 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
             )
         return False
 
-    pids = sorted({pid for pid, _ in holders if pid > 0})
+    current_pid = os.getpid()
+    pids = sorted({pid for pid, _ in holders if pid > 0 and pid != current_pid})
     pids_desc = ", ".join(f"PID {p}" for p in pids)
     check_warn(
         f"{_DHH}/state.db has {len(pids)} process(es) holding an unlinked or retired WAL generation",
@@ -249,36 +250,54 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
     from gateway.status import terminate_pid
     from hermes_state_holders import _read_proc_argv
 
-    stopped_pids = []
-    failed_pids = []
+    cmd_descs = {pid: (" ".join(_read_proc_argv(pid))[:60] if _read_proc_argv(pid) else f"PID {pid}") for pid in pids}
+
+    # Bounded parallel termination: SIGTERM all holders, wait collectively, then force-kill any remaining.
+    failed_initial = {}
     for pid in pids:
-        argv = _read_proc_argv(pid)
-        cmd_desc = " ".join(argv)[:60] if argv else f"PID {pid}"
         try:
             terminate_pid(pid, force=False)
-            exited = False
-            for _ in range(20):
-                time.sleep(0.1)
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    exited = True
-                    break
-            if not exited:
-                terminate_pid(pid, force=True)
-                for _ in range(10):
-                    time.sleep(0.1)
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
-                        exited = True
-                        break
-            if exited:
-                stopped_pids.append((pid, cmd_desc))
-            else:
-                failed_pids.append((pid, cmd_desc))
         except Exception as exc:
-            failed_pids.append((pid, f"{cmd_desc} ({exc})"))
+            failed_initial[pid] = exc
+
+    def _is_running(p: int) -> bool:
+        try:
+            os.kill(p, 0)
+            return True
+        except OSError:
+            return False
+
+    active_pids = set(pids)
+    for _ in range(20):
+        if not active_pids:
+            break
+        active_pids = {p for p in active_pids if _is_running(p)}
+        if active_pids:
+            time.sleep(0.1)
+
+    if active_pids:
+        for pid in list(active_pids):
+            try:
+                terminate_pid(pid, force=True)
+            except Exception:
+                pass
+        for _ in range(10):
+            if not active_pids:
+                break
+            active_pids = {p for p in active_pids if _is_running(p)}
+            if active_pids:
+                time.sleep(0.1)
+
+    still_held = {h[0] for h in iter_deleted_sqlite_sidecar_holders(state_db_path) if h[0] != current_pid}
+    failed_pids = []
+    stopped_pids = []
+    for p in pids:
+        cmd = cmd_descs.get(p, f"PID {p}")
+        if p in active_pids or (p in failed_initial and p in still_held):
+            err = f" ({failed_initial[p]})" if p in failed_initial else ""
+            failed_pids.append((p, f"{cmd}{err}"))
+        else:
+            stopped_pids.append((p, cmd))
 
     if stopped_pids:
         check_ok(
@@ -297,10 +316,18 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
             f"{', '.join(f'PID {p} ({c})' for p, c in failed_pids)} — stop them manually and reopen"
         )
 
-    remaining = iter_deleted_sqlite_sidecar_holders(state_db_path)
+    remaining = [h for h in iter_deleted_sqlite_sidecar_holders(state_db_path) if h[0] > 0 and h[0] != current_pid]
     if not remaining:
         try:
             check_ok(f"{_DHH}/state.db reopened successfully ({_session_count(state_db_path)} sessions)")
+            pending_spool = state_db_path.parent / "pending_messages"
+            if pending_spool.exists():
+                spooled_files = list(pending_spool.glob("pending-*.json"))
+                if spooled_files:
+                    check_info(
+                        f"{len(spooled_files)} pending message spool file(s) preserved in {pending_spool.name}/ "
+                        "for gateway ingestion"
+                    )
         except Exception as e:
             check_warn(f"{_DHH}/state.db reopened but health check reported: {e}")
 
