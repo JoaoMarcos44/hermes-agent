@@ -178,11 +178,7 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str, pid: Optional[int] = 
     try:
         watched_stat = os.stat(watched_path)
     except FileNotFoundError:
-        current_pid = os.getpid()
-        is_self = (pid == current_pid) if pid is not None else (
-            f"/{current_pid}/" in fd_path or fd_path.startswith("/proc/self/")
-        )
-        if is_self and watched_path.endswith("-wal"):
+        if watched_path.endswith("-wal"):
             base_db = watched_path.removesuffix("-wal")
             try:
                 base_stat = os.stat(base_db)

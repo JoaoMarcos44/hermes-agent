@@ -466,15 +466,19 @@ def test_fd_is_truly_unlinked_handles_vanished_descriptor(tmp_path):
 
 
 def test_fd_is_truly_unlinked_tolerates_in_process_checkpointed_wal(tmp_path):
-    """In-process descriptor on cleanly checkpointed WAL with intact -shm returns False (#110214)."""
+    """Descriptor on cleanly checkpointed WAL with intact -shm returns False for self and peers (#110214)."""
     from hermes_state_dbfile import _fd_is_truly_unlinked
     base = tmp_path / "state.db"
     base.write_bytes(b"SQLite format 3\x00" + b"\x00" * 84)
     shm = tmp_path / "state.db-shm"
     shm.write_bytes(b"shm_data")
     wal_path = tmp_path / "state.db-wal"  # does not exist
-    # fd_path pointing to an existing file on the same filesystem
+    # Tolerated for both in-process and peer processes as long as -shm is intact
     assert _fd_is_truly_unlinked(str(base), str(wal_path), pid=os.getpid()) is False
+    assert _fd_is_truly_unlinked(str(base), str(wal_path), pid=99999) is False
+    # If -shm is also gone, the generation was wiped: must return True
+    shm.unlink()
+    assert _fd_is_truly_unlinked(str(base), str(wal_path), pid=os.getpid()) is True
 
 
 def test_wal_generation_was_lost_tolerates_checkpointed_wal_with_intact_shm(tmp_path):
