@@ -42,6 +42,12 @@ def build_gateway_parser(
 
     gateway_run = gateway_subparsers.add_parser(
         "run", help="Run gateway in foreground (recommended for WSL, Docker, Termux)")
+    # ``gateway --yolo`` is registered on the group parser by the primary fix.
+    # Mirror it on the leaf so both natural placements reach the same startup
+    # environment without changing approval semantics.
+    gateway_run.add_argument(
+        "--yolo", action="store_true", default=argparse.SUPPRESS,
+        help="Bypass all dangerous command approval prompts (use at your own risk)")
     gateway_run.add_argument("-v", "--verbose", action="count", default=0,
         help="Increase stderr log verbosity (-v=INFO, -vv=DEBUG)")
     _flag(gateway_run, "-q", "--quiet", help="Suppress all stderr log output")

@@ -135,6 +135,9 @@ class TestAcceptHooksOnAgentSubparsers:
     with `unrecognized arguments`."""
 
     ARGVS = [
+        # Complementary coverage for #110147: the primary gateway-level fix
+        # handles ``gateway --yolo``; the leaf must also accept the flag.
+        ["gateway", "run", "--yolo", "--help"],
         ["--accept-hooks", "gateway", "run", "--help"],
         ["gateway", "--accept-hooks", "run", "--help"],
         ["gateway", "run", "--accept-hooks", "--help"],
