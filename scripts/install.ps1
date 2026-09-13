@@ -749,11 +749,37 @@ function Install-Uv {
     # place, so install.ps1 and `hermes update` stay in sync.
     $managedUv = Join-Path $HermesHome "bin\uv.exe"
 
+    function Get-UsableUvVersion($UvPath) {
+        $prevEAP = $ErrorActionPreference
+        try {
+            # A broken Chocolatey shim commonly writes its failure to stderr.
+            # Do not let PowerShell's global Stop policy turn that probe into a
+            # terminating exception before we can inspect the native exit code.
+            $ErrorActionPreference = "Continue"
+            $global:LASTEXITCODE = 0
+            $versionOutput = @(& $UvPath --version 2>&1)
+            $exitCode = $LASTEXITCODE
+        } catch {
+            return $null
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
+        if ($exitCode -eq 0 -and $versionOutput.Count -gt 0) {
+            $version = ($versionOutput -join " ").Trim()
+            if ($version) { return $version }
+        }
+        return $null
+    }
+
     if (Test-Path $managedUv) {
-        $script:UvCmd = $managedUv
-        $version = & $managedUv --version
-        Write-Success "Managed uv found ($version)"
-        return $true
+        $version = Get-UsableUvVersion $managedUv
+        if ($version) {
+            $script:UvCmd = $managedUv
+            Write-Success "Managed uv found ($version)"
+            return $true
+        }
+        Write-Info "Existing managed uv at $managedUv is not usable; replacing it ..."
+        Remove-Item $managedUv -Force -ErrorAction SilentlyContinue
     }
 
     Write-Info "Installing managed uv into $HermesHome\bin ..."
@@ -820,7 +846,10 @@ function Install-Uv {
                     Copy-Item $existingUv $managedUv -Force
                     # Verify the salvaged binary actually runs before
                     # trusting it as the managed uv.
-                    $null = & $managedUv --version
+                    $version = Get-UsableUvVersion $managedUv
+                    if (-not $version) {
+                        throw "uv --version failed for salvaged candidate"
+                    }
                 } catch {
                     Write-Info "Existing uv at $existingUv could not be salvaged: $_"
                     Remove-Item $managedUv -Force -ErrorAction SilentlyContinue
@@ -831,10 +860,13 @@ function Install-Uv {
         $ErrorActionPreference = $prevEAP
 
         if (Test-Path $managedUv) {
-            $script:UvCmd = $managedUv
-            $version = & $managedUv --version
-            Write-Success "Managed uv installed ($version)"
-            return $true
+            $version = Get-UsableUvVersion $managedUv
+            if ($version) {
+                $script:UvCmd = $managedUv
+                Write-Success "Managed uv installed ($version)"
+                return $true
+            }
+            Remove-Item $managedUv -Force -ErrorAction SilentlyContinue
         }
 
         Write-Err "uv installed but not found at $managedUv"
