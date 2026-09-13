@@ -89,8 +89,12 @@ def declared_conversation_scope(agent: Any) -> Optional[str]:
     Hashes ``(source, gateway_session_key, generation)``. None (fall back to the physical id)
     when no key is declared, for a background-review fork (``_persist_disabled``), for an
     explicit fork child, and on any DB error (fail closed rather than merge a fork onto its
-    parent's key).
+    parent's key). Same-model cache-parity forks explicitly inherit the parent's declared
+    scope via ``_inherited_cache_scope`` when the parent had a host-declared key.
     """
+    inherited = getattr(agent, "_inherited_cache_scope", None)
+    if isinstance(inherited, str) and inherited.startswith(_DECLARED_SCOPE_PREFIX):
+        return inherited
     key = str(getattr(agent, "_gateway_session_key", "") or "").strip()
     if not key or getattr(agent, "_persist_disabled", False):
         return None
@@ -132,6 +136,9 @@ def declared_conversation_scope(agent: Any) -> Optional[str]:
 def resolve_prompt_cache_scope(agent: Any) -> str:
     """Rotation-stable cache-scope id: declared scope, else the compression-lineage root of
     ``agent.session_id`` (the physical id without ancestry/DB). Memoized on the agent."""
+    inherited = getattr(agent, "_inherited_cache_scope", None)
+    if isinstance(inherited, str) and inherited.strip():
+        return inherited.strip()
     sid = str(getattr(agent, "session_id", None) or "")
     if not sid:
         return ""

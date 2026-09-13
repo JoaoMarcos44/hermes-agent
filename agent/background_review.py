@@ -907,6 +907,15 @@ def build_cache_parity_fork(
         review_agent._cached_system_prompt = agent._cached_system_prompt
         review_agent.session_start = agent.session_start
         _inherit_parent_tool_surface(review_agent, agent)
+        review_agent._gateway_session_key = getattr(agent, "_gateway_session_key", None)
+        if hasattr(agent, "_conversation_root_id") and callable(agent._conversation_root_id):
+            try:
+                review_agent._cached_conversation_root = agent._conversation_root_id()
+            except Exception:
+                review_agent._cached_conversation_root = None
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
+
+        review_agent._inherited_cache_scope = resolve_prompt_cache_scope_safe(agent)
     _detach_fork_compression(review_agent)
     # Compaction bounds a single request; this bounds the WHOLE review (checked in
     # conversation_loop via _review_input_budget_exhausted).

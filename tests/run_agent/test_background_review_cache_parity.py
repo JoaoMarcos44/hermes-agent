@@ -12,6 +12,9 @@ Sonnet 4.5 per the contributor's measurement).
 """
 
 from unittest.mock import patch
+import run_agent
+
+_REAL_CONVERSATION_ROOT_ID = run_agent.AIAgent._conversation_root_id
 
 
 def _make_agent_stub(agent_cls):
@@ -105,6 +108,12 @@ def _make_recorder_class(captured=None, record_on_run=()):
             self.valid_tool_names = set()
             self._tool_snapshot_generation = 0
             self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
+            self._inherited_cache_scope = None
+            self._cached_conversation_root = None
+            self._gateway_session_key = None
+
+        def _conversation_root_id(self):
+            return _REAL_CONVERSATION_ROOT_ID(self)
 
         def run_conversation(self, *args, **kwargs):
             if captured is not None:
@@ -424,3 +433,173 @@ def test_unrouted_review_fork_inherits_empty_tool_surface():
         assert added == set()
         assert fork.tools == []
         assert fork.valid_tool_names == set()
+
+
+def test_same_model_review_fork_inherits_parent_cache_scope():
+    """Same-model review fork inherits the parent's resolved cache scope (#109964).
+
+    When _persist_disabled=True and _session_db=None are set for persistence
+    detachment, declared_conversation_scope would return None and
+    resolve_prompt_cache_scope would skip the lineage walk, falling back to the
+    physical session_id. For same-model review, the fork explicitly inherits the
+    parent's already-resolved scope without touching the database, preserves
+    _gateway_session_key, and caches the conversation root so Nous Portal tags
+    and ambient affinity remain in complete parity.
+    """
+    import run_agent
+    import agent.background_review as bg_review
+    from agent.background_review import build_cache_parity_fork
+    from agent.prompt_cache_scope import declared_conversation_scope, resolve_prompt_cache_scope
+    from agent.portal_tags import (
+        get_affinity_scope,
+        get_conversation_context,
+        nous_portal_tags,
+        reset_affinity_scope,
+        reset_conversation_context,
+        set_affinity_scope,
+        set_conversation_context,
+    )
+
+    class DummySessionDB:
+        def __init__(self, lineage=None):
+            self._lineage = lineage or []
+
+        def is_explicit_fork_child(self, sid):
+            return False
+
+        def get_compression_lineage(self, sid):
+            return self._lineage
+
+        def get_session(self, sid):
+            return {"source": "telegram"}
+
+        def latest_conversation_boundary(self, key, source):
+            return 1
+
+        def get_conversation_root(self, sid):
+            return self._lineage[0] if self._lineage else sid
+
+    _Recorder = _make_recorder_class()
+
+    # 1. Gateway parent with declared key
+    db_gw = DummySessionDB(lineage=["live-sess-1"])
+    agent_gw = _make_agent_stub(run_agent.AIAgent)
+    agent_gw.session_id = "live-sess-1"
+    agent_gw.platform = "telegram"
+    agent_gw._gateway_session_key = "telegram:chat-42"
+    agent_gw._session_db = db_gw
+
+    parent_scope_gw = resolve_prompt_cache_scope(agent_gw)
+    parent_decl_gw = declared_conversation_scope(agent_gw)
+    assert parent_scope_gw.startswith("gwk_")
+    assert parent_decl_gw == parent_scope_gw
+    assert agent_gw._conversation_root_id() == "live-sess-1"
+
+    with patch.object(run_agent, "AIAgent", _Recorder):
+        fork_gw, _rt, routed = build_cache_parity_fork(agent_gw, max_iterations=5)
+        assert not routed
+        assert fork_gw._persist_disabled is True
+        assert fork_gw._session_db is None
+        assert fork_gw._gateway_session_key == "telegram:chat-42"
+        assert fork_gw._cached_conversation_root == "live-sess-1"
+        assert fork_gw._inherited_cache_scope == parent_scope_gw
+        assert declared_conversation_scope(fork_gw) == parent_scope_gw
+        assert resolve_prompt_cache_scope(fork_gw) == parent_scope_gw
+        assert fork_gw._conversation_root_id() == "live-sess-1"
+
+    # Ambient turn parity for gateway parent vs fork
+    t1 = set_conversation_context(agent_gw._conversation_root_id())
+    a1 = set_affinity_scope(declared_conversation_scope(agent_gw))
+    try:
+        parent_sticky = get_affinity_scope() or get_conversation_context() or agent_gw.session_id
+        parent_tags = [t for t in nous_portal_tags() if t.startswith("conversation=")]
+    finally:
+        reset_affinity_scope(a1)
+        reset_conversation_context(t1)
+
+    t2 = set_conversation_context(fork_gw._conversation_root_id())
+    a2 = set_affinity_scope(declared_conversation_scope(fork_gw))
+    try:
+        fork_sticky = get_affinity_scope() or get_conversation_context() or fork_gw.session_id
+        fork_tags = [t for t in nous_portal_tags() if t.startswith("conversation=")]
+    finally:
+        reset_affinity_scope(a2)
+        reset_conversation_context(t2)
+
+    assert fork_sticky == parent_sticky == parent_scope_gw
+    assert fork_tags == parent_tags == ["conversation=live-sess-1"]
+
+    # 2. Rotated parent with compression lineage (lineage root != physical session_id)
+    db_rot = DummySessionDB(lineage=["root-sess-100", "rotated-sess-101"])
+    agent_rot = _make_agent_stub(run_agent.AIAgent)
+    agent_rot.session_id = "rotated-sess-101"
+    agent_rot.platform = "cli"
+    agent_rot._gateway_session_key = None
+    agent_rot._session_db = db_rot
+
+    parent_scope_rot = resolve_prompt_cache_scope(agent_rot)
+    assert parent_scope_rot == "root-sess-100"
+    assert declared_conversation_scope(agent_rot) is None
+    assert agent_rot._conversation_root_id() == "root-sess-100"
+
+    with patch.object(run_agent, "AIAgent", _Recorder):
+        fork_rot, _rt, routed = build_cache_parity_fork(agent_rot, max_iterations=5)
+        assert not routed
+        assert fork_rot._persist_disabled is True
+        assert fork_rot._session_db is None
+        assert fork_rot._gateway_session_key is None
+        assert fork_rot._cached_conversation_root == "root-sess-100"
+        assert fork_rot._inherited_cache_scope == "root-sess-100"
+        # Declared scope is None (does NOT pollute affinity scope with raw session ID)
+        assert declared_conversation_scope(fork_rot) is None
+        # Prompt cache scope resolves to inherited root
+        assert resolve_prompt_cache_scope(fork_rot) == "root-sess-100"
+        # Conversation root preserved across detached DB
+        assert fork_rot._conversation_root_id() == "root-sess-100"
+
+    # Ambient turn parity for rotated parent vs fork
+    t3 = set_conversation_context(agent_rot._conversation_root_id())
+    a3 = set_affinity_scope(declared_conversation_scope(agent_rot))
+    try:
+        parent_rot_sticky = get_affinity_scope() or get_conversation_context() or agent_rot.session_id
+        parent_rot_tags = [t for t in nous_portal_tags() if t.startswith("conversation=")]
+    finally:
+        reset_affinity_scope(a3)
+        reset_conversation_context(t3)
+
+    t4 = set_conversation_context(fork_rot._conversation_root_id())
+    a4 = set_affinity_scope(declared_conversation_scope(fork_rot))
+    try:
+        fork_rot_sticky = get_affinity_scope() or get_conversation_context() or fork_rot.session_id
+        fork_rot_tags = [t for t in nous_portal_tags() if t.startswith("conversation=")]
+    finally:
+        reset_affinity_scope(a4)
+        reset_conversation_context(t4)
+
+    assert fork_rot_sticky == parent_rot_sticky == "root-sess-100"
+    assert fork_rot_tags == parent_rot_tags == ["conversation=root-sess-100"]
+
+    # 3. Routed aux path (different model): must NOT inherit parent's cache scope
+    routed_runtime = {
+        "provider": "openrouter",
+        "model": "aux-cheap-model",
+        "api_key": "test-key",
+        "base_url": None,
+        "api_mode": None,
+        "credential_pool": None,
+        "request_overrides": {},
+        "max_tokens": None,
+        "command": None,
+        "args": [],
+        "routed": True,
+    }
+
+    with patch.object(run_agent, "AIAgent", _Recorder), \
+         patch.object(bg_review, "_resolve_review_runtime", return_value=routed_runtime):
+        fork_routed, _rt, routed = build_cache_parity_fork(agent_gw, max_iterations=5)
+        assert routed is True
+        assert getattr(fork_routed, "_inherited_cache_scope", None) is None
+        assert getattr(fork_routed, "_cached_conversation_root", None) is None
+        assert getattr(fork_routed, "_gateway_session_key", None) is None
+        assert declared_conversation_scope(fork_routed) is None
+        assert resolve_prompt_cache_scope(fork_routed) == fork_routed.session_id

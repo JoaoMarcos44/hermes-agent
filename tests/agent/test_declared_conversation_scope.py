@@ -188,6 +188,26 @@ class TestDeclaredConversationScope:
         assert declared_conversation_scope(agent) is None
         assert resolve_prompt_cache_scope(agent) == "review-fork"
 
+    def test_inherited_cache_scope_wins_over_persist_disabled(self):
+        """Same-model review fork inherits parent scope despite _persist_disabled (#109964)."""
+        agent = _agent("fork-sid", None, CHAT_KEY)
+        agent._persist_disabled = True
+        agent._inherited_cache_scope = "gwk_inherited_scope_123"
+
+        assert declared_conversation_scope(agent) == "gwk_inherited_scope_123"
+        assert resolve_prompt_cache_scope(agent) == "gwk_inherited_scope_123"
+
+    def test_inherited_cache_scope_non_gwk_does_not_pollute_declared_scope(self):
+        """When parent had no declared key (e.g. rotated CLI session), inherited scope is
+        the lineage root ('root-sid'). declared_conversation_scope must remain None so it
+        does not pollute ambient affinity scope, while resolve_prompt_cache_scope honors it."""
+        agent = _agent("fork-sid", None, None)
+        agent._persist_disabled = True
+        agent._inherited_cache_scope = "root-sid"
+
+        assert declared_conversation_scope(agent) is None
+        assert resolve_prompt_cache_scope(agent) == "root-sid"
+
     def test_fork_check_failure_degrades_to_the_physical_scope(self):
         """A transient DB error must not merge a fork onto its parent's key."""
 
