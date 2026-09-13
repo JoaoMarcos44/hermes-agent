@@ -105,6 +105,7 @@ def _make_recorder_class(captured=None, record_on_run=()):
             self.valid_tool_names = set()
             self._tool_snapshot_generation = 0
             self.ephemeral_system_prompt = kwargs.get("ephemeral_system_prompt")
+            self._inherited_cache_scope = None
 
         def run_conversation(self, *args, **kwargs):
             if captured is not None:
@@ -424,3 +425,101 @@ def test_unrouted_review_fork_inherits_empty_tool_surface():
         assert added == set()
         assert fork.tools == []
         assert fork.valid_tool_names == set()
+
+
+def test_same_model_review_fork_inherits_parent_cache_scope():
+    """Same-model review fork inherits the parent's resolved cache scope (#109964).
+
+    When _persist_disabled=True and _session_db=None are set for persistence
+    detachment, declared_conversation_scope would return None and
+    resolve_prompt_cache_scope would skip the lineage walk, falling back to the
+    physical session_id. For same-model review, the fork explicitly inherits the
+    parent's already-resolved scope without touching the database.
+    """
+    import run_agent
+    import agent.background_review as bg_review
+    from agent.background_review import build_cache_parity_fork
+    from agent.prompt_cache_scope import declared_conversation_scope, resolve_prompt_cache_scope
+
+    class DummySessionDB:
+        def __init__(self, lineage=None):
+            self._lineage = lineage or []
+
+        def is_explicit_fork_child(self, sid):
+            return False
+
+        def get_compression_lineage(self, sid):
+            return self._lineage
+
+        def get_session(self, sid):
+            return {"source": "telegram"}
+
+        def latest_conversation_boundary(self, key, source):
+            return 1
+
+    _Recorder = _make_recorder_class()
+
+    # 1. Gateway parent with declared key
+    db_gw = DummySessionDB()
+    agent_gw = _make_agent_stub(run_agent.AIAgent)
+    agent_gw.session_id = "live-sess-1"
+    agent_gw.platform = "telegram"
+    agent_gw._gateway_session_key = "telegram:chat-42"
+    agent_gw._session_db = db_gw
+
+    parent_scope_gw = resolve_prompt_cache_scope(agent_gw)
+    parent_decl_gw = declared_conversation_scope(agent_gw)
+    assert parent_scope_gw.startswith("gwk_")
+    assert parent_decl_gw == parent_scope_gw
+
+    with patch.object(run_agent, "AIAgent", _Recorder):
+        fork_gw, _rt, routed = build_cache_parity_fork(agent_gw, max_iterations=5)
+        assert not routed
+        assert fork_gw._persist_disabled is True
+        assert fork_gw._session_db is None
+        assert fork_gw._inherited_cache_scope == parent_scope_gw
+        assert declared_conversation_scope(fork_gw) == parent_scope_gw
+        assert resolve_prompt_cache_scope(fork_gw) == parent_scope_gw
+
+    # 2. Rotated parent with compression lineage (lineage root != physical session_id)
+    db_rot = DummySessionDB(lineage=["root-sess-100", "rotated-sess-101"])
+    agent_rot = _make_agent_stub(run_agent.AIAgent)
+    agent_rot.session_id = "rotated-sess-101"
+    agent_rot.platform = "cli"
+    agent_rot._gateway_session_key = None
+    agent_rot._session_db = db_rot
+
+    parent_scope_rot = resolve_prompt_cache_scope(agent_rot)
+    assert parent_scope_rot == "root-sess-100"
+
+    with patch.object(run_agent, "AIAgent", _Recorder):
+        fork_rot, _rt, routed = build_cache_parity_fork(agent_rot, max_iterations=5)
+        assert not routed
+        assert fork_rot._persist_disabled is True
+        assert fork_rot._session_db is None
+        assert fork_rot._inherited_cache_scope == "root-sess-100"
+        assert declared_conversation_scope(fork_rot) == "root-sess-100"
+        assert resolve_prompt_cache_scope(fork_rot) == "root-sess-100"
+
+    # 3. Routed aux path (different model): must NOT inherit parent's cache scope
+    routed_runtime = {
+        "provider": "openrouter",
+        "model": "aux-cheap-model",
+        "api_key": "test-key",
+        "base_url": None,
+        "api_mode": None,
+        "credential_pool": None,
+        "request_overrides": {},
+        "max_tokens": None,
+        "command": None,
+        "args": [],
+        "routed": True,
+    }
+
+    with patch.object(run_agent, "AIAgent", _Recorder), \
+         patch.object(bg_review, "_resolve_review_runtime", return_value=routed_runtime):
+        fork_routed, _rt, routed = build_cache_parity_fork(agent_gw, max_iterations=5)
+        assert routed is True
+        assert getattr(fork_routed, "_inherited_cache_scope", None) is None
+        assert declared_conversation_scope(fork_routed) is None
+        assert resolve_prompt_cache_scope(fork_routed) == fork_routed.session_id

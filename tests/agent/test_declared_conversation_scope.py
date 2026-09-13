@@ -188,6 +188,15 @@ class TestDeclaredConversationScope:
         assert declared_conversation_scope(agent) is None
         assert resolve_prompt_cache_scope(agent) == "review-fork"
 
+    def test_inherited_cache_scope_wins_over_persist_disabled(self):
+        """Same-model review fork inherits parent scope despite _persist_disabled (#109964)."""
+        agent = _agent("fork-sid", None, CHAT_KEY)
+        agent._persist_disabled = True
+        agent._inherited_cache_scope = "gwk_inherited_scope_123"
+
+        assert declared_conversation_scope(agent) == "gwk_inherited_scope_123"
+        assert resolve_prompt_cache_scope(agent) == "gwk_inherited_scope_123"
+
     def test_fork_check_failure_degrades_to_the_physical_scope(self):
         """A transient DB error must not merge a fork onto its parent's key."""
 
