@@ -119,6 +119,23 @@ def test_existing_uv_salvage_rung_present(source: str):
     )
 
 
+def test_every_managed_uv_candidate_requires_successful_version_check(source: str):
+    """A copied Chocolatey shim must not become the managed uv binary."""
+    body = _install_uv_body(source)
+    assert "function Get-UsableUvVersion" in body
+    assert body.count("Get-UsableUvVersion") >= 4, (
+        "initial, salvaged, and final managed candidates must all be "
+        "validated through the same exit-code-aware check"
+    )
+    assert "$exitCode -eq 0" in body
+    assert "Existing managed uv" in body and "Remove-Item $managedUv" in body
+
+
+def test_no_unvalidated_managed_uv_version_invocations_remain(source: str):
+    body = _install_uv_body(source)
+    assert not re.search(r"\$version\s*=\s*&\s*\$managedUv\s+--version", body)
+
+
 def test_failure_path_keeps_manual_install_pointer_and_shows_output(source: str):
     body = _install_uv_body(source)
     assert "https://docs.astral.sh/uv/getting-started/installation/" in body, (
