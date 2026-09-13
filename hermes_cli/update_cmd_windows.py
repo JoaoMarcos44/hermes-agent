@@ -734,22 +734,36 @@ def _restore_windows_gateway_service(name: str, *, timeout: float = 60.0) -> Non
         raise RuntimeError(f"Windows service {name} did not reach a restorable state within {timeout:.0f}s")
 
 
-def _windows_cold_start_plan() -> dict | None:
+def _windows_cold_start_plan(args=None) -> dict | None:
     """Pause token for the no-running-gateway case: cold-start after update when an autostart entry exists.
 
     An installed autostart entry is an explicit "I want a gateway" signal; a gateway that died between
     updates would otherwise stay down until next login (resume only relaunches what was running).
     Desktop-owned lifecycle -> ``None`` (spawning ``gateway run`` beside Desktop races ports/state);
-    the skip is ownership, not liveness."""
+    the skip is ownership, not liveness — except when the start attestation reports a vouched-for
+    gateway that died without a clean exit (#109538). The Desktop hand-off exits the app before the
+    updater starts and can kill the running gateway in those same seconds, so discovery finds no live
+    PID to pause — the dead attestation is the surviving "a gateway was up" evidence, and the Desktop
+    does not restart the messaging gateway itself. Keep the plan; the spawn-time re-check in
+    ``_cold_start_windows_gateway_after_update`` stays the ownership authority."""
     from hermes_cli.update_cmd import _desktop_owns_gateway_lifecycle
-    with _best_effort('Could not check Desktop gateway-lifecycle ownership before update: %s'):
-        if _desktop_owns_gateway_lifecycle():
-            logger.debug("Skipping Windows gateway cold-start plan: Desktop owns gateway lifecycle")
-            return None
+    from hermes_cli import gateway_windows
     with _best_effort('Could not check Windows gateway autostart state before update: %s'):
-        from hermes_cli import gateway_windows
-        if gateway_windows.is_installed():
-            return {"resume_needed": True, "profiles": {}, "unmapped_pids": [], "unmapped": [], "cold_start_if_installed": True}
+        if not gateway_windows.is_installed():
+            return None
+        desktop_owns = False
+        with _best_effort('Could not check Desktop gateway-lifecycle ownership before update: %s'):
+            desktop_owns = bool(_desktop_owns_gateway_lifecycle())
+        if desktop_owns:
+            attested_died = False
+            with _best_effort('Could not probe attested gateway death before update: %s'):
+                attested_died = bool(gateway_windows.attested_gateway_died())
+            if not attested_died:
+                logger.debug("Skipping Windows gateway cold-start plan: Desktop owns gateway lifecycle")
+                if bool(getattr(args, "gateway", False)):
+                    print("  ⚠ Gateway cold-start skipped: Desktop control plane active. Run 'hermes gateway start' if your bot is offline.")
+                return None
+        return {"resume_needed": True, "profiles": {}, "unmapped_pids": [], "unmapped": [], "cold_start_if_installed": True}
     return None
 
 
@@ -855,7 +869,7 @@ def _gateway_drain_timeout(socket_acks: list[dict]) -> float:
     return drain_timeout
 
 
-def _pause_windows_gateways_for_update() -> dict | None:
+def _pause_windows_gateways_for_update(args=None) -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
     Scheduled/startup gateways run via pythonw.exe, invisible to the hermes.exe instance guard, yet keep files
@@ -868,7 +882,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         from hermes_cli.gateway import _capture_gateway_argv
     profile_processes, service_gateways, service_gateway_pids, running_pids = _discover_windows_gateways()
     if not running_pids:
-        return _windows_cold_start_plan()
+        return _windows_cold_start_plan(args=args)
     profiles, mapped_pids, socket_acks = _request_socket_pauses(running_pids, profile_processes, service_gateway_pids)
     # Resolve venv-side launchers BEFORE draining: a dead worker's parent cannot be recovered (NoSuchProcess).
     # The launcher keeps ``.pyd`` mapped and would trip the venv-holder guard; it is killed with the survivors.
@@ -926,7 +940,8 @@ def _cold_start_windows_gateway_after_update() -> bool:
         if list(find_gateway_pids(all_profiles=True)):
             return True
     with _abort_on_error("Could not re-check Desktop gateway-lifecycle ownership before cold-start"):
-        if _desktop_owns_gateway_lifecycle():
+        from hermes_cli import gateway_windows
+        if _desktop_owns_gateway_lifecycle() and not gateway_windows.attested_gateway_died():
             logger.debug("Skipping Windows gateway cold-start: Desktop owns gateway lifecycle")
             return True
     with _abort_on_error("Could not cold-start Windows gateway after update"):

@@ -869,12 +869,35 @@ def _start_attestation_path() -> Path:
     return _hermes_home().joinpath(*_START_ATTESTATION_RELATIVE)
 
 
+# Default freshness window: 24 hours (86400 seconds) for handoff/attestation relevance.
+_DEFAULT_ATTESTATION_FRESHNESS_SECONDS = 86400.0
+
+
 def _write_start_attestation(pids: list[int], via: str) -> None:
-    """Persist the PIDs a ✓ vouched for. Best-effort, never raises."""
+    """Persist the PIDs a ✓ vouched for, bound to create_time and timestamp. Best-effort, never raises."""
     try:
         path = _start_attestation_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"pids": [int(p) for p in pids], "via": via, "ts": datetime.now(timezone.utc).isoformat()}
+        now_utc = datetime.now(timezone.utc)
+        from gateway.status import get_process_start_time
+        create_times: dict[str, float] = {}
+        valid_pids: list[int] = []
+        for p in pids:
+            try:
+                pid_int = int(p)
+                valid_pids.append(pid_int)
+                st = get_process_start_time(pid_int)
+                if st is not None:
+                    create_times[str(pid_int)] = float(st)
+            except Exception:
+                pass
+        payload = {
+            "pids": valid_pids,
+            "create_times": create_times,
+            "via": via,
+            "ts": now_utc.isoformat(),
+            "timestamp": now_utc.timestamp(),
+        }
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(path)
@@ -889,25 +912,128 @@ def _clear_start_attestation() -> None:
         pass
 
 
-def _attested_pid_exited_cleanly(pid: int) -> bool:
-    """True when the lifecycle ledger shows a clean exit for ``pid``."""
+def _read_start_attestation() -> dict | None:
+    """Parsed attestation payload dict, or None when absent/unreadable/invalid. Never raises."""
+    try:
+        data = json.loads(_start_attestation_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _attested_pids_from(data: object) -> list[int]:
+    """PID list from an attestation payload; empty for anything malformed."""
+    if not isinstance(data, dict):
+        return []
+    pids = data.get("pids")
+    if not isinstance(pids, list):
+        return []
+    return [p for p in pids if isinstance(p, int)]
+
+
+def _is_attestation_fresh(data: dict, max_age_seconds: float = _DEFAULT_ATTESTATION_FRESHNESS_SECONDS) -> bool:
+    """True when the attestation was written within max_age_seconds. Malformed/missing ts reads False."""
+    if not isinstance(data, dict):
+        return False
+    ts_val = data.get("timestamp")
+    if isinstance(ts_val, (int, float)):
+        return (time.time() - float(ts_val)) <= max_age_seconds
+    ts_str = data.get("ts")
+    if isinstance(ts_str, str):
+        try:
+            dt = datetime.fromisoformat(ts_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - dt).total_seconds() <= max_age_seconds
+        except Exception:
+            return False
+    return False
+
+
+def _attested_pid_exited_cleanly(pid: int, expected_create_time: float | None = None) -> bool:
+    """True when the lifecycle ledger shows a clean exit for ``pid`` matching expected_create_time."""
     try:
         from gateway.lifecycle_ledger import get_lifecycle_sentinel_path
 
         data = json.loads(get_lifecycle_sentinel_path(_hermes_home()).read_text(encoding="utf-8"))
     except Exception:
         return False
-    return isinstance(data, dict) and data.get("phase") == "exited" and data.get("pid") == pid
+    if not (isinstance(data, dict) and data.get("phase") == "exited" and data.get("pid") == pid):
+        return False
+    ledger_start = data.get("start_time")
+    if expected_create_time is not None and ledger_start is not None:
+        try:
+            if abs(float(ledger_start) - float(expected_create_time)) > 2.0:
+                return False
+        except (ValueError, TypeError):
+            pass
+    return True
+
+
+def attested_gateway_died(
+    current_pids: list[int] | None = None,
+    max_age_seconds: float = _DEFAULT_ATTESTATION_FRESHNESS_SECONDS,
+) -> bool:
+    """True when the start attestation vouches for fresh gateway PID(s) that are gone without a clean exit.
+
+    Read-only twin of :func:`check_start_attestation` for callers that must not consume the
+    one-shot marker — ``hermes update`` consults it to decide whether a Desktop-owned install
+    still owes a gateway cold-start (#109538).
+
+    Binds attestation to process create_time and freshness window. Returns ``False`` for anything
+    undecidable or invalid (no marker, stale marker > max_age_seconds, malformed payload, a gateway
+    running now, a clean ledger exit, or discovery failure): "unknown" must never read as "dead".
+    """
+    try:
+        data = _read_start_attestation()
+        if not isinstance(data, dict):
+            return False
+        attested = _attested_pids_from(data)
+        if not attested:
+            return False
+        if not _is_attestation_fresh(data, max_age_seconds=max_age_seconds):
+            return False
+
+        if current_pids is None:
+            try:
+                from hermes_cli.gateway import find_gateway_pids
+
+                current_pids = list(find_gateway_pids())
+            except Exception:
+                return False
+
+        create_times = data.get("create_times")
+        create_times_dict = create_times if isinstance(create_times, dict) else {}
+
+        from gateway.status import get_process_start_time
+        for pid in attested:
+            if pid in current_pids:
+                expected_st = create_times_dict.get(str(pid))
+                if expected_st is not None:
+                    try:
+                        actual_st = get_process_start_time(pid)
+                        if actual_st is not None and abs(float(actual_st) - float(expected_st)) <= 2.0:
+                            return False  # Same process is still running
+                    except Exception:
+                        return False
+                else:
+                    return False
+
+        if any(_attested_pid_exited_cleanly(pid, create_times_dict.get(str(pid))) for pid in attested):
+            return False
+
+        return True
+    except Exception:
+        return False
 
 
 def check_start_attestation(current_pids: list[int] | None = None) -> str | None:
     """Surface (once) a gateway that died after a ✓ was printed for it. Never raises. Gateway running
     or a clean-exit ledger record: clear silently; otherwise return a warning and consume the marker."""
-    try:
-        data = json.loads(_start_attestation_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    data = _read_start_attestation()
+    if data is None:
         return None
-    attested = [p for p in data.get("pids", []) if isinstance(p, int)] if isinstance(data, dict) else []
+    attested = _attested_pids_from(data)
     if not attested:
         _clear_start_attestation()
         return None
@@ -921,9 +1047,15 @@ def check_start_attestation(current_pids: list[int] | None = None) -> str | None
             return None
 
     _clear_start_attestation()
-    if current_pids or any(_attested_pid_exited_cleanly(pid) for pid in attested):
+    create_times = data.get("create_times")
+    create_times_dict = create_times if isinstance(create_times, dict) else {}
+    if current_pids or any(_attested_pid_exited_cleanly(pid, create_times_dict.get(str(pid))) for pid in attested):
         return None
 
+    return _format_attestation_warning(attested, data)
+
+
+def _format_attestation_warning(attested: list[int], data: dict) -> str:
     via = data.get("via") or "direct spawn"
     ts = data.get("ts") or "unknown time"
     lines = [

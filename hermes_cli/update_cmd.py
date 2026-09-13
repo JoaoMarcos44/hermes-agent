@@ -1294,7 +1294,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         "pre_update_backup", pre_update_snapshot_id is not None,
         f"snapshot={pre_update_snapshot_id}" if pre_update_snapshot_id else "disabled or failed")
 
-    _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
+    _windows_gateway_resume = _m()._pause_windows_gateways_for_update(args)
     if _windows_gateway_resume:
         import atexit as _atexit
         _atexit.register(_m()._resume_windows_gateways_after_update, _windows_gateway_resume)
