@@ -45,12 +45,17 @@ def test_doctor_fix_stops_holders_and_reopens(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
 
+    # Create durable capture artifact satisfying precondition 2
+    capture_dir = tmp_path / "state.db.retired-wal-20260913-11111"
+    capture_dir.mkdir()
+    (capture_dir / "manifest.json").write_text(json.dumps({"pid": 11111, "main": {"mode": "copied"}}), encoding="utf-8")
+
     mock_holders = [(11111, str(tmp_path / "state.db-wal (deleted)"))]
     calls = []
     dead_pids = set()
 
     def fake_terminate(pid, force=False, **kwargs):
-        calls.append((pid, force))
+        calls.append((pid, force, kwargs.get("expected_start_time")))
         dead_pids.add(pid)
         state["holders"].clear()
 
@@ -65,6 +70,8 @@ def test_doctor_fix_stops_holders_and_reopens(tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr("gateway.status.terminate_pid", fake_terminate)
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 12345 if pid not in dead_pids else None)
+    monkeypatch.setattr("gateway.status._start_times_agree", lambda cur, exp: cur == exp)
     monkeypatch.setattr(doctor_state, "iter_deleted_sqlite_sidecar_holders", fake_iter_holders, raising=False)
     monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holders", fake_iter_holders)
     monkeypatch.setattr("hermes_state_holders._read_proc_argv", lambda _p: ["hermes", "gateway", "run"])
@@ -77,6 +84,7 @@ def test_doctor_fix_stops_holders_and_reopens(tmp_path, monkeypatch):
     assert finding.fixed == 1
     assert len(calls) >= 1
     assert calls[0][0] == 11111
+    assert calls[0][2] == 12345  # expected_start_time passed
     assert len(finding.manual_issues) == 0
 
 
@@ -85,12 +93,18 @@ def test_doctor_fix_reports_manual_issue_when_stop_fails(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     db.touch()
 
+    capture_dir = tmp_path / "state.db.retired-wal-20260913-99999"
+    capture_dir.mkdir()
+    (capture_dir / "manifest.json").write_text(json.dumps({"pid": 99999, "main": {"mode": "copied"}}), encoding="utf-8")
+
     mock_holders = [(99999, str(tmp_path / "state.db-wal (deleted)"))]
 
     def fake_terminate_fail(pid, **kwargs):
         raise PermissionError("Operation not permitted")
 
     monkeypatch.setattr("gateway.status.terminate_pid", fake_terminate_fail)
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 54321)
+    monkeypatch.setattr("gateway.status._start_times_agree", lambda cur, exp: cur == exp)
     monkeypatch.setattr(doctor_state, "iter_deleted_sqlite_sidecar_holders", lambda _p: mock_holders, raising=False)
     monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holders", lambda _p: mock_holders)
     monkeypatch.setattr("hermes_state_holders._read_proc_argv", lambda _p: ["/usr/bin/python", "daemon.py"])
@@ -105,6 +119,156 @@ def test_doctor_fix_reports_manual_issue_when_stop_fails(tmp_path, monkeypatch):
     assert "99999" in manual
     assert "daemon.py" in manual
     assert "stop them manually" in manual
+
+
+def test_doctor_identity_unavailable_fails_closed(tmp_path, monkeypatch):
+    """When start-time fingerprint cannot be established, doctor refuses to signal and reports manual issue."""
+    db = tmp_path / "state.db"
+    db.touch()
+
+    capture_dir = tmp_path / "state.db.retired-wal-20260913-77777"
+    capture_dir.mkdir()
+    (capture_dir / "manifest.json").write_text(json.dumps({"pid": 77777, "main": {"mode": "copied"}}), encoding="utf-8")
+
+    mock_holders = [(77777, str(tmp_path / "state.db-wal (deleted)"))]
+    signals_sent = []
+
+    monkeypatch.setattr("gateway.status.terminate_pid", lambda pid, **kw: signals_sent.append(pid))
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: None)  # Unavailable
+    monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holders", lambda _p: mock_holders)
+    monkeypatch.setattr("hermes_state_holders._read_proc_argv", lambda _p: ["worker.py"])
+
+    finding = Finding()
+    handled = doctor_state._recover_retired_wal(finding, should_fix=True, state_db_path=db, _DHH="~/.hermes")
+
+    assert handled is True
+    assert len(signals_sent) == 0  # No signal sent
+    assert finding.fixed == 0
+    assert any("start-time identity unavailable" in issue for issue in finding.manual_issues)
+
+
+def test_doctor_unlinked_wal_no_capture_fails_closed(tmp_path, monkeypatch):
+    """When an unlinked WAL generation has no durable capture, doctor refuses to signal the owner."""
+    db = tmp_path / "state.db"
+    db.touch()
+
+    mock_holders = [(88888, str(tmp_path / "state.db-wal (deleted)"))]
+    signals_sent = []
+
+    monkeypatch.setattr("gateway.status.terminate_pid", lambda pid, **kw: signals_sent.append(pid))
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 8888)
+    monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holders", lambda _p: mock_holders)
+    monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holder_descriptors", lambda _p: [
+        {"pid": 88888, "target": str(tmp_path / "state.db-wal (deleted)"), "fd_path": "/proc/88888/fd/3",
+         "identity": (1, 2), "suffix": "-wal"}
+    ])
+    monkeypatch.setattr("hermes_state_holders._read_proc_argv", lambda _p: ["worker.py"])
+
+    finding = Finding()
+    handled = doctor_state._recover_retired_wal(finding, should_fix=True, state_db_path=db, _DHH="~/.hermes")
+
+    assert handled is True
+    assert len(signals_sent) == 0  # Refused to signal because no capture exists
+    assert finding.fixed == 0
+    assert any("has no durable capture" in issue for issue in finding.manual_issues)
+
+
+def test_doctor_holder_exits_before_term_no_signal_to_replacement(tmp_path, monkeypatch):
+    """When a holder exits before TERM, doctor detects identity drift and sends no signal to replacement."""
+    db = tmp_path / "state.db"
+    db.touch()
+
+    capture_dir = tmp_path / "state.db.retired-wal-20260913-66666"
+    capture_dir.mkdir()
+    (capture_dir / "manifest.json").write_text(json.dumps({"pid": 66666, "main": {"mode": "copied"}}), encoding="utf-8")
+
+    mock_holders = [(66666, str(tmp_path / "state.db-wal (deleted)"))]
+    signals_sent = []
+
+    # Witness sees start time 100, but immediately before TERM the process exited and start time is None
+    start_times = {66666: [100, None]}
+    def fake_start_time(pid):
+        vals = start_times.get(pid, [100])
+        return vals.pop(0) if len(vals) > 1 else vals[0]
+
+    monkeypatch.setattr("gateway.status.terminate_pid", lambda pid, **kw: signals_sent.append(pid))
+    monkeypatch.setattr("gateway.status.get_process_start_time", fake_start_time)
+    monkeypatch.setattr("gateway.status._start_times_agree", lambda cur, exp: cur == exp)
+    monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holders", lambda _p: mock_holders)
+    monkeypatch.setattr("hermes_state_holders._read_proc_argv", lambda _p: ["worker.py"])
+
+    finding = Finding()
+    handled = doctor_state._recover_retired_wal(finding, should_fix=True, state_db_path=db, _DHH="~/.hermes")
+
+    assert handled is True
+    assert len(signals_sent) == 0  # No signal sent to replacement!
+
+
+def test_doctor_pid_recycled_between_term_and_kill_no_kill(tmp_path, monkeypatch):
+    """When PID is recycled between TERM and KILL, doctor detects identity mismatch and refuses SIGKILL."""
+    db = tmp_path / "state.db"
+    db.touch()
+
+    capture_dir = tmp_path / "state.db.retired-wal-20260913-44444"
+    capture_dir.mkdir()
+    (capture_dir / "manifest.json").write_text(json.dumps({"pid": 44444, "main": {"mode": "copied"}}), encoding="utf-8")
+
+    mock_holders = [(44444, str(tmp_path / "state.db-wal (deleted)"))]
+    signals_sent = []
+
+    # Start time was 200 during witness & TERM, but before KILL PID was recycled to a process with start time 999
+    call_count = {"val": 0}
+    def fake_start_time(pid):
+        call_count["val"] += 1
+        if call_count["val"] <= 2:
+            return 200
+        return 999  # Recycled PID
+
+    def fake_terminate(pid, force=False, **kw):
+        signals_sent.append((pid, force))
+
+    monkeypatch.setattr("gateway.status.terminate_pid", fake_terminate)
+    monkeypatch.setattr("gateway.status.get_process_start_time", fake_start_time)
+    monkeypatch.setattr("gateway.status._start_times_agree", lambda cur, exp: cur == exp)
+    monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holders", lambda _p: mock_holders)
+    monkeypatch.setattr("hermes_state_holders._read_proc_argv", lambda _p: ["worker.py"])
+    monkeypatch.setattr("os.kill", lambda pid, sig: None)  # Reports process still alive
+
+    finding = Finding()
+    handled = doctor_state._recover_retired_wal(finding, should_fix=True, state_db_path=db, _DHH="~/.hermes")
+
+    assert handled is True
+    # TERM was sent (force=False), but force-kill (force=True) was REFUSED because start time changed to 999!
+    assert any(sig[1] is False for sig in signals_sent)
+    assert not any(sig[1] is True for sig in signals_sent)
+
+
+def test_doctor_header_only_mode_guidance(tmp_path, monkeypatch):
+    """When retired WAL capture is header_only, guidance states forensic only and does not advertise nonexistent state.db."""
+    db = tmp_path / "state.db"
+    db.touch()
+
+    artifact_dir = tmp_path / "state.db.retired-wal-20260913T120000Z-9999"
+    artifact_dir.mkdir()
+    manifest = {
+        "manifest_version": 1,
+        "main": {"mode": "header_only", "file": "state.db.header", "bytes": 100},
+        "wal": {"file": "state.db-wal", "bytes": 512},
+    }
+    (artifact_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holders", lambda _p: [])
+
+    finding = Finding()
+    infos = []
+    monkeypatch.setattr(doctor_state, "check_info", lambda text: infos.append(text))
+
+    doctor_state._recover_retired_wal(finding, should_fix=False, state_db_path=db, _DHH="~/.hermes")
+
+    # Verify guidance states forensic artifact only and references manifest.json, NOT sessions recover state.db
+    assert any("mode: header_only" in msg for msg in infos)
+    assert any("forensic artifact only" in msg for msg in infos)
+    assert not any("sessions recover --source" in msg for msg in infos)
 
 
 def test_state_db_health_catches_deleted_wal_error(tmp_path, monkeypatch):
@@ -189,6 +353,10 @@ def test_doctor_excludes_current_pid_and_reports_pending_spool(tmp_path, monkeyp
     spool.mkdir()
     (spool / "pending-123.json").write_text("{}", encoding="utf-8")
 
+    capture_dir = tmp_path / "state.db.retired-wal-20260913-22222"
+    capture_dir.mkdir()
+    (capture_dir / "manifest.json").write_text(json.dumps({"pid": 22222, "main": {"mode": "copied"}}), encoding="utf-8")
+
     current_pid = os.getpid()
     mock_holders = [
         (current_pid, str(tmp_path / "state.db-wal (deleted)")),
@@ -213,6 +381,8 @@ def test_doctor_excludes_current_pid_and_reports_pending_spool(tmp_path, monkeyp
         return None
 
     monkeypatch.setattr("gateway.status.terminate_pid", fake_terminate)
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 2222)
+    monkeypatch.setattr("gateway.status._start_times_agree", lambda cur, exp: cur == exp)
     monkeypatch.setattr("hermes_state_dbfile.iter_deleted_sqlite_sidecar_holders", fake_iter_holders)
     monkeypatch.setattr("hermes_state_holders._read_proc_argv", lambda _p: ["hermes", "worker"])
     monkeypatch.setattr("os.kill", fake_kill)
@@ -254,4 +424,3 @@ def test_corrupt_store_as_status_handles_deleted_wal_and_replaced_errors(tmp_pat
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail["error"] == "state_db_replaced"
     assert "doctor --fix" in exc_info.value.detail["message"]
-

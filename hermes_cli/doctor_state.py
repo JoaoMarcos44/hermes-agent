@@ -13,6 +13,9 @@ from hermes_cli.doctor_report import (
 )
 from hermes_cli.sizefmt import format_bytes as _human_bytes
 from hermes_state_common import FTS_STORAGE_VERSION
+import logging
+
+logger = logging.getLogger("hermes_cli.doctor")
 
 
 def _honcho_is_configured_for_doctor() -> bool:
@@ -205,6 +208,53 @@ def _repair_state_db(f: Finding, should_fix: bool, state_db_path: Path, kind: st
     f.fixed += 1
 
 
+def _find_retired_wal_capture(db_path: Path, pid: int, wal_identity: Optional[tuple] = None) -> Optional[Path]:
+    """Find an existing retired-wal capture directory matching pid and wal_identity."""
+    retired_dirs = sorted(db_path.parent.glob(f"{db_path.name}.retired-wal-*"))
+    for d in reversed(retired_dirs):
+        manifest_file = d / "manifest.json"
+        if not manifest_file.is_file():
+            continue
+        try:
+            import json
+            m = json.loads(manifest_file.read_text(encoding="utf-8"))
+            if m.get("pid") == pid:
+                if wal_identity is None:
+                    return d
+                captured_ident = tuple(m.get("wal", {}).get("identity") or ())
+                if captured_ident == tuple(wal_identity):
+                    return d
+        except Exception:
+            continue
+    return None
+
+
+def _report_retired_dirs_info(retired_dirs: List[Path], profile_arg: str) -> None:
+    """Report latest retired WAL capture with mode-aware guidance (header_only vs copied)."""
+    if not retired_dirs:
+        return
+    latest = retired_dirs[-1]
+    manifest_file = latest / "manifest.json"
+    mode = "unknown"
+    if manifest_file.exists():
+        import json
+        try:
+            m = json.loads(manifest_file.read_text(encoding="utf-8"))
+            mode = m.get("main", {}).get("mode", "unknown")
+        except Exception:
+            pass
+    if mode == "copied":
+        check_info(
+            f"Retired WAL capture preserved at {latest.name} (mode: copied; "
+            f"inspect with 'hermes {profile_arg}sessions recover --source {latest / 'state.db'} --inspect-only')"
+        )
+    else:
+        check_info(
+            f"Retired WAL capture preserved at {latest.name} (mode: {mode}; "
+            f"forensic artifact only — inspect {latest / 'manifest.json'})"
+        )
+
+
 def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH: str) -> bool:
     """Detect and remediate processes holding unlinked or retired WAL generations."""
     from hermes_state_dbfile import iter_deleted_sqlite_sidecar_holders
@@ -215,21 +265,7 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
     profile_arg = profile_cli_selector()
 
     if not holders:
-        if retired_dirs:
-            latest = retired_dirs[-1]
-            manifest_file = latest / "manifest.json"
-            mode = "unknown"
-            if manifest_file.exists():
-                import json
-                try:
-                    m = json.loads(manifest_file.read_text(encoding="utf-8"))
-                    mode = m.get("main", {}).get("mode", "unknown")
-                except Exception:
-                    pass
-            check_info(
-                f"Retired WAL capture preserved at {latest.name} (mode: {mode}; "
-                f"inspect with 'hermes {profile_arg}sessions recover --source {latest / 'state.db'} --inspect-only')"
-            )
+        _report_retired_dirs_info(retired_dirs, profile_arg)
         return False
 
     current_pid = os.getpid()
@@ -247,16 +283,62 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
         )
         return True
 
-    from gateway.status import terminate_pid
+    from gateway.status import terminate_pid, get_process_start_time, _start_times_agree
     from hermes_state_holders import _read_proc_argv
+    from hermes_state_dbfile import (
+        iter_deleted_sqlite_sidecar_holder_descriptors,
+        capture_external_retired_wal_generation,
+    )
 
     cmd_descs = {pid: (" ".join(_read_proc_argv(pid))[:60] if _read_proc_argv(pid) else f"PID {pid}") for pid in pids}
 
-    # Bounded parallel termination: SIGTERM all holders, wait collectively, then force-kill any remaining.
-    failed_initial = {}
+    # Precondition 1: Process Identity Witness
+    # Capture start time while fd/holder is observed; refuse if unavailable.
+    witness_start_times: Dict[int, int] = {}
+    failed_pids: List[Tuple[int, str]] = []
     for pid in pids:
+        st = get_process_start_time(pid)
+        if st is None:
+            failed_pids.append((pid, f"{cmd_descs.get(pid, f'PID {pid}')} (refusing to signal: start-time identity unavailable)"))
+        else:
+            witness_start_times[pid] = st
+
+    # Precondition 2: Exact-Generation Preservation
+    # Ensure this PID's exact orphaned WAL inode has a durable capture BEFORE sending any signal.
+    holder_descriptors = {
+        r["pid"]: r for r in iter_deleted_sqlite_sidecar_holder_descriptors(state_db_path)
+        if r.get("suffix") == "-wal" and r.get("identity")
+    }
+    preserved_pids = set()
+    for pid in list(witness_start_times.keys()):
+        wal_ident = holder_descriptors.get(pid, {}).get("identity")
+        existing_capture = _find_retired_wal_capture(state_db_path, pid, wal_ident)
+        if existing_capture:
+            preserved_pids.add(pid)
+            continue
+        fd_path = holder_descriptors.get(pid, {}).get("fd_path")
+        if fd_path and wal_ident:
+            try:
+                capture_external_retired_wal_generation(state_db_path, pid=pid, fd_path=fd_path, wal_identity=wal_ident)
+                preserved_pids.add(pid)
+                continue
+            except Exception as exc:
+                logger.debug("Failed external capture of WAL for PID %s: %s", pid, exc)
+        failed_pids.append((pid, f"{cmd_descs.get(pid, f'PID {pid}')} (refusing to signal: unlinked WAL generation {wal_ident} has no durable capture)"))
+
+    target_pids = [p for p in witness_start_times.keys() if p in preserved_pids]
+
+    # Bounded parallel termination with identity revalidation
+    failed_initial = {}
+    active_pids = set()
+    for pid in target_pids:
+        cur_start = get_process_start_time(pid)
+        if cur_start is None or not _start_times_agree(cur_start, witness_start_times[pid]):
+            # Holder exited or was recycled before TERM: no signal to replacement
+            continue
+        active_pids.add(pid)
         try:
-            terminate_pid(pid, force=False)
+            terminate_pid(pid, force=False, expected_start_time=witness_start_times[pid])
         except Exception as exc:
             failed_initial[pid] = exc
 
@@ -267,7 +349,6 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
         except OSError:
             return False
 
-    active_pids = set(pids)
     for _ in range(20):
         if not active_pids:
             break
@@ -277,8 +358,13 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
 
     if active_pids:
         for pid in list(active_pids):
+            cur_start = get_process_start_time(pid)
+            if cur_start is None or not _start_times_agree(cur_start, witness_start_times[pid]):
+                # PID was recycled between TERM and KILL: refuse KILL
+                active_pids.discard(pid)
+                continue
             try:
-                terminate_pid(pid, force=True)
+                terminate_pid(pid, force=True, expected_start_time=witness_start_times[pid])
             except Exception:
                 pass
         for _ in range(10):
@@ -289,9 +375,8 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
                 time.sleep(0.1)
 
     still_held = {h[0] for h in iter_deleted_sqlite_sidecar_holders(state_db_path) if h[0] != current_pid}
-    failed_pids = []
     stopped_pids = []
-    for p in pids:
+    for p in target_pids:
         cmd = cmd_descs.get(p, f"PID {p}")
         if p in active_pids or (p in failed_initial and p in still_held):
             err = f" ({failed_initial[p]})" if p in failed_initial else ""
@@ -331,21 +416,8 @@ def _recover_retired_wal(f: Finding, should_fix: bool, state_db_path: Path, _DHH
         except Exception as e:
             check_warn(f"{_DHH}/state.db reopened but health check reported: {e}")
 
-    if retired_dirs:
-        latest = retired_dirs[-1]
-        manifest_file = latest / "manifest.json"
-        mode = "unknown"
-        if manifest_file.exists():
-            import json
-            try:
-                m = json.loads(manifest_file.read_text(encoding="utf-8"))
-                mode = m.get("main", {}).get("mode", "unknown")
-            except Exception:
-                pass
-        check_info(
-            f"Retired WAL capture preserved at {latest.name} (mode: {mode}; "
-            f"inspect with 'hermes {profile_arg}sessions recover --source {latest / 'state.db'} --inspect-only')"
-        )
+    refreshed_retired_dirs = sorted(state_db_path.parent.glob(f"{state_db_path.name}.retired-wal-*"))
+    _report_retired_dirs_info(refreshed_retired_dirs, profile_arg)
 
     return True
 
