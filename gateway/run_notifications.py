@@ -279,8 +279,11 @@ class GatewayNotificationsMixin:
             force_document_attachments = "[[as_document]]" in response
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
             media_files, cleaned = adapter.extract_media(response)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(
-                media_files, session_key=session_key or "")
+            scope_factory = getattr(self, "_profile_scope_for_source", None)
+            with (scope_factory(event.source)
+                  if callable(scope_factory) else contextlib.nullcontext()):
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                    media_files, session_key=session_key or "")
             # Strip image URLs (parity with the non-streaming chain); no extract_local_files here.
             # Do NOT deduplicate explicit MEDIA tags against prior turns here (#73771). This rescan is
             # already EXPLICIT-ONLY (see docstring): a MEDIA: directive in the final streamed reply is the

@@ -1782,7 +1782,8 @@ class GatewayTurnMixin:
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
             if response and adapter:
-                await self._deliver_media_from_response(response, event, adapter)
+                await self._deliver_media_from_response(
+                    response, event, adapter, session_key=session_key)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
@@ -2256,8 +2257,9 @@ class GatewayTurnMixin:
             images, media_files, text_content = [], [], ""
             if response:
                 media_files, response = adapter.extract_media(response)
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(
-                    media_files, session_key=self._session_key_for_source(source))
+                with self._profile_scope_for_source(source):
+                    media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                        media_files, session_key=self._session_key_for_source(source))
                 images, text_content = adapter.extract_images(response)
             if text_content:
                 await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
