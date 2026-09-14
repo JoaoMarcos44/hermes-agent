@@ -909,12 +909,19 @@ def _clear_start_attestation() -> None:
         pass
 
 
-def record_update_handoff(pids: list[int] | None = None, nonce: str | None = None) -> dict | None:
-    """Record the current profile's gateway identities immediately before Desktop stops them.
+def record_update_handoff(
+    pids: list[int] | None = None,
+    nonce: str | None = None,
+    *,
+    all_profiles: bool = False,
+) -> dict | None:
+    """Record gateway identities immediately before Desktop stops them.
 
-    The Desktop update path owns the stop boundary, but gateway discovery and process identity already
-    live here. Keeping the producer beside the consumer avoids a second Windows process matcher in
-    Electron. Missing identity for any discovered PID fails closed and writes no authority marker.
+    With ``all_profiles=True`` the marker captures every PID in the all-profile stop snapshot, while
+    the consumer still authorizes only an attestation whose identity matches one of those PIDs. The
+    Desktop update path owns the stop boundary, but gateway discovery and process identity already live
+    here; keeping the producer beside the consumer avoids a second Windows process matcher in Electron.
+    Missing identity for any discovered PID fails closed and writes no authority marker.
     """
     try:
         # A failed/empty new hand-off must not leave an older marker able to authorize a later
@@ -925,7 +932,7 @@ def record_update_handoff(pids: list[int] | None = None, nonce: str | None = Non
         if pids is None:
             from hermes_cli.gateway import find_gateway_pids
 
-            pids = list(find_gateway_pids())
+            pids = list(find_gateway_pids(all_profiles=all_profiles))
         if not isinstance(pids, list) or not pids:
             return None
         handoff_pids = []

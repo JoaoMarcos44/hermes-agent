@@ -1551,13 +1551,24 @@ def _gateway_list() -> None:
         print(" — ".join(parts))
 
 
-def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None, all_profiles: bool = False) -> int:
+def kill_gateway_processes(
+    force: bool = False,
+    exclude_pids: set | None = None,
+    all_profiles: bool = False,
+    expected_start_times: dict[int, float] | None = None,
+) -> int:
     """Kill running gateway processes (force-kill if ``force``); ``exclude_pids`` skips e.g. just-
     restarted service PIDs. Returns count killed."""
     killed = 0
     for pid in find_gateway_pids(exclude_pids=exclude_pids, all_profiles=all_profiles):
         try:
             expected_start_time = None
+            if expected_start_times is not None:
+                expected_start_time = expected_start_times.get(int(pid))
+                if expected_start_time is None:
+                    # A new PID discovered after the hand-off capture is not part of the
+                    # authority boundary; never terminate it under the old snapshot.
+                    continue
             if force:
                 # Re-verify the LIVE cmdline at kill time: a PID recycled since the scan must never be tree-killed.
                 # Re-verify at kill time, not just scan time: the cmdline match inside find_gateway_pids()
@@ -1566,8 +1577,10 @@ def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None,
                 # anything that no longer looks like a gateway — refuse those.
                 if _capture_gateway_argv(pid) is None:
                     continue
-                from gateway.status import get_process_start_time
-                expected_start_time = get_process_start_time(pid)
+                if expected_start_times is None:
+                    from gateway.status import get_process_start_time
+
+                    expected_start_time = get_process_start_time(pid)
             terminate_pid(pid, force=force, expected_start_time=expected_start_time)
             killed += 1
         except ProcessLookupError:
@@ -6189,13 +6202,15 @@ def _cmd_stop(args):
     _refuse_from_inside_gateway("stop", "restart loops")
     stop_all = getattr(args, "all", False)
     system = getattr(args, "system", False)
+    handoff_payload = None
     if getattr(args, "update_handoff", False) and stop_all and is_windows():
         from hermes_cli import gateway_windows
 
         # The Desktop owns this stop boundary. If identity capture is unavailable, continue with the
         # requested stop but leave no authority marker; the update path then fails closed and does not
         # cold-start a competing gateway.
-        if gateway_windows.record_update_handoff() is None:
+        handoff_payload = gateway_windows.record_update_handoff(all_profiles=True)
+        if handoff_payload is None:
             logger.warning("Could not record Windows gateway update handoff; recovery will fail closed")
     if not stop_all and not find_gateway_pids() and named_profile_served_by_running_multiplexer():
         # A served profile owns no gateway to stop; "No gateway running for this profile" (exit 0) would
@@ -6218,7 +6233,15 @@ def _cmd_stop(args):
 
     service_available = _stop_installed_service(system)
     if stop_all:
-        total = kill_gateway_processes(all_profiles=True) + (1 if service_available else 0)
+        expected_start_times = None
+        if handoff_payload is not None:
+            expected_start_times = {
+                int(pid): float(create_time)
+                for pid, create_time in handoff_payload["create_times"].items()
+            }
+        total = kill_gateway_processes(
+            all_profiles=True, expected_start_times=expected_start_times
+        ) + (1 if service_available else 0)
         if total:
             print(f"✓ Stopped {total} gateway process(es) across all profiles")
         else:

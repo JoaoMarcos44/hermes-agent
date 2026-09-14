@@ -360,7 +360,13 @@ def test_desktop_stop_records_handoff_before_killing_all_gateways(monkeypatch, a
 
     monkeypatch.setattr(gateway, "is_windows", lambda: True)
     monkeypatch.setattr(gateway, "_refuse_from_inside_gateway", lambda *args: None)
-    monkeypatch.setattr(gateway, "find_gateway_pids", lambda **_kwargs: [555])
+    find_calls = []
+
+    def _find(**kwargs):
+        find_calls.append(kwargs)
+        return [555]
+
+    monkeypatch.setattr(gateway, "find_gateway_pids", _find)
     monkeypatch.setattr(gateway, "_dispatch_all_via_service_manager_if_s6", lambda _verb: False)
     monkeypatch.setattr(gateway, "_stop_installed_service", lambda _system: False)
     monkeypatch.setattr(process_identity, "_process_create_time", lambda pid=None: 1000.0)
@@ -368,15 +374,34 @@ def test_desktop_stop_records_handoff_before_killing_all_gateways(monkeypatch, a
 
     def _kill(**kwargs):
         marker = attest_home / "state" / "gateway.update-handoff.json"
-        observed.append((kwargs.get("all_profiles"), marker.exists()))
+        observed.append((kwargs.get("all_profiles"), marker.exists(), kwargs.get("expected_start_times")))
         return 1
 
     monkeypatch.setattr(gateway, "kill_gateway_processes", _kill)
     gateway._cmd_stop(argparse.Namespace(system=False, all=True, update_handoff=True))
 
-    assert observed == [(True, True)]
+    assert find_calls == [{"all_profiles": True}]
+    assert observed == [(True, True, {555: 1000.0})]
     payload = json.loads(
         (attest_home / "state" / "gateway.update-handoff.json").read_text(encoding="utf-8")
     )
     assert payload["pids"] == [555]
     assert payload["create_times"] == {"555": 1000.0}
+
+
+def test_gateway_stop_uses_captured_identity_instead_of_reprobing_pid(monkeypatch):
+    """A PID discovered after the hand-off boundary must not be terminated."""
+    from hermes_cli import gateway
+
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda **_kwargs: [555, 777])
+    terminated = []
+    monkeypatch.setattr(
+        gateway,
+        "terminate_pid",
+        lambda pid, **kwargs: terminated.append((pid, kwargs.get("expected_start_time"))),
+    )
+
+    assert gateway.kill_gateway_processes(
+        all_profiles=True, expected_start_times={555: 1000.0}
+    ) == 1
+    assert terminated == [(555, 1000.0)]
