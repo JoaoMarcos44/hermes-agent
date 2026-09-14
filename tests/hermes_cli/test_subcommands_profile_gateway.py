@@ -60,6 +60,10 @@ def test_gateway_and_proxy_dispatch():
     assert px.command == "proxy"
     assert px.func is _h_proxy
 
+    stop = p.parse_args(["gateway", "stop", "--all", "--update-handoff"])
+    assert stop.gateway_command == "stop"
+    assert stop.update_handoff is True
+
 
 
 

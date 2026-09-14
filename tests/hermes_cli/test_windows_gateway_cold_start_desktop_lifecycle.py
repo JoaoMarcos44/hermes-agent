@@ -95,7 +95,8 @@ def test_orphaned_control_plane_does_not_own_lifecycle(monkeypatch):
     assert update_cmd._desktop_owns_gateway_lifecycle() is False
 
 
-def test_pause_skips_cold_start_plan_when_desktop_owns_lifecycle(monkeypatch):
+def test_pause_skips_cold_start_plan_without_a_matching_update_handoff(monkeypatch, tmp_path):
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(tmp_path))
     monkeypatch.setattr(cli_main, "_is_windows", lambda: True)
     monkeypatch.setattr(main_install_repair, "_is_windows", lambda: True)
     monkeypatch.setattr(hermes_gateway, "find_gateway_pids", lambda **_k: [])
@@ -103,9 +104,9 @@ def test_pause_skips_cold_start_plan_when_desktop_owns_lifecycle(monkeypatch):
         hermes_gateway, "find_windows_gateway_services", lambda **_k: []
     )
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
-    monkeypatch.setattr(gateway_windows, "attested_death_generation", lambda **_k: None)
     monkeypatch.setattr(update_cmd, "_desktop_owns_gateway_lifecycle", lambda: True)
     monkeypatch.setattr(update_cmd_windows, "_desktop_owns_gateway_lifecycle", lambda: True)
+    gateway_windows._write_start_attestation([555], "direct spawn (PID 555)")
 
     assert update_cmd._pause_windows_gateways_for_update() is None
 
@@ -165,12 +166,16 @@ def test_attested_dead_gateway_survives_desktop_ownership_and_marker_is_consumed
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
     monkeypatch.setattr(update_cmd, "_desktop_owns_gateway_lifecycle", lambda: True)
     monkeypatch.setattr(update_cmd_windows, "_desktop_owns_gateway_lifecycle", lambda: True)
+    monkeypatch.setattr(process_identity, "_process_create_time", lambda pid=None: 1000.0)
     gateway_windows._write_start_attestation([555], "direct spawn (PID 555)")
     marker = tmp_path / "state" / "gateway.start-attestation.json"
+    assert gateway_windows.record_update_handoff(pids=[555], nonce="handoff-1") is not None
+    handoff = tmp_path / "state" / "gateway.update-handoff.json"
 
     token = update_cmd._pause_windows_gateways_for_update()
 
     generation = token.pop("attested_generation")
+    assert token.pop("attested_handoff_nonce") == "handoff-1"
     assert generation == json.loads(marker.read_text(encoding="utf-8"))["generation"]
     assert token == {
         "resume_needed": True,
@@ -180,6 +185,7 @@ def test_attested_dead_gateway_survives_desktop_ownership_and_marker_is_consumed
         "cold_start_if_installed": True,
     }
     token["attested_generation"] = generation
+    token["attested_handoff_nonce"] = "handoff-1"
     assert marker.exists()  # plan-time probe is read-only
 
     spawned = []
@@ -194,6 +200,7 @@ def test_attested_dead_gateway_survives_desktop_ownership_and_marker_is_consumed
     assert spawned == [1]
     assert "Gateway started via cold-start after update (PID: 4242)" in capsys.readouterr().out
     assert not marker.exists()  # consumed by the spawn
+    assert not handoff.exists()  # consumed only after the replacement is ready
     assert gateway_windows.attested_death_generation(current_pids=[]) is None
 
 
@@ -212,10 +219,13 @@ def test_cold_start_is_authorized_by_the_token_generation_not_the_mutable_marker
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
     monkeypatch.setattr(update_cmd, "_desktop_owns_gateway_lifecycle", lambda: True)
     monkeypatch.setattr(update_cmd_windows, "_desktop_owns_gateway_lifecycle", lambda: True)
+    monkeypatch.setattr(process_identity, "_process_create_time", lambda pid=None: 1000.0)
     gateway_windows._write_start_attestation([555], "direct spawn (PID 555)")
     marker = tmp_path / "state" / "gateway.start-attestation.json"
+    assert gateway_windows.record_update_handoff(pids=[555], nonce="handoff-1") is not None
     token = update_cmd._pause_windows_gateways_for_update()
     assert token["attested_generation"]
+    assert token["attested_handoff_nonce"] == "handoff-1"
 
     # Concurrent ``hermes gateway status`` consumed the marker...
     assert gateway_windows.check_start_attestation(current_pids=[]) is not None

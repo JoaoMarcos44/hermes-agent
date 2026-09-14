@@ -11,6 +11,7 @@ import ctypes
 import json
 import locale
 import logging
+import math
 import os
 import re
 import shlex
@@ -864,10 +865,15 @@ def _wait_for_gateway_ready(
 # ---------------------------------------------------------------------------
 
 _START_ATTESTATION_RELATIVE = ("state", "gateway.start-attestation.json")
+_UPDATE_HANDOFF_RELATIVE = ("state", "gateway.update-handoff.json")
 
 
 def _start_attestation_path() -> Path:
     return _hermes_home().joinpath(*_START_ATTESTATION_RELATIVE)
+
+
+def _update_handoff_path() -> Path:
+    return _hermes_home().joinpath(*_UPDATE_HANDOFF_RELATIVE)
 
 
 def _write_start_attestation(pids: list[int], via: str) -> None:
@@ -903,28 +909,97 @@ def _clear_start_attestation() -> None:
         pass
 
 
+def record_update_handoff(pids: list[int] | None = None, nonce: str | None = None) -> dict | None:
+    """Record the current profile's gateway identities immediately before Desktop stops them.
+
+    The Desktop update path owns the stop boundary, but gateway discovery and process identity already
+    live here. Keeping the producer beside the consumer avoids a second Windows process matcher in
+    Electron. Missing identity for any discovered PID fails closed and writes no authority marker.
+    """
+    try:
+        # A failed/empty new hand-off must not leave an older marker able to authorize a later
+        # Desktop-owned cold-start. The marker is only useful when this invocation replaces it.
+        _clear_update_handoff()
+        from hermes_cli.process_identity import _process_create_time
+
+        if pids is None:
+            from hermes_cli.gateway import find_gateway_pids
+
+            pids = list(find_gateway_pids())
+        if not isinstance(pids, list) or not pids:
+            return None
+        handoff_pids = []
+        for pid in pids:
+            if type(pid) is not int or pid <= 0:
+                return None
+            if pid not in handoff_pids:
+                handoff_pids.append(pid)
+        create_times: dict[str, float] = {}
+        for pid in handoff_pids:
+            create_time = _process_create_time(pid)
+            if create_time is None or not math.isfinite(float(create_time)) or float(create_time) <= 0:
+                return None
+            create_times[str(pid)] = float(create_time)
+        payload = {
+            "nonce": str(nonce or uuid.uuid4().hex),
+            "pids": handoff_pids,
+            "create_times": create_times,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        path = _update_handoff_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+        return payload
+    except Exception:
+        try:
+            _clear_update_handoff()
+        except Exception:
+            # Cleanup is best-effort too; the producer still returns no authority on any failure.
+            logger.debug("Could not clear failed gateway update handoff", exc_info=True)
+        logger.debug("Failed to record gateway update handoff", exc_info=True)
+        return None
+
+
+def _clear_update_handoff() -> None:
+    try:
+        _update_handoff_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 # A start attestation older than this is no authority (#110020 review (d)): the marker is a one-shot
 # meant to bridge the seconds between a ✓ and the next ``hermes gateway status``/``update``; a
 # historical marker must never later override Desktop ownership into a duplicate gateway (#76129).
 START_ATTESTATION_MAX_AGE_S = 24 * 3600
+UPDATE_HANDOFF_MAX_AGE_S = START_ATTESTATION_MAX_AGE_S
 # Same slack process_identity uses for psutil create_time comparisons (PID reuse disambiguation).
 _CREATE_TIME_TOLERANCE_S = 2.0
 # A backwards clock step (NTP) between write and read must not kill a fresh marker.
 _ATTESTATION_CLOCK_SLACK_S = 60.0
 
 
-def _attestation_within_horizon(data: object) -> bool:
-    """False for a marker whose ``ts`` is missing, unparsable or older than the horizon (fail closed)."""
+def _timestamp_within_horizon(data: object, field: str, max_age_s: float) -> bool:
     try:
-        ts = datetime.fromisoformat(str(data["ts"])) if isinstance(data, dict) else None
+        ts = datetime.fromisoformat(str(data[field])) if isinstance(data, dict) else None
         if ts is None:
             return False
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         age = time.time() - ts.timestamp()
-        return -_ATTESTATION_CLOCK_SLACK_S <= age <= START_ATTESTATION_MAX_AGE_S
+        return -_ATTESTATION_CLOCK_SLACK_S <= age <= max_age_s
     except Exception:
         return False
+
+
+def _attestation_within_horizon(data: object) -> bool:
+    """False for a marker whose ``ts`` is missing, unparsable or older than the horizon (fail closed)."""
+    return _timestamp_within_horizon(data, "ts", START_ATTESTATION_MAX_AGE_S)
+
+
+def _update_handoff_within_horizon(data: object) -> bool:
+    return _timestamp_within_horizon(data, "recorded_at", UPDATE_HANDOFF_MAX_AGE_S)
 
 
 def _attestation_generation(data: object) -> str | None:
@@ -946,6 +1021,65 @@ def _read_start_attestation() -> object | None:
         return json.loads(_start_attestation_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def _read_update_handoff() -> dict | None:
+    """Read the Desktop hand-off marker; malformed, stale, or incomplete data fails closed."""
+    try:
+        data = json.loads(_update_handoff_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("nonce"), str) or not data["nonce"]:
+        return None
+    pids = data.get("pids")
+    create_times = data.get("create_times")
+    if (
+        not isinstance(pids, list)
+        or not pids
+        or not all(type(pid) is int and pid > 0 for pid in pids)
+        or len(set(pids)) != len(pids)
+        or not isinstance(create_times, dict)
+        or any(
+            str(pid) not in create_times
+            or type(create_times[str(pid)]) not in (int, float)
+            or not math.isfinite(float(create_times[str(pid)]))
+            or float(create_times[str(pid)]) <= 0
+            for pid in pids
+        )
+        or not _update_handoff_within_horizon(data)
+    ):
+        return None
+    return {
+        "nonce": data["nonce"],
+        "pids": list(pids),
+        "create_times": {str(pid): float(create_times[str(pid)]) for pid in pids},
+        "recorded_at": str(data["recorded_at"]),
+    }
+
+
+def _handoff_nonce_for_attestation(data: object, handoff: dict | None = None) -> str | None:
+    """Return the matching Desktop hand-off nonce for an attestation, or None."""
+    handoff = _read_update_handoff() if handoff is None else handoff
+    if not handoff or not isinstance(data, dict):
+        return None
+    attested_pids = _attested_pids_from(data)
+    for pid in attested_pids:
+        attested_birth = _attested_create_time(data, pid)
+        handoff_birth = handoff["create_times"].get(str(pid))
+        if (
+            attested_birth is not None
+            and handoff_birth is not None
+            and abs(attested_birth - handoff_birth) <= _CREATE_TIME_TOLERANCE_S
+        ):
+            return handoff["nonce"]
+    return None
+
+
+def _consume_update_handoff(nonce: str) -> None:
+    """Clear only the hand-off marker that authorized this cold-start."""
+    handoff = _read_update_handoff()
+    if handoff and handoff["nonce"] == nonce:
+        _clear_update_handoff()
 
 
 def _attested_pids_from(data: object) -> list[int]:
@@ -1002,7 +1136,26 @@ def _attested_dead(attested: list[int], current_pids: list[int], data: object = 
     )
 
 
-def attested_death_generation(current_pids: list[int]) -> str | None:
+def attested_death_authorization(
+    current_pids: list[int], *, require_handoff_match: bool = False
+) -> tuple[str | None, str | None]:
+    """Return the attestation generation and matching hand-off nonce read as one authorization pair."""
+    data = _read_start_attestation()
+    attested = _attested_pids_from(data)
+    if not attested or not _attestation_within_horizon(data) or not _attested_dead(attested, current_pids, data):
+        return None, None
+    handoff_nonce = None
+    if require_handoff_match:
+        handoff_nonce = _handoff_nonce_for_attestation(data, _read_update_handoff())
+        if handoff_nonce is None:
+            return None, None
+    generation = _attestation_generation(data)
+    return (generation, handoff_nonce) if generation is not None else (None, None)
+
+
+def attested_death_generation(
+    current_pids: list[int], *, require_handoff_match: bool = False
+) -> str | None:
     """The generation of a start attestation that vouches for gateway PID(s) gone without a clean exit,
     or ``None``.
 
@@ -1013,11 +1166,10 @@ def attested_death_generation(current_pids: list[int]) -> str | None:
     already established (``[]`` after their own discovery came back empty) so the process table is
     not scanned twice. ``None`` for anything undecidable (no marker, no generation, a clean ledger
     exit): "unknown" must never read as "dead"."""
-    data = _read_start_attestation()
-    attested = _attested_pids_from(data)
-    if not attested or not _attestation_within_horizon(data) or not _attested_dead(attested, current_pids, data):
-        return None
-    return _attestation_generation(data)
+    generation, _handoff_nonce = attested_death_authorization(
+        current_pids, require_handoff_match=require_handoff_match
+    )
+    return generation
 
 
 def check_start_attestation(current_pids: list[int] | None = None) -> str | None:

@@ -46,7 +46,7 @@ test('Windows with missing CLI shim returns false and does not exec', () => {
   })
 
   assert.equal(ran, false)
-  assert.deepEqual(calls, [[CLI, ['gateway', 'stop', '--all']]])
+  assert.deepEqual(calls, [[CLI, ['gateway', 'stop', '--all', '--update-handoff']]])
 })
 
 test('Windows with live CLI invokes "gateway stop --all" and returns true', () => {
@@ -66,7 +66,7 @@ test('Windows with live CLI invokes "gateway stop --all" and returns true', () =
 
   assert.equal(ran, true)
   assert.equal(seenCommand, CLI)
-  assert.deepEqual(seenArgs, ['gateway', 'stop', '--all'])
+  assert.deepEqual(seenArgs, ['gateway', 'stop', '--all', '--update-handoff'])
 })
 
 test('Windows with failing CLI returns false (best-effort, never throws)', () => {

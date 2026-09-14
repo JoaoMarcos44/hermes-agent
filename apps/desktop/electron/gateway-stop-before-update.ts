@@ -10,8 +10,9 @@
  *    the worker PID does not reach parents, so the lock could survive.
  *  - a single gateway.pid read misses multi-profile setups entirely.
  *
- * So we delegate to `hermes gateway stop --all`: the CLI discovers every
- * profile's gateway processes (launcher + worker) via find_gateway_pids,
+ * So we delegate to `hermes gateway stop --all --update-handoff`: the CLI
+ * records the current profile's pre-stop process identity before discovering
+ * every profile's gateway processes (launcher + worker) via find_gateway_pids,
  * drains in-flight agents (planned-stop marker -> resume_pending), and
  * force-kills survivors — the same logic `hermes update`'s
  * _pause_windows_gateways_for_update relies on.
@@ -48,7 +49,9 @@ export function stopGatewayBeforeUpdate(
   hermesHome: string,
   deps: StopGatewayBeforeUpdateDeps = {}
 ): boolean {
-  return runGatewayLifecycleCommand(hermesCliPath, ['gateway', 'stop', '--all'], deps)
+  // Ask the CLI to bind the live gateway identity before it stops every profile. The
+  // updater can then distinguish this Desktop hand-off from an unrelated crash.
+  return runGatewayLifecycleCommand(hermesCliPath, ['gateway', 'stop', '--all', '--update-handoff'], deps)
 }
 
 /**

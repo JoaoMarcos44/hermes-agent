@@ -14,11 +14,13 @@ Two holes closed by the fix:
 All timing knobs are shrunk so no test sleeps longer than ~1s.
 """
 
+import argparse
 import json
 
 import pytest
 
 import hermes_cli.gateway_windows as gateway_windows
+from hermes_cli import process_identity
 
 
 # ---------------------------------------------------------------------------
@@ -295,3 +297,86 @@ def test_attestation_bound_to_create_time_keeps_authority_for_its_own_incarnatio
     path.write_text(json.dumps(legacy), encoding="utf-8")
     _sentinel(attest_home, phase="running", pid=111, create_time=1003.0)
     assert gateway_windows.attested_death_generation(current_pids=[]) is not None
+
+
+def test_update_handoff_binds_cold_start_authority_to_the_pre_stop_identity(monkeypatch, attest_home):
+    """A Desktop hand-off marker is required and must match the attested birth time."""
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda **_kwargs: [555])
+    monkeypatch.setattr(process_identity, "_process_create_time", lambda pid=None: 1000.0)
+
+    handoff = gateway_windows.record_update_handoff(nonce="handoff-1")
+
+    assert handoff is not None
+    assert handoff["nonce"] == "handoff-1"
+    assert handoff["pids"] == [555]
+    assert handoff["create_times"] == {"555": 1000.0}
+    gateway_windows._write_start_attestation([555], "direct spawn (PID 555)")
+    generation = json.loads(
+        (attest_home / "state" / "gateway.start-attestation.json").read_text(encoding="utf-8")
+    )["generation"]
+    assert gateway_windows.attested_death_authorization(
+        current_pids=[], require_handoff_match=True
+    ) == (generation, "handoff-1")
+    assert gateway_windows.attested_death_generation(
+        current_pids=[], require_handoff_match=True
+    ) is not None
+
+    handoff["create_times"]["555"] = 2000.0
+    (attest_home / "state" / "gateway.update-handoff.json").write_text(
+        json.dumps(handoff), encoding="utf-8"
+    )
+    assert gateway_windows.attested_death_generation(
+        current_pids=[], require_handoff_match=True
+    ) is None
+
+    handoff["pids"] = [[]]
+    (attest_home / "state" / "gateway.update-handoff.json").write_text(
+        json.dumps(handoff), encoding="utf-8"
+    )
+    assert gateway_windows._read_update_handoff() is None
+    assert gateway_windows.attested_death_authorization(
+        current_pids=[], require_handoff_match=True
+    ) == (None, None)
+
+
+def test_failed_update_handoff_capture_clears_previous_authority(monkeypatch, attest_home):
+    """A failed new capture must not leave a prior hand-off able to authorize recovery."""
+    path = attest_home / "state" / "gateway.update-handoff.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"nonce": "old"}), encoding="utf-8")
+    assert gateway_windows.record_update_handoff(pids=[]) is None
+    assert not path.exists()
+
+    path.write_text(json.dumps({"nonce": "old"}), encoding="utf-8")
+    monkeypatch.setattr(process_identity, "_process_create_time", lambda pid=None: None)
+
+    assert gateway_windows.record_update_handoff(pids=[555]) is None
+    assert not path.exists()
+
+
+def test_desktop_stop_records_handoff_before_killing_all_gateways(monkeypatch, attest_home):
+    """The Desktop-only stop flag must invoke the real producer before the destructive stop."""
+    from hermes_cli import gateway
+
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(gateway, "_refuse_from_inside_gateway", lambda *args: None)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda **_kwargs: [555])
+    monkeypatch.setattr(gateway, "_dispatch_all_via_service_manager_if_s6", lambda _verb: False)
+    monkeypatch.setattr(gateway, "_stop_installed_service", lambda _system: False)
+    monkeypatch.setattr(process_identity, "_process_create_time", lambda pid=None: 1000.0)
+    observed = []
+
+    def _kill(**kwargs):
+        marker = attest_home / "state" / "gateway.update-handoff.json"
+        observed.append((kwargs.get("all_profiles"), marker.exists()))
+        return 1
+
+    monkeypatch.setattr(gateway, "kill_gateway_processes", _kill)
+    gateway._cmd_stop(argparse.Namespace(system=False, all=True, update_handoff=True))
+
+    assert observed == [(True, True)]
+    payload = json.loads(
+        (attest_home / "state" / "gateway.update-handoff.json").read_text(encoding="utf-8")
+    )
+    assert payload["pids"] == [555]
+    assert payload["create_times"] == {"555": 1000.0}

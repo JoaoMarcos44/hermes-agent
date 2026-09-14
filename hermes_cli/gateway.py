@@ -6189,6 +6189,14 @@ def _cmd_stop(args):
     _refuse_from_inside_gateway("stop", "restart loops")
     stop_all = getattr(args, "all", False)
     system = getattr(args, "system", False)
+    if getattr(args, "update_handoff", False) and stop_all and is_windows():
+        from hermes_cli import gateway_windows
+
+        # The Desktop owns this stop boundary. If identity capture is unavailable, continue with the
+        # requested stop but leave no authority marker; the update path then fails closed and does not
+        # cold-start a competing gateway.
+        if gateway_windows.record_update_handoff() is None:
+            logger.warning("Could not record Windows gateway update handoff; recovery will fail closed")
     if not stop_all and not find_gateway_pids() and named_profile_served_by_running_multiplexer():
         # A served profile owns no gateway to stop; "No gateway running for this profile" (exit 0) would
         # contradict `gateway status` ("running via the default-profile multiplexer") on the same profile.

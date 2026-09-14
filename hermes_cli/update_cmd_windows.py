@@ -747,13 +747,10 @@ def _windows_cold_start_plan() -> dict | None:
     updates would otherwise stay down until next login (resume only relaunches what was running).
     Desktop-owned lifecycle -> ``None`` (spawning ``gateway run`` beside Desktop races ports/state);
     the skip is ownership, not liveness — except when the start attestation reports a vouched-for
-    gateway that died without a clean exit. The Desktop hand-off exits the app before the updater starts
-    and can kill the running gateway in those same seconds, so discovery finds no live PID to pause
-    (#109538) — the dead attestation is the only surviving "a gateway was up" evidence, and the Desktop
-    does not restart the messaging gateway itself. Keep the plan, and record the attestation
-    *generation* that authorized it on the token: the marker is a mutable one-shot that any concurrent
-    ``hermes gateway status``/``start`` consumes, so execution authorizes the spawn from the token and
-    consumes only that generation (#110020 review)."""
+    gateway that died without a clean exit *and* its ``(pid, create_time)`` matches the current Desktop
+    update hand-off. A stale crash marker therefore remains unknown and cannot authorize a competing
+    gateway (#110469). The attestation generation and hand-off nonce are copied to the token because
+    either marker may be consumed or replaced while the update runs (#110020 review)."""
     from hermes_cli.update_cmd import _desktop_owns_gateway_lifecycle
     from hermes_cli import gateway_windows
     with _best_effort('Could not check Windows gateway autostart state before update: %s'):
@@ -762,11 +759,14 @@ def _windows_cold_start_plan() -> dict | None:
         token = {"resume_needed": True, "profiles": {}, "unmapped_pids": [], "unmapped": [], "cold_start_if_installed": True}
         with _best_effort('Could not check Desktop gateway-lifecycle ownership before update: %s'):
             if _desktop_owns_gateway_lifecycle():
-                generation = gateway_windows.attested_death_generation(current_pids=[])
-                if generation is None:
+                generation, handoff_nonce = gateway_windows.attested_death_authorization(
+                    current_pids=[], require_handoff_match=True
+                )
+                if generation is None or handoff_nonce is None:
                     logger.debug("Skipping Windows gateway cold-start plan: Desktop owns gateway lifecycle")
                     return None
                 token["attested_generation"] = generation
+                token["attested_handoff_nonce"] = handoff_nonce
         return token
     return None
 
@@ -934,12 +934,11 @@ def _cold_start_windows_gateway_after_update(token: dict | None = None) -> bool:
     (``gateway_windows._report_gateway_start``), instead of being printed unconditionally from the returned
     PID.
 
-    Desktop-owned lifecycle suppresses the spawn only while nothing attests a gateway is expected: an
-    attested gateway that died without a clean exit is restored even then (#109538) — the Desktop does
-    not restart the messaging gateway itself. That authority is the ``attested_generation`` the plan
-    recorded on ``token``, not the marker on disk: the marker is a mutable one-shot a concurrent
-    ``hermes gateway status``/``start`` consumes, which would otherwise skip this spawn and clear the
-    token (#110020 review). Only that generation is consumed afterwards — never a newer marker.
+    Desktop-owned lifecycle suppresses the spawn unless the plan carries both the attestation generation
+    and the nonce of a matching current Desktop hand-off. Those values live on ``token``, not only on
+    mutable marker files: concurrent ``hermes gateway status``/``start`` calls may consume or replace a
+    marker while the update runs. Only the recorded generation and nonce are consumed afterwards — never
+    newer markers (#110020 review, #110469).
     """
     from hermes_cli.update_cmd import _desktop_owns_gateway_lifecycle, _m
     if not _m()._is_windows():
@@ -952,12 +951,15 @@ def _cold_start_windows_gateway_after_update(token: dict | None = None) -> bool:
             return True
     token = token or {}
     generation = token.get("attested_generation")
+    handoff_nonce = token.get("attested_handoff_nonce")
     if generation is None and "attested_generation" not in token:
         # Token written by pre-generation code and resumed across this very update: probe the marker.
         with _abort_on_error("Could not re-read the start attestation before cold-start"):
-            generation = gateway_windows.attested_death_generation(current_pids=[])
+            generation, handoff_nonce = gateway_windows.attested_death_authorization(
+                current_pids=[], require_handoff_match=True
+            )
     with _abort_on_error("Could not re-check Desktop gateway-lifecycle ownership before cold-start"):
-        if _desktop_owns_gateway_lifecycle() and not generation:
+        if _desktop_owns_gateway_lifecycle() and not (generation and handoff_nonce):
             logger.debug("Skipping Windows gateway cold-start: Desktop owns gateway lifecycle")
             return True
     with _abort_on_error("Could not cold-start Windows gateway after update"):
@@ -973,6 +975,8 @@ def _cold_start_windows_gateway_after_update(token: dict | None = None) -> bool:
     # success without a gateway (#110020 review).
     if generation:
         gateway_windows._consume_start_attestation(generation)
+    if handoff_nonce:
+        gateway_windows._consume_update_handoff(handoff_nonce)
     print(f"\n✓ Gateway started via cold-start after update (PID: {', '.join(map(str, ready_pids))})")
     with suppress(Exception):
         gateway_windows._write_start_attestation(ready_pids, "cold-start after update")
