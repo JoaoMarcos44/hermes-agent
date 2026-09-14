@@ -96,6 +96,9 @@ def test_clean_exit_then_boot_reports_nothing(tmp_path: Path) -> None:
     assert sentinel["phase"] == "exited"
     assert sentinel["exit_code"] == 0
     assert sentinel["exit_reason"] == "graceful_shutdown"
+    assert "create_time" in sentinel
+    assert "start_time" in sentinel
+    assert sentinel["create_time"] == sentinel["start_time"]
 
     assert record_startup(home=tmp_path) is None
     assert _exit_diag_records(tmp_path) == []

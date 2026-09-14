@@ -118,7 +118,11 @@ def _pid_alive_with_start_time(pid: Any, start_time: Any) -> bool:
         return False
     try:
         actual = None if start_time is None else get_process_start_time(pid_int)
-        return actual is None or abs(float(actual) - float(start_time)) <= 2.0  # None: can't disambiguate PID reuse
+        if actual is None:
+            return True
+        diff = abs(float(actual) - float(start_time))
+        tolerance = 200.0 if float(start_time) > 1e6 else 2.0
+        return diff <= tolerance  # None: can't disambiguate PID reuse
     except Exception:
         return True
 
@@ -147,6 +151,8 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]
         "prior_pid": sentinel.get("pid"), "prior_started_at": sentinel.get("started_at"),
         "prior_start_time": sentinel.get("start_time"),
     }
+    if "create_time" in sentinel:
+        evidence["prior_create_time"] = sentinel["create_time"]
     # Enrich with the last heartbeat: last proven liveness and memory at that moment.
     try:
         from gateway.shutdown_watchdog import get_loop_heartbeat_path
@@ -213,7 +219,17 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     except Exception:
         logger.debug("Unclean-exit detection failed", exc_info=True)
     try:
-        claim: Dict[str, Any] = {"phase": "running", "pid": os.getpid(), "start_time": time.time(), "started_at": _now_iso()}
+        from gateway.status import get_process_start_time
+
+        proc_start = get_process_start_time(os.getpid())
+        norm_start = proc_start if proc_start is not None else time.time()
+        claim: Dict[str, Any] = {
+            "phase": "running",
+            "pid": os.getpid(),
+            "create_time": proc_start,
+            "start_time": norm_start,
+            "started_at": _now_iso(),
+        }
         # Carry the verdict on the PREVIOUS life on the new sentinel: it is the only
         # machine-readable copy (/api/status reads it to report an OOM restart).
         # Scoped to this life — the next clean exit or boot rewrites the sentinel.
@@ -238,8 +254,25 @@ def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdow
         sentinel = _read_json(get_lifecycle_sentinel_path(home))
         if sentinel is not None and sentinel.get("pid") != os.getpid():
             return
-        _write_sentinel({"phase": "exited", "pid": os.getpid(), "exit_code": exit_code, "exit_reason": reason,
-                         "exited_at": _now_iso()}, home)
+        create_time = None
+        if sentinel is not None:
+            create_time = sentinel.get("create_time") or sentinel.get("start_time")
+        if create_time is None:
+            from gateway.status import get_process_start_time
+
+            create_time = get_process_start_time(os.getpid())
+        exit_payload: Dict[str, Any] = {
+            "phase": "exited",
+            "pid": os.getpid(),
+            "create_time": create_time,
+            "start_time": create_time,
+            "exit_code": exit_code,
+            "exit_reason": reason,
+            "exited_at": _now_iso(),
+        }
+        if sentinel and "started_at" in sentinel:
+            exit_payload["started_at"] = sentinel["started_at"]
+        _write_sentinel(exit_payload, home)
     except Exception:
         logger.debug("Failed to mark lifecycle sentinel exited", exc_info=True)
 

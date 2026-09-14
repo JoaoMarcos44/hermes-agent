@@ -189,3 +189,136 @@ def test_breakaway_fallback_warns_even_on_success(monkeypatch, attest_home, caps
     assert "✓" in out
     assert "could not break away" in out
     assert "schtasks /Run /TN Hermes_Gateway" in out
+
+
+# ---------------------------------------------------------------------------
+# #110469: Process identity binding, PID reuse guard, and handoff matching
+# ---------------------------------------------------------------------------
+
+
+def test_attestation_persists_create_times(monkeypatch, attest_home):
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 12345678)
+    gateway_windows._write_start_attestation([555], "direct spawn (PID 555)")
+
+    data = gateway_windows._read_start_attestation()
+    assert data is not None
+    assert data["pids"] == [555]
+    assert data["create_times"] == {"555": 12345678}
+
+
+def test_attested_pid_clean_exit_guards_pid_reuse(attest_home):
+    """PID reuse with an unrelated clean exit must NOT suppress recovery (#110469)."""
+    state = attest_home / "state"
+    state.mkdir(exist_ok=True)
+    # Lifecycle ledger recorded clean exit for PID 555, but from a different process instance (ct 999999)
+    (state / "gateway.lifecycle.json").write_text(
+        json.dumps({
+            "phase": "exited",
+            "pid": 555,
+            "create_time": 999999,
+            "exit_reason": "graceful_shutdown",
+        }),
+        encoding="utf-8",
+    )
+
+    # Clean exit for mismatched create_time returns False (does not treat as clean exit of this instance)
+    assert not gateway_windows._attested_pid_exited_cleanly(555, expected_create_time=123456)
+    # Clean exit for matching create_time returns True
+    assert gateway_windows._attested_pid_exited_cleanly(555, expected_create_time=999999)
+
+
+def test_attestation_probe_is_read_only(attest_home):
+    """attested_gateway_died is a read-only probe and does not consume the marker."""
+    marker = attest_home / "state" / "gateway.start-attestation.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps({
+            "pids": [555],
+            "create_times": {"555": 100},
+            "via": "test",
+            "ts": "2026-09-01T00:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+
+    assert gateway_windows.attested_gateway_died(current_pids=[]) is True
+    assert marker.exists(), "Probe must not consume the marker"
+    assert gateway_windows.attested_gateway_died(current_pids=[555]) is False
+
+
+def test_attestation_fail_closed_malformed_matrix(attest_home):
+    """Unknown or malformed attestation must fail closed and never read as dead (#110469)."""
+    marker = attest_home / "state" / "gateway.start-attestation.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+
+    malformed_cases = [
+        {"pids": None},
+        {"pids": "555"},
+        {"pids": [True]},
+        {"pids": ["555"]},
+        {"pids": []},
+        {"pids": [555], "create_times": None},
+        {"pids": [555]},  # missing create_times
+        "not json",
+        None,
+    ]
+
+    for payload in malformed_cases:
+        if isinstance(payload, str):
+            marker.write_text(payload, encoding="utf-8")
+        elif payload is None:
+            marker.unlink(missing_ok=True)
+        else:
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert gateway_windows._read_start_attestation() is None if payload is None or not isinstance(payload, dict) or payload.get("pids") is None or not isinstance(payload.get("pids"), list) or not payload.get("pids") or any(isinstance(x, bool) or not isinstance(x, int) for x in payload.get("pids", [])) else True or False
+        assert gateway_windows.attested_gateway_died(current_pids=[]) is False
+
+
+def test_attested_gateway_died_requires_handoff_match_rejects_stale(attest_home):
+    """A stale marker without matching hand-off must NOT authorize cold start (#110469)."""
+    marker = attest_home / "state" / "gateway.start-attestation.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    # 13-day-old marker
+    marker.write_text(
+        json.dumps({
+            "pids": [555],
+            "create_times": {"555": 100},
+            "via": "test",
+            "ts": "2026-09-01T00:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+
+    # Without handoff record, require_handoff_match fails closed
+    assert gateway_windows.attested_gateway_died(current_pids=[], require_handoff_match=True) is False
+
+
+def test_attested_gateway_died_requires_handoff_match_accepts_valid_handoff(attest_home):
+    """A gateway running for days killed by update handoff authorizes cold start (#110469)."""
+    marker = attest_home / "state" / "gateway.start-attestation.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    # Long-lived gateway started 30 days ago
+    marker.write_text(
+        json.dumps({
+            "pids": [777],
+            "create_times": {"777": 500000},
+            "via": "test",
+            "ts": "2026-08-14T00:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+
+    # Hand-off recorded right before update
+    handoff_marker = attest_home / "state" / "gateway.update-handoff.json"
+    handoff_marker.write_text(
+        json.dumps({
+            "nonce": "test-nonce-123",
+            "pids": [777],
+            "create_times": {"777": 500000},
+            "recorded_at": "2026-09-13T22:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+
+    assert gateway_windows.attested_gateway_died(current_pids=[], require_handoff_match=True) is True

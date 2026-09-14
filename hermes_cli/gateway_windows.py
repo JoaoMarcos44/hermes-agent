@@ -863,18 +863,74 @@ def _wait_for_gateway_ready(
 # ---------------------------------------------------------------------------
 
 _START_ATTESTATION_RELATIVE = ("state", "gateway.start-attestation.json")
+_UPDATE_HANDOFF_RELATIVE = ("state", "gateway.update-handoff.json")
 
 
 def _start_attestation_path() -> Path:
     return _hermes_home().joinpath(*_START_ATTESTATION_RELATIVE)
 
 
-def _write_start_attestation(pids: list[int], via: str) -> None:
-    """Persist the PIDs a ✓ vouched for. Best-effort, never raises."""
+def _update_handoff_path() -> Path:
+    return _hermes_home().joinpath(*_UPDATE_HANDOFF_RELATIVE)
+
+
+def _read_start_attestation() -> dict | None:
+    """Read and validate the start attestation marker.
+
+    Fail-closed: returns None for missing, unreadable, non-dict, or malformed
+    payloads (e.g. non-list pids, non-int items, boolean items, or invalid create_times).
+    Never raises.
+    """
     try:
         path = _start_attestation_path()
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        raw_pids = data.get("pids")
+        if not isinstance(raw_pids, list) or not raw_pids:
+            return None
+        pids: list[int] = []
+        for p in raw_pids:
+            if isinstance(p, bool) or not isinstance(p, int) or p <= 0:
+                return None
+            pids.append(p)
+        cts = data.get("create_times")
+        if cts is not None and not isinstance(cts, dict):
+            return None
+        return {
+            "pids": pids,
+            "create_times": cts if isinstance(cts, dict) else {},
+            "via": str(data.get("via") or ""),
+            "ts": str(data.get("ts") or ""),
+            "handoff_nonce": data.get("handoff_nonce"),
+        }
+    except Exception:
+        return None
+
+
+def _write_start_attestation(pids: list[int], via: str, handoff_nonce: str | None = None) -> None:
+    """Persist the PIDs a ✓ vouched for with their creation timestamps. Best-effort, never raises."""
+    try:
+        from gateway.status import get_process_start_time
+
+        path = _start_attestation_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"pids": [int(p) for p in pids], "via": via, "ts": datetime.now(timezone.utc).isoformat()}
+        int_pids = [int(p) for p in pids if not isinstance(p, bool)]
+        create_times: dict[str, int] = {}
+        for p in int_pids:
+            ct = get_process_start_time(p)
+            if ct is not None:
+                create_times[str(p)] = int(ct)
+        payload = {
+            "pids": int_pids,
+            "create_times": create_times,
+            "via": via,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        if handoff_nonce is not None:
+            payload["handoff_nonce"] = str(handoff_nonce)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(path)
@@ -889,28 +945,199 @@ def _clear_start_attestation() -> None:
         pass
 
 
-def _attested_pid_exited_cleanly(pid: int) -> bool:
-    """True when the lifecycle ledger shows a clean exit for ``pid``."""
+def record_update_handoff(
+    pids: list[int] | None = None,
+    nonce: str | None = None,
+) -> dict | None:
+    """Record live gateway PIDs and their create_times at the moment of update hand-off.
+
+    Called by Desktop hand-off or CLI before stopping/handing off to update.
+    Never raises; returns the persisted hand-off dictionary or None on error.
+    """
+    try:
+        import uuid
+        from gateway.status import get_process_start_time
+
+        if pids is None:
+            from hermes_cli.gateway import find_gateway_pids
+
+            pids = list(find_gateway_pids())
+        if not pids:
+            return None
+        hand_pids = [int(p) for p in pids if not isinstance(p, bool) and int(p) > 0]
+        if not hand_pids:
+            return None
+        create_times: dict[str, int] = {}
+        for p in hand_pids:
+            ct = get_process_start_time(p)
+            if ct is not None:
+                create_times[str(p)] = int(ct)
+        if not create_times:
+            return None
+        path = _update_handoff_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        nonce_val = str(nonce or uuid.uuid4().hex[:16])
+        payload = {
+            "nonce": nonce_val,
+            "pids": hand_pids,
+            "create_times": create_times,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+        return payload
+    except Exception:
+        logger.debug("Failed to record gateway update handoff", exc_info=True)
+        return None
+
+
+def _read_update_handoff() -> dict | None:
+    """Read and validate the update hand-off marker. Fail closed, never raises."""
+    try:
+        path = _update_handoff_path()
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        raw_pids = data.get("pids")
+        if not isinstance(raw_pids, list) or not raw_pids:
+            return None
+        pids: list[int] = []
+        for p in raw_pids:
+            if isinstance(p, bool) or not isinstance(p, int) or p <= 0:
+                return None
+            pids.append(p)
+        cts = data.get("create_times")
+        if not isinstance(cts, dict) or not cts:
+            return None
+        return {
+            "nonce": str(data.get("nonce") or ""),
+            "pids": pids,
+            "create_times": cts,
+            "recorded_at": str(data.get("recorded_at") or ""),
+        }
+    except Exception:
+        return None
+
+
+def _clear_update_handoff() -> None:
+    try:
+        _update_handoff_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _attested_pid_exited_cleanly(pid: int, expected_create_time: int | float | None = None) -> bool:
+    """True when the lifecycle ledger shows a clean exit for ``pid`` matching ``expected_create_time``."""
     try:
         from gateway.lifecycle_ledger import get_lifecycle_sentinel_path
 
         data = json.loads(get_lifecycle_sentinel_path(_hermes_home()).read_text(encoding="utf-8"))
     except Exception:
         return False
-    return isinstance(data, dict) and data.get("phase") == "exited" and data.get("pid") == pid
+    if not isinstance(data, dict) or data.get("phase") != "exited" or data.get("pid") != pid:
+        return False
+    # When expected_create_time is specified, guard against PID reuse
+    if expected_create_time is not None:
+        ledger_ct = data.get("create_time")
+        if ledger_ct is None:
+            ledger_ct = data.get("start_time")
+        if ledger_ct is None:
+            # Clean exit record lacks process identity to disambiguate: fail closed
+            return False
+        try:
+            diff = abs(float(ledger_ct) - float(expected_create_time))
+            tolerance = 200.0 if float(expected_create_time) > 1e6 else 2.0
+            if diff > tolerance:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def attested_gateway_died(
+    current_pids: list[int] | None = None,
+    *,
+    require_handoff_match: bool = False,
+) -> bool:
+    """Read-only probe: True when an attested gateway process provably died without clean exit.
+
+    Never modifies or consumes the attestation or hand-off markers.
+    Fail-closed: any parse failure, missing identity, or ambiguous state returns False.
+
+    When ``require_handoff_match`` is True:
+        Enforces that the dead gateway matches a verified Desktop update handoff
+        record (``gateway.update-handoff.json``). A stale crash marker from days
+        earlier has no matching hand-off record and returns False, preserving
+        Desktop lifecycle refusal (#76129). A long-lived gateway that ran for
+        days and died as part of the current handoff returns True.
+    """
+    data = _read_start_attestation()
+    if not data:
+        return False
+    attested_pids = data["pids"]
+    create_times = data["create_times"]
+
+    # Every attested PID must have a verifiable create_time; otherwise fail closed.
+    if not create_times or any(str(p) not in create_times for p in attested_pids):
+        return False
+
+    if current_pids is None:
+        try:
+            from hermes_cli.gateway import find_gateway_pids
+
+            current_pids = list(find_gateway_pids())
+        except Exception:
+            return False
+
+    # If any attested process is currently alive, it has not died.
+    if current_pids:
+        cur_set = set(current_pids)
+        if any(p in cur_set for p in attested_pids):
+            return False
+
+    # If any attested process exited cleanly in the lifecycle ledger, it was a planned stop.
+    if any(
+        _attested_pid_exited_cleanly(p, create_times.get(str(p)))
+        for p in attested_pids
+    ):
+        return False
+
+    # If scoped to Desktop update hand-off: verify matching hand-off record
+    if require_handoff_match:
+        handoff = _read_update_handoff()
+        if not handoff:
+            return False
+        handoff_pids = handoff["pids"]
+        handoff_cts = handoff["create_times"]
+        matched = False
+        for p in attested_pids:
+            if p in handoff_pids and str(p) in handoff_cts:
+                try:
+                    diff = abs(float(create_times[str(p)]) - float(handoff_cts[str(p)]))
+                    tolerance = 200.0 if float(create_times[str(p)]) > 1e6 else 2.0
+                    if diff <= tolerance:
+                        matched = True
+                        break
+                except (TypeError, ValueError):
+                    pass
+        if not matched:
+            return False
+
+    return True
 
 
 def check_start_attestation(current_pids: list[int] | None = None) -> str | None:
     """Surface (once) a gateway that died after a ✓ was printed for it. Never raises. Gateway running
     or a clean-exit ledger record: clear silently; otherwise return a warning and consume the marker."""
-    try:
-        data = json.loads(_start_attestation_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    attested = [p for p in data.get("pids", []) if isinstance(p, int)] if isinstance(data, dict) else []
-    if not attested:
+    data = _read_start_attestation()
+    if not data:
         _clear_start_attestation()
         return None
+    attested = data["pids"]
+    create_times = data["create_times"]
 
     if current_pids is None:
         try:
@@ -921,7 +1148,7 @@ def check_start_attestation(current_pids: list[int] | None = None) -> str | None
             return None
 
     _clear_start_attestation()
-    if current_pids or any(_attested_pid_exited_cleanly(pid) for pid in attested):
+    if current_pids or any(_attested_pid_exited_cleanly(pid, create_times.get(str(pid))) for pid in attested):
         return None
 
     via = data.get("via") or "direct spawn"
