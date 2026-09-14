@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from hermes_constants import _get_platform_default_hermes_home
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -61,6 +63,68 @@ _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
 
 
+def _path_is_within(path: Path, parent: Path) -> bool:
+    """Return whether *path* is *parent* or one of its descendants."""
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+_OPERATOR_USER_HOME = Path.home().expanduser().resolve()
+_OPERATOR_PLATFORM_HOME = Path(_get_platform_default_hermes_home()).expanduser().resolve()
+
+
+def _make_test_home(prefix: str) -> Path:
+    """Create a temporary test home outside the operator's platform home."""
+    parents = (_OPERATOR_USER_HOME, PROJECT_ROOT, Path(tempfile.gettempdir()))
+    for parent in parents:
+        try:
+            parent = parent.resolve()
+        except OSError:
+            continue
+        if _path_is_within(parent, _OPERATOR_PLATFORM_HOME):
+            continue
+        try:
+            candidate = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent))).resolve()
+        except OSError:
+            continue
+        if not _path_is_within(candidate, _OPERATOR_PLATFORM_HOME):
+            return candidate
+        shutil.rmtree(candidate, ignore_errors=True)
+    raise RuntimeError(
+        "could not create a test home outside the operator's platform-native Hermes home"
+    )
+
+
+def pytest_sessionstart(session):
+    """Redirect pytest's basetemp when it would be inside the operator home."""
+    config = session.config
+    tmp_path_factory = getattr(config, "_tmp_path_factory", None)
+    requested = getattr(tmp_path_factory, "_given_basetemp", None)
+    if requested is None:
+        requested = getattr(config.option, "basetemp", None)
+    candidate = Path(requested or tempfile.gettempdir()).expanduser()
+    try:
+        candidate = candidate.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            f"could not validate pytest basetemp against {_OPERATOR_PLATFORM_HOME}"
+        ) from exc
+    if _path_is_within(candidate, _OPERATOR_PLATFORM_HOME):
+        if tmp_path_factory is None:
+            raise RuntimeError(
+                "pytest tmp_path factory is unavailable; refusing to use a basetemp "
+                f"inside {_OPERATOR_PLATFORM_HOME}"
+            )
+        safe_basetemp = _make_test_home("pytest-basetemp-")
+        config.option.basetemp = str(safe_basetemp)
+        # pytest constructs this factory before loading local conftest hooks, so
+        # changing config.option.basetemp alone is too late for tmp_path.
+        tmp_path_factory._given_basetemp = safe_basetemp
+
+
 def _hermes_home_points_at_production(value: str) -> bool:
     """True when a pre-set HERMES_HOME resolves to the real production root.
 
@@ -78,17 +142,13 @@ def _hermes_home_points_at_production(value: str) -> bool:
         return True
     try:
         resolved = Path(value).expanduser().resolve()
-        real_root = (Path.home() / ".hermes").resolve()
-    except Exception:
+    except (OSError, RuntimeError, ValueError):
         return True
-    if resolved == real_root:
-        return True
-    # Profile home directly under the production root: <root>/profiles/<name>
-    return resolved.parent.name == "profiles" and resolved.parent.parent == real_root
+    return _path_is_within(resolved, _OPERATOR_PLATFORM_HOME)
 
 
 if _hermes_home_points_at_production(os.environ.get("HERMES_HOME", "")):
-    _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
+    _SESSION_HERMES_HOME = str(_make_test_home("hermes-test-home-"))
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
