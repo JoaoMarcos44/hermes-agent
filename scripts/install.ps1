@@ -771,6 +771,42 @@ function Install-Uv {
         return $null
     }
 
+    function Resolve-ExecutableTarget($ExePath) {
+        if (-not $ExePath -or -not (Test-Path $ExePath)) { return $null }
+
+        # 1. Chocolatey: shim at chocolatey\bin\uv.exe redirects to
+        # chocolatey\lib\uv\tools\uv.exe. Copying the 390KB shim breaks
+        # outside of Chocolatey's tree; resolving the underlying real
+        # executable (~68MB) lets the salvage succeed.
+        $parent = Split-Path $ExePath -Parent
+        $grandparent = Split-Path $parent -Parent
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($ExePath)
+        $chocoTarget = Join-Path $grandparent "lib\$name\tools\$name.exe"
+        if (Test-Path $chocoTarget) { return $chocoTarget }
+
+        # 2. Scoop: companion .shim file contains `path = "..."` pointing
+        # to the real unpacked binary under apps\<pkg>\current.
+        $scoopShim = [System.IO.Path]::ChangeExtension($ExePath, ".shim")
+        if (Test-Path $scoopShim) {
+            $shimContent = Get-Content $scoopShim -Raw -ErrorAction SilentlyContinue
+            if ($shimContent -and $shimContent -match 'path\s*=\s*"?([^"\r\n]+)"?') {
+                $scoopTarget = $matches[1].Trim()
+                if (Test-Path $scoopTarget) { return $scoopTarget }
+            }
+        }
+
+        # 3. Windows symlink / reparse point: resolve underlying target.
+        try {
+            $item = Get-Item $ExePath -ErrorAction SilentlyContinue
+            if ($item.LinkType -and $item.Target) {
+                $target = if ($item.Target -is [array]) { $item.Target[0] } else { $item.Target }
+                if (Test-Path $target) { return $target }
+            }
+        } catch {}
+
+        return $ExePath
+    }
+
     if (Test-Path $managedUv) {
         $version = Get-UsableUvVersion $managedUv
         if ($version) {
@@ -847,6 +883,11 @@ function Install-Uv {
                 Select-Object -First 1
             $salvageCandidates = @()
             if ($uvOnPath -and $uvOnPath.Source) {
+                # Resolve package manager shims (Chocolatey, Scoop) to their real target first
+                $resolved = Resolve-ExecutableTarget $uvOnPath.Source
+                if ($resolved -and (Test-Path $resolved)) {
+                    $salvageCandidates += $resolved
+                }
                 $salvageCandidates += $uvOnPath.Source
             }
             $salvageCandidates += (Join-Path $env:USERPROFILE ".local\bin\uv.exe")
