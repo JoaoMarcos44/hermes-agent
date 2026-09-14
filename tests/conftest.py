@@ -72,8 +72,16 @@ def _path_is_within(path: Path, parent: Path) -> bool:
     return True
 
 
-_OPERATOR_USER_HOME = Path.home().expanduser().resolve()
-_OPERATOR_PLATFORM_HOME = Path(_get_platform_default_hermes_home()).expanduser().resolve()
+try:
+    _OPERATOR_USER_HOME = Path.home().expanduser().resolve(strict=False)
+    _OPERATOR_PLATFORM_HOME = Path(
+        _get_platform_default_hermes_home()
+    ).expanduser().resolve(strict=False)
+except (OSError, RuntimeError, ValueError) as exc:
+    raise RuntimeError(
+        "could not capture the platform-native Hermes home before pytest "
+        "fixtures were loaded"
+    ) from exc
 
 
 def _make_test_home(prefix: str) -> Path:
@@ -81,20 +89,25 @@ def _make_test_home(prefix: str) -> Path:
     parents = (_OPERATOR_USER_HOME, PROJECT_ROOT, Path(tempfile.gettempdir()))
     for parent in parents:
         try:
-            parent = parent.resolve()
-        except OSError:
+            parent = parent.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
             continue
         if _path_is_within(parent, _OPERATOR_PLATFORM_HOME):
             continue
+        created = None
         try:
-            candidate = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent))).resolve()
-        except OSError:
+            created = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
+            candidate = created.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            if created is not None:
+                shutil.rmtree(created, ignore_errors=True)
             continue
         if not _path_is_within(candidate, _OPERATOR_PLATFORM_HOME):
             return candidate
-        shutil.rmtree(candidate, ignore_errors=True)
+        shutil.rmtree(created, ignore_errors=True)
     raise RuntimeError(
-        "could not create a test home outside the operator's platform-native Hermes home"
+        "could not create a test home outside the operator's platform-native "
+        f"Hermes home {_OPERATOR_PLATFORM_HOME!s} (prefix={prefix!r})"
     )
 
 
@@ -102,21 +115,35 @@ def pytest_sessionstart(session):
     """Redirect pytest's basetemp when it would be inside the operator home."""
     config = session.config
     tmp_path_factory = getattr(config, "_tmp_path_factory", None)
-    requested = getattr(tmp_path_factory, "_given_basetemp", None)
-    if requested is None:
+    missing = object()
+    factory_basetemp = getattr(tmp_path_factory, "_given_basetemp", missing)
+    requested = factory_basetemp
+    if requested is missing or requested is None:
         requested = getattr(config.option, "basetemp", None)
-    candidate = Path(requested or tempfile.gettempdir()).expanduser()
+    raw_candidate = Path(requested or tempfile.gettempdir()).expanduser()
     try:
-        candidate = candidate.resolve()
+        candidate = raw_candidate.resolve(strict=False)
     except (OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
-            f"could not validate pytest basetemp against {_OPERATOR_PLATFORM_HOME}"
+            f"could not resolve pytest basetemp {raw_candidate!s} with strict=False "
+            f"while checking it against {_OPERATOR_PLATFORM_HOME!s}"
         ) from exc
     if _path_is_within(candidate, _OPERATOR_PLATFORM_HOME):
         if tmp_path_factory is None:
             raise RuntimeError(
-                "pytest tmp_path factory is unavailable; refusing to use a basetemp "
-                f"inside {_OPERATOR_PLATFORM_HOME}"
+                "pytest TempPathFactory is unavailable; refusing basetemp "
+                f"{candidate!s} inside {_OPERATOR_PLATFORM_HOME!s}"
+            )
+        if factory_basetemp is missing:
+            raise RuntimeError(
+                "pytest TempPathFactory lacks _given_basetemp; refusing basetemp "
+                f"{candidate!s} inside {_OPERATOR_PLATFORM_HOME!s}"
+            )
+        materialized = getattr(tmp_path_factory, "_basetemp", None)
+        if materialized is not None:
+            raise RuntimeError(
+                "pytest TempPathFactory already materialized unsafe basetemp "
+                f"{materialized!s} inside {_OPERATOR_PLATFORM_HOME!s}"
             )
         safe_basetemp = _make_test_home("pytest-basetemp-")
         config.option.basetemp = str(safe_basetemp)
@@ -141,7 +168,7 @@ def _hermes_home_points_at_production(value: str) -> bool:
     if not value:
         return True
     try:
-        resolved = Path(value).expanduser().resolve()
+        resolved = Path(value).expanduser().resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         return True
     return _path_is_within(resolved, _OPERATOR_PLATFORM_HOME)
