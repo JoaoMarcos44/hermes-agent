@@ -1107,9 +1107,21 @@ class MoAChatCompletions:
                 stream_kwargs["timeout"] = api_kwargs["timeout"]
         # Pop the runtime's extra_body so the explicit kwarg never collides with **agg_runtime.
         agg_extra_body = _merge_slot_extra_body(agg_runtime.pop("extra_body", None), api_kwargs.get("extra_body"))
+        request_kwargs = {"extra_body": agg_extra_body}
+        # Reuse the transport's canonical identity: only the stable leading system/developer
+        # prefix plus tools and conversation scope participate, never guidance or tool transcript.
+        from agent.transports.chat_completions import _add_prompt_cache_key
+        _add_prompt_cache_key(
+            request_kwargs, messages=agg_messages, tools=tools,
+            supports_prompt_cache_key=bool(
+                agg_runtime.get("supports_prompt_cache_key")
+                or (agg_runtime.get("provider") or "").lower() in {"openai", "nous"}
+            ),
+            session_id=getattr(self, "session_id", None),
+        )
         agg_response = call_llm(
             task="moa_aggregator", messages=agg_messages, temperature=prepared["aggregator_temperature"],
-            max_tokens=api_kwargs.get("max_tokens"), tools=tools, extra_body=agg_extra_body,
+            max_tokens=api_kwargs.get("max_tokens"), tools=tools, **request_kwargs,
             reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
             **stream_kwargs, **agg_runtime,
         )
