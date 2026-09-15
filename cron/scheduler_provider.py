@@ -71,14 +71,16 @@ def _profile_entry(entry) -> tuple:
 
 
 def _existing_profile_homes(profile_homes: list) -> list:
-    """Drop homes no longer on disk: ticking/heartbeating a deleted home would recreate its
-    ``cron/`` workspace and silently resurrect the profile.
+    """Drop homes no longer on disk or tombstoned: ticking/heartbeating a deleted home would
+    recreate its ``cron/`` workspace and silently resurrect the profile.
 
     Ticking or heartbeating a deleted home recreates its ``cron/`` workspace (``record_ticker_heartbeat`` ->
     ``ensure_dirs`` -> ``mkdir(parents=True)``) on every 60s cycle, so the "deleted" profile silently comes
     back on disk and in ``hermes profile list`` (#47368). Filtering on directory existence leaves a deleted
     profile's home untouched, which is the correct invariant: a home that does not exist cannot hold jobs to
-    fire.
+    fire. A tombstoned home whose directory still exists (Windows handles, a stale
+    static list) is also dropped — its scheduled jobs must not fire and its tick must
+    not churn state.db -> sessions.changed forever (#111338).
     """
     if callable(profile_homes):
         # Live enumerator (multiplex gateway): a profile created after startup is ticked without a
@@ -88,7 +90,23 @@ def _existing_profile_homes(profile_homes: list) -> list:
         except Exception:
             logger.warning("cron profile enumeration failed; skipping this cycle", exc_info=True)
             return []
-    return [entry for entry in profile_homes if Path(_profile_entry(entry)[1]).is_dir()]
+    filtered: list = []
+    for entry in profile_homes:
+        _, home = _profile_entry(entry)
+        try:
+            p = Path(home)
+            if not p.is_dir():
+                continue
+            try:
+                from hermes_constants import named_profile_is_deleted
+                if named_profile_is_deleted(p):
+                    continue
+            except Exception:
+                pass
+            filtered.append(entry)
+        except Exception:
+            continue
+    return filtered
 
 
 @contextlib.contextmanager

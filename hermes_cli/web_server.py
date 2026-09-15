@@ -101,11 +101,17 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
                 _check_gateway_running, _served_by_running_multiplexer, profiles_to_serve)
 
             # Same served set as the multiplexer: default + every live profile under profiles/.
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if profile_homes:
+            # A callable re-enumerates every tick so profile create/delete is reflected
+            # without an app restart; a static snapshot would keep ticking a deleted
+            # profile's store and churn state.db → sessions.changed forever (#111338).
+            def _desktop_profile_homes():  # type: ignore[no-untyped-def]
+                return list(profiles_to_serve(multiplex=True))
+
+            initial = _desktop_profile_homes()
+            if initial:
                 # Even one profile needs the per-tick gateway gate; otherwise
                 # Desktop races its dedicated gateway for the same cron store.
-                start_kwargs["profile_homes"] = profile_homes
+                start_kwargs["profile_homes"] = _desktop_profile_homes
                 # Stand down, per tick, for a profile already owned by a gateway — its OWN
                 # process, or the live default multiplexer (a served satellite has no gateway.pid
                 # of its own). That gateway ticks with live adapters; winning the tick-lock race
@@ -115,11 +121,11 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
                     or (name != "default" and _served_by_running_multiplexer(name)))
                 from hermes_logging import enable_profile_log_routing
 
-                enable_profile_log_routing(profile_homes)
+                enable_profile_log_routing(initial)
                 _log.info(
                     "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
-                    [name for name, _home in profile_homes],
+                    len(initial),
+                    [name for name, _home in initial],
                 )
         except Exception:
             # Fail open to the single-store ticker so the active profile keeps firing.

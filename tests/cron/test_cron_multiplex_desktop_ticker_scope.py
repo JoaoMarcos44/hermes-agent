@@ -138,7 +138,10 @@ def test_desktop_ticker_gates_on_profile_gateway_running(tmp_path, monkeypatch, 
 
     web_server._start_desktop_cron_ticker(threading.Event(), interval=0)
 
-    assert captured.get("profile_homes") == homes
+    ph = captured.get("profile_homes")
+    if callable(ph):
+        ph = ph()
+    assert ph == homes
     gate = captured.get("profile_gate")
     assert gate is not None, "desktop ticker did not install a profile gate"
     for name, home in homes:

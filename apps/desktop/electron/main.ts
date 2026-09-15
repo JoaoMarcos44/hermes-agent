@@ -1576,14 +1576,50 @@ function assertNotPassiveSpawn(passive: boolean, poolKey: string): void {
 // Land a spawn failure in desktop.log. A background slot-wait timeout is
 // routine under a saturated pool (the next hydration pass retries), so it is
 // logged as such instead of as a backend-start failure.
+const backgroundSlotBackoff = new Map<string, { failures: number; nextAllowedAt: number }>()
+const BACKGROUND_SLOT_BACKOFF_BASE_MS = 60_000
+const BACKGROUND_SLOT_BACKOFF_MAX_MS = 5 * 60_000
+
+function backgroundSlotBackoffDelay(failures: number): number {
+  return Math.min(BACKGROUND_SLOT_BACKOFF_BASE_MS * 2 ** Math.max(0, failures - 1), BACKGROUND_SLOT_BACKOFF_MAX_MS)
+}
+
+function shouldBackoffBackgroundSlot(poolKey: string): boolean {
+  const state = backgroundSlotBackoff.get(poolKey)
+  return Boolean(state && Date.now() < state.nextAllowedAt)
+}
+
+function recordBackgroundSlotSuccess(poolKey: string): void {
+  backgroundSlotBackoff.delete(poolKey)
+}
+
+function recordBackgroundSlotFailure(poolKey: string): number {
+  const prev = backgroundSlotBackoff.get(poolKey)
+  const failures = (prev?.failures ?? 0) + 1
+  const delay = backgroundSlotBackoffDelay(failures)
+  backgroundSlotBackoff.set(poolKey, { failures, nextAllowedAt: Date.now() + delay })
+  return delay
+}
+
+function failuresForLog(poolKey: string): number {
+  return backgroundSlotBackoff.get(poolKey)?.failures ?? 1
+}
+
 function logPoolSpawnFailure(label: string, error: unknown): void {
   if (isBackgroundSlotWaitTimeout(error)) {
-    rememberLog(`Profile backend ${label} slot wait timed out (background); will retry on the next hydration`)
-  } else {
+    if ((error as any)?._isBackoffFastFail) {
+      return
+    }
+    const poolKey = String(label ?? '').replace(/^"|"$/g, '').trim() || String(label)
+    const delay = recordBackgroundSlotFailure(poolKey)
     rememberLog(
-      `Hermes backend for profile ${label} failed to start: ${error instanceof Error ? error.message : String(error)}`
+      `Profile backend ${label} slot wait timed out (background); backing off for ${Math.round(delay / 1000)}s before the next hydration (failure #${failuresForLog(poolKey)})`
     )
+    return
   }
+  rememberLog(
+    `Hermes backend for profile ${label} failed to start: ${error instanceof Error ? error.message : String(error)}`
+  )
 }
 
 // Apply foreground intent to the dial claim for `scopeKey`: an entry already
@@ -1624,6 +1660,7 @@ function setPoolLimits(raw) {
   poolLimits = clampPoolLimits(raw)
   persistPoolLimits(poolLimits)
   localBackendSpawnCoordinator.setLimit(poolLimits.maxBackends)
+  backgroundSlotBackoff.clear()
   void evictLruPoolBackends(poolMaxBackends())
   startPoolIdleReaper()
 
@@ -12502,6 +12539,12 @@ async function runPoolBackendStart(profile, entry, opts: { forceLocal?: boolean;
 
   assertPoolEntryStillOwned(poolKey, entry)
 
+  if (spawnPriority === 'background' && shouldBackoffBackgroundSlot(poolKey)) {
+    const err = new LocalBackendSlotWaitTimeoutError(poolKey, 'background')
+    ;(err as any)._isBackoffFastFail = true
+    throw err
+  }
+
   const spawnRequest = localBackendSpawnCoordinator.request(poolKey, {
     timeoutMs: POOL_SLOT_WAIT_MS,
     priority: spawnPriority
@@ -12521,6 +12564,7 @@ async function runPoolBackendStart(profile, entry, opts: { forceLocal?: boolean;
 
   try {
     entry.releaseLocalBackendSlot = await spawnRequest.acquired
+    recordBackgroundSlotSuccess(poolKey)
   } finally {
     localBackendLifecycle.signal.removeEventListener('abort', cancelRequest)
   }
