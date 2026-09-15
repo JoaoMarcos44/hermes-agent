@@ -42,12 +42,18 @@ def _logical_tool_id(msg: Dict[str, Any]) -> str | None:
     return None
 
 
-def _adoption_key(msg: Dict[str, Any], encode_content_fn: Callable[[Any], Any]) -> Tuple[Any, ...]:
-    role = msg.get("role", "unknown")
-    tool_id = _logical_tool_id(msg)
-    if tool_id is not None:
-        return ("tc", role, tool_id)
-    return ("body", role, msg.get("timestamp"), encode_content_fn(msg.get("content")))
+def _adoption_key(msg: Dict[str, Any], encode_content_fn: Callable[[Any], Any]) -> Tuple[Any, ...] | None:
+    """Identity safe for same-batch collapse; absent timestamps are not durable identity."""
+    timestamp = msg.get("timestamp")
+    if timestamp is None:
+        return None
+    return (
+        "body",
+        msg.get("role", "unknown"),
+        timestamp,
+        encode_content_fn(msg.get("content")),
+        _logical_tool_id(msg),
+    )
 
 
 def _encode_tool_calls_column(tool_calls: Any) -> Optional[str]:
@@ -90,15 +96,17 @@ def resolve_and_repair_transcript_batch(
         key = _adoption_key(msg, encode_content_fn)
         if target_row is not None and int(target_row["id"]) in seen_row_ids:
             continue
-        if target_row is None and key in seen_keys:
+        if target_row is None and key is not None and key in seen_keys:
             continue
         if target_row is None:
             inserted_rows.append(msg)
-            seen_keys.add(key)
+            if key is not None:
+                seen_keys.add(key)
             continue
         target_id = int(target_row["id"])
         seen_row_ids.add(target_id)
-        seen_keys.add(key)
+        if key is not None:
+            seen_keys.add(key)
         msg["_row_id"] = target_id
         decoded = decode_content_fn(target_row["content"])
         if msg.get("_repair_mutated"):
@@ -145,13 +153,21 @@ def _lookup_active_target(
             ).fetchone()
             if row is not None:
                 return row
+    timestamp = msg.get("timestamp")
+    if timestamp is None:
+        return None
     tool_id = _logical_tool_id(msg)
     if tool_id is not None:
+        if role == "assistant":
+            identity = "(json_extract(tool_calls, '$[0].id') = ? OR tool_call_id = ?)"
+            params = (session_id, role, timestamp, encode_content_fn(msg.get("content")), tool_id, tool_id)
+        else:
+            identity = "tool_call_id = ?"
+            params = (session_id, role, timestamp, encode_content_fn(msg.get("content")), tool_id)
         return conn.execute(
             "SELECT id, role, active, timestamp, content, tool_calls, tool_call_id FROM messages "
-            "WHERE session_id = ? AND active = 1 AND role = ? AND tool_call_id = ? "
-            "ORDER BY id LIMIT 1",
-            (session_id, role, tool_id),
+            f"WHERE session_id = ? AND active = 1 AND role = ? AND timestamp IS ? AND content IS ? AND {identity} "
+            "ORDER BY id LIMIT 1", params,
         ).fetchone()
     return conn.execute(
         "SELECT id, role, active, timestamp, content, tool_calls, tool_call_id FROM messages "
