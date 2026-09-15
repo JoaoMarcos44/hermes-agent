@@ -69,11 +69,11 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
         st = path.stat()
     except OSError:
         return None  # absent
-    key = (st.st_mtime_ns, st.st_size)
+    key = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
     path_key = str(path)
     with _CACHE_LOCK:
         hit = cache.get(path_key)
-        if hit is not None and hit[:2] == key:
+        if hit is not None and hit[:4] == key:
             return copy.deepcopy(hit[2])
     try:
         parsed = parse(path)

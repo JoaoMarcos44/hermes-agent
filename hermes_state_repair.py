@@ -387,7 +387,10 @@ def _persistent_repair_attempts_exhausted(db_path: Path) -> bool:
             isinstance(recorded, str) and recorded.startswith(f"{db_path.stat().st_size}:"))
     except OSError:
         return False
-    return same and int(ledger.get("failed_attempts", 0)) >= _MAX_PERSISTENT_REPAIR_ATTEMPTS
+    try:
+        return same and int(ledger.get("failed_attempts", 0)) >= _MAX_PERSISTENT_REPAIR_ATTEMPTS
+    except (TypeError, ValueError):
+        return False
 
 
 def _persistent_repair_exhausted_error(db_path: Path) -> str:

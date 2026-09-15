@@ -952,7 +952,7 @@ class SessionDB(
                         # Say what actually happened, not disk/permission damage.
                         raise sqlite3.OperationalError(
                             f"database is locked (another Hermes process held the "
-                            f"state.db write lock for over {patience_s:.0f}s — "
+                            f"state.db write lock for over {patience_s:g}s — "
                             "likely a long maintenance operation such as VACUUM, "
                             "a large WAL checkpoint, or an older pre-update "
                             "process; the database itself is healthy)"

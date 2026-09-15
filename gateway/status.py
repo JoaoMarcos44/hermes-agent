@@ -540,7 +540,7 @@ def _file_cache_signature(path: Path) -> tuple[bool, Optional[int], Optional[int
         st = path.stat()
     except OSError:
         return (False, None, None)
-    return (True, st.st_mtime_ns, st.st_size)
+    return (True, st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
 
 
 def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:

@@ -70,6 +70,19 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
     )
     if row_bits:
         lines.append(("info", ", ".join(row_bits), ""))
+
+    if (
+        holders is not None
+        and holders > 1
+        and str(stats.get("journal_mode") or "").lower() == "wal"
+    ):
+        lines.append((
+            "warn",
+            f"multiple processes hold this WAL DB (holders={holders})",
+            "(prefer one writer process, or set database.journal_mode: delete "
+            "after stopping all openers — see website/docs/developer-guide/state-db-recovery.md)",
+        ))
+
     fts = stats.get("fts_tables")
     if fts:
         present = [t for t, ok in fts.items() if ok]
@@ -149,10 +162,14 @@ def _check_directory_structure(should_fix: bool, f: Finding) -> None:
 
 
 def _session_count(state_db_path: Path):
-    import sqlite3
-    # mode=ro: doctor is a reader; a writable open of a gateway-held WAL DB is the second-writer class (#103339).
-    # as_uri() percent-encodes '?' / '#' in the home path; a raw f-string URI truncates there.
-    conn = sqlite3.connect(Path(state_db_path).resolve().as_uri() + "?mode=ro", uri=True)
+    from hermes_state_dbfile import _connect_tracked_db
+
+    conn = _connect_tracked_db(
+        Path(state_db_path).resolve().as_uri() + "?mode=ro",
+        tracking_path=Path(state_db_path),
+        uri=True,
+        timeout=2.0,
+    )
     try:
         return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     finally:
@@ -278,9 +295,24 @@ def _state_db_wal(f: Finding, should_fix: bool, state_db_path: Path) -> None:
                     check_warn("WAL checkpoint skipped: could not take exclusive ownership of state.db",
                                f"({guard_error}; stop the profile's gateway and re-run 'hermes doctor --fix')")
                     return f.issues.append(_SKIP)
-                guard.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            check_ok(f"WAL checkpoint performed ({size // 1024}K → {wal_size() // 1024}K)")
+                row = guard.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            busy, log, checkpointed = (row or (None, None, None))
+            new_size = wal_size()
+            if busy:
+                check_warn(
+                    f"WAL PASSIVE checkpoint busy (busy={busy}, log={log}, checkpointed={checkpointed})",
+                    "(stop gateway/other holders, then retry or run 'hermes sessions optimize' offline)",
+                )
+                return f.issues.append(
+                    "WAL checkpoint could not complete while writers held the DB — stop the profile's gateway first"
+                )
+            check_ok(f"WAL checkpoint performed ({size // 1024}K → {new_size // 1024}K; log={log}, checkpointed={checkpointed})")
             f.fixed += 1
+            if new_size > 50 * 1024 * 1024:
+                check_info(
+                    "WAL still large after PASSIVE — PASSIVE does not TRUNCATE; reclaim offline (sessions optimize) "
+                    "or rely on journal_size_limit (~64 MiB)"
+                )
         elif size > 10 * 1024 * 1024:  # 10 MB
             check_info(f"WAL file is {size // (1024*1024)} MB (normal for active sessions)")
 

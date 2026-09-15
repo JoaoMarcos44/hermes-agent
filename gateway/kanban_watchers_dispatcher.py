@@ -147,7 +147,7 @@ class _KanbanDispatcher:
             stat = path.stat()
         except OSError:
             return (resolved, None, None)
-        return (resolved, stat.st_mtime_ns, stat.st_size)
+        return (resolved, stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_ctime_ns)
 
     def is_corrupt_board_db_error(self, exc: Exception) -> bool:
         if isinstance(exc, _kbc().KanbanDbCorruptError):

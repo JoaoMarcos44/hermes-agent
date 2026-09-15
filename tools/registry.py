@@ -114,7 +114,7 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
         abs_path = str(path.resolve())
         try:
             st = path.stat()
-            stat_key = (st.st_mtime_ns, st.st_size)
+            stat_key = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
         except OSError:
             continue
         cached = cache.get(abs_path)
