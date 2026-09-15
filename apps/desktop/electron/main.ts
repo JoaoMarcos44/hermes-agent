@@ -66,6 +66,7 @@ import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { recycleOwnedBackend } from './backend-recycle'
 import { isPidAliveWindows, waitForBackendRelease } from './backend-release-gate'
 import { createBackendServeSupportResolver } from './backend-serve-support'
+import { sessionProfileSpawnSpec } from './session-profile-spawn'
 import {
   isHostKeyChangedBootFailure,
   isRetryableRemoteBootFailure,
@@ -12957,18 +12958,9 @@ async function runHermesStart() {
     }
 
     const token = crypto.randomBytes(32).toString('base64url')
+    const spawnSpec = sessionProfileSpawnSpec({ selectedProfile: primaryProfile, hermesHome: HERMES_HOME })
+    const backendArgs = [...spawnSpec!.argvProfileFlag, 'serve', '--host', '127.0.0.1', '--port', '0']
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-    const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
-    // Pin the desktop's chosen profile via the global --profile flag. This is
-    // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
 
     const setup = await runPrimaryBackendStartup({
       signal: localBackendLifecycle.signal,
