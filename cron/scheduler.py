@@ -407,6 +407,21 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     return disabled
 
 
+class _CronToolsetResolutionBlocked(RuntimeError):
+    """Raised when platform toolset resolution fails and cron.toolset_resolution_failure=deny."""
+
+def _cron_toolset_resolution_failure_mode(cfg: dict) -> str:
+    """Return 'deny' (fail-closed, default) or 'full' (legacy fail-open)."""
+    cron_cfg = (cfg or {}).get("cron") or {}
+    raw = str(cron_cfg.get("toolset_resolution_failure") or "deny").strip().lower()
+    if raw in ("deny", "fail_closed", "block", "empty", "closed"):
+        return "deny"
+    if raw in ("full", "allow", "fail_open", "open", "all"):
+        return "full"
+    logger.warning("Unknown cron.toolset_resolution_failure=%r; failing closed (deny)", raw)
+    return "deny"
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist (else a per-job list
     silently drops every MCP server). Mirrors ``_get_platform_tools``: ``no_mcp`` sentinel -> none
@@ -428,26 +443,49 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Toolset list for a cron job. Precedence: per-job ``enabled_toolsets`` (+ MCP merge) >
     ``cron`` platform config (``_get_platform_tools``, which strips _DEFAULT_OFF_TOOLSETS so fresh
-    installs run without ``moa``) > ``None`` on any failure (full default set).
+    installs run without ``moa``) > ``None`` on failure when cron.toolset_resolution_failure=full,
+    else raises _CronToolsetResolutionBlocked (fail-closed, default).
 
     1. Per-job ``enabled_toolsets`` (set via ``cronjob`` tool on create/update). Keeps the agent's
     job-scoped toolset override intact — #6130. Enabled MCP servers are layered on per
     ``_merge_mcp_into_per_job_toolsets`` so a native-toolset allowlist does not silently strip MCP tools. 2.
     Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``) so users can gate cron toolsets
-    globally without recreating every job. 3. ``None`` on any lookup failure — AIAgent loads the full
-    default set (legacy behavior before this change, preserved as the safety net).
+    globally without recreating every job. 3. On lookup failure: when
+    cron.toolset_resolution_failure is 'full', warn + return None (full default set, legacy
+    fail-open); otherwise raise _CronToolsetResolutionBlocked so the run is blocked with a
+    once-only alert (mirrors cron.preflight).
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        try:
+            return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        except Exception as exc:
+            mode = _cron_toolset_resolution_failure_mode(cfg)
+            if mode == "full":
+                logger.warning(
+                    "Cron toolset resolution failed (per-job MCP merge), falling back to full default toolset: %s",
+                    exc)
+                return None
+            logger.error(
+                "Cron toolset resolution failed for job '%s' — blocking run (fail-closed, cron.toolset_resolution_failure=deny): %s",
+                job.get("id", "?"), exc)
+            raise _CronToolsetResolutionBlocked(
+                f"cron platform toolset resolution failed (fail-closed): {exc}") from exc
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
         return sorted(_get_platform_tools(cfg or {}, "cron"))
     except Exception as exc:
-        logger.warning(
-            "Cron toolset resolution failed, falling back to full default toolset: %s",
-            exc)
-        return None
+        mode = _cron_toolset_resolution_failure_mode(cfg)
+        if mode == "full":
+            logger.warning(
+                "Cron toolset resolution failed, falling back to full default toolset: %s",
+                exc)
+            return None
+        logger.error(
+            "Cron toolset resolution failed for job '%s' — blocking run (fail-closed, cron.toolset_resolution_failure=deny): %s",
+            job.get("id", "?"), exc)
+        raise _CronToolsetResolutionBlocked(
+            f"cron platform toolset resolution failed (fail-closed): {exc}") from exc
 
 
 def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
@@ -2151,11 +2189,16 @@ class _CronAgentSetup:
     reasoning_config: Any = None
     fallback_model: Any = None
     credential_pool: Any = None
+    enabled_toolsets: Optional[List[str]] = None
+    disabled_toolsets: Optional[List[str]] = None
 
 
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
     """Resolve model/runtime/reasoning/pool for the run, in the original gate order: exfil guard ->
-    preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP."""
+    preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP.
+    Toolset resolution is now also fail-closed: a _get_platform_tools failure with
+    cron.toolset_resolution_failure=deny (default) blocks the run with a once-only alert
+    (mirrors preflight) instead of falling back to the full toolset."""
     _cfg = jc.cfg
     setup = _CronAgentSetup(model=jc.model)
     setup.prefill_messages = _load_prefill_messages(_cfg, job_id)
@@ -2174,6 +2217,25 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.blocked = _preflight_or_block(job, job_id, job_name, _cfg)
     if setup.blocked is not None:
         return setup
+
+    # Toolset resolution fail-closed probe BEFORE any LLM/runtime spend: a transient
+    # _get_platform_tools failure must not widen privileges to the full toolset.
+    try:
+        setup.enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+    except _CronToolsetResolutionBlocked as exc:
+        setup.blocked = _blocked_config_result(job_id, job_name, str(exc))
+        return setup
+    except Exception as exc:
+        # Defensive: any unexpected raise from the resolver also blocks when deny.
+        mode = _cron_toolset_resolution_failure_mode(_cfg)
+        if mode == "full":
+            logger.warning("Cron toolset resolution failed (unexpected), falling back to full default toolset: %s", exc)
+            setup.enabled_toolsets = None
+        else:
+            logger.error("Cron toolset resolution failed for job '%s' — blocking run: %s", job_id, exc)
+            setup.blocked = _blocked_config_result(job_id, job_name, f"cron platform toolset resolution failed (fail-closed): {exc}")
+            return setup
+    setup.disabled_toolsets = _resolve_cron_disabled_toolsets(_cfg)
 
     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
     setup.reasoning_config = _resolve_job_reasoning_config(
@@ -2195,6 +2257,20 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
+    # Use toolsets already resolved (and fail-closed) in _resolve_cron_agent_setup when
+    # available; direct callers that bypass setup still resolve here (with the same
+    # fail-closed semantics — a failure then surfaces as an exception from
+    # _resolve_cron_enabled_toolsets and is handled by run_job's failure path).
+    if setup.enabled_toolsets is None and setup.disabled_toolsets is None:
+        # No pre-resolved toolsets (e.g. direct test call) — resolve now. When
+        # the resolver is in deny mode a failure raises _CronToolsetResolutionBlocked
+        # and the agent is never constructed; when in full mode it returns None
+        # (legacy full-toolset fallback) and construction proceeds.
+        enabled = _resolve_cron_enabled_toolsets(job, _cfg)
+        disabled = _resolve_cron_disabled_toolsets(_cfg)
+    else:
+        enabled = setup.enabled_toolsets
+        disabled = setup.disabled_toolsets
     return AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
@@ -2215,8 +2291,8 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         providers_order=pr.get("order"),
         provider_sort=pr.get("sort"),
         openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-        enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-        disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+        enabled_toolsets=enabled,
+        disabled_toolsets=disabled,
         quiet_mode=True,
         # Project context files only with a configured workdir; SOUL.md always.
         skip_context_files=not bool(workdir),

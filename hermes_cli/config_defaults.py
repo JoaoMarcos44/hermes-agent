@@ -1652,6 +1652,12 @@ DEFAULT_CONFIG = {
         # platforms are configured. Failure -> last_status=blocked_config, ONE alert, no LLM call.
         # False = fail during the run instead.
         "preflight": True,
+        # Platform toolset resolution failure mode for unattended cron jobs.
+        # "deny" (default) = fail closed: the run is blocked (last_status=blocked_config,
+        # one alert, no LLM/tool use) so an operator's platform_toolsets.cron gate cannot be
+        # bypassed by a transient config/import error. "full" = legacy fail-open: fall back
+        # to the full default toolset.
+        "toolset_resolution_failure": "deny",
         # Default model for cron jobs (WHAT model runs). Fire-time resolution: per-job pin >
         # cron.model > the job's creation-time snapshot > model.default. An unpinned job keeps
         # running on the model it was created under when model.default later changes; cron.model
