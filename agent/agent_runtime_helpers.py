@@ -426,7 +426,7 @@ def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
     if prev.get("content") != original_content or list(prev.get("tool_calls") or []) != original_calls:
         prev["_repair_mutated"] = True
     dropped_id = msg.get("_row_id")
-    if isinstance(dropped_id, int):
+    if isinstance(dropped_id, int) and not isinstance(dropped_id, bool) and dropped_id > 0:
         prev.setdefault("_archived_row_ids", []).append(dropped_id)
 
 
