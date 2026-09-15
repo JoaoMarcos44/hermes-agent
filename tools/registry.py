@@ -262,7 +262,9 @@ def check_fn_cache_scope() -> Optional[str]:
     browser-control request bypasses this cache AND model_tools' outer definition cache (same
     sentinel) — one Browser session's live tools must not leak into another. Single-profile
     processes keep the process-wide cache; a multiplex gateway installs a Hermes-home override
-    per profile turn, so the canonical profile key is the boundary."""
+    per profile turn, so the canonical profile key is the boundary. An explicit Hermes-home
+    override is also a profile boundary even when the process-wide gateway multiplexer flag is off
+    (dashboard/TUI sessions). Single-profile processes without an override keep the process-wide cache."""
     try:
         from gateway.session_context import get_session_env
         if all(str(get_session_env(k, "") or "").strip() for k in _BROWSER_IDENTITY_KEYS):
@@ -272,10 +274,10 @@ def check_fn_cache_scope() -> Optional[str]:
     try:
         from agent.secret_scope import is_multiplex_active
         from hermes_constants import get_hermes_home_override
-        if not is_multiplex_active():
-            return None
         override = get_hermes_home_override()
-        return str(Path(override).expanduser().resolve()) if override else CHECK_FN_CACHE_BYPASS
+        if override is not None:
+            return hermes_home_key(override)
+        return CHECK_FN_CACHE_BYPASS if is_multiplex_active() else None
     except Exception:
         # Fail closed: bypass both cache layers rather than aliasing requests
         # whose multiplex profile identity could not be resolved.
