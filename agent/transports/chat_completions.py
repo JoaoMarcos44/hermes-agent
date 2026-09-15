@@ -107,7 +107,14 @@ def _add_prompt_cache_key(
         _static_prompt_instructions(messages), tools, _cache_scope_from_session_id(cache_scope_id or session_id),
     )
     if cache_key:
-        api_kwargs["prompt_cache_key"] = cache_key
+        # ``call_llm`` accepts the provider extension container, not arbitrary
+        # request fields. Keep the key in the body so it reaches the wire and
+        # cannot become an unexpected top-level Python argument.
+        extra_body = api_kwargs.get("extra_body")
+        if not isinstance(extra_body, dict):
+            extra_body = {}
+            api_kwargs["extra_body"] = extra_body
+        extra_body["prompt_cache_key"] = cache_key
 
 
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:

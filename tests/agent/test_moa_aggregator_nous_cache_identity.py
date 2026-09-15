@@ -20,8 +20,8 @@ def test_moa_aggregator_reuses_shared_transport_key_across_tool_growth(monkeypat
         "guidance": "volatile advice 2", "aggregator": first["aggregator"], "aggregator_temperature": None}
     client._call_prepared_aggregator(first, {"tools": tools})
     client._call_prepared_aggregator(second, {"tools": tools})
-    assert calls[0]["prompt_cache_key"] == calls[1]["prompt_cache_key"]
-    assert calls[0]["prompt_cache_key"]
+    assert calls[0]["extra_body"]["prompt_cache_key"] == calls[1]["extra_body"]["prompt_cache_key"]
+    assert calls[0]["extra_body"]["prompt_cache_key"]
     assert "prompt_cache_key" not in tools
     assert "prompt_cache_key" not in first
     assert "prompt_cache_key" not in second

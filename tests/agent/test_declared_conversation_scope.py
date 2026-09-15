@@ -359,7 +359,7 @@ class TestPromptCacheKeyStability:
                     _agent(session_id, db, CHAT_KEY)
                 ),
             )
-            return kwargs["prompt_cache_key"]
+            return kwargs["extra_body"]["prompt_cache_key"]
 
         assert key(RUN_1) == key(RUN_2)
 

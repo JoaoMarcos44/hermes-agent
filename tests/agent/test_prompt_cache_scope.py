@@ -329,7 +329,7 @@ class TestTransportWiring:
                 session_id=session_id,
                 cache_scope_id=cache_scope_id,
             )
-            return kwargs.get("prompt_cache_key")
+            return kwargs.get("extra_body", {}).get("prompt_cache_key")
 
         assert key("root-sess", "root-sess") == key("rotated-1", "root-sess")
         assert key("rotated-1") != key("rotated-1", "root-sess")
@@ -538,7 +538,7 @@ class TestPerResponseRunNonceIsolation:
                 supports_prompt_cache_key=True,
                 session_id=session_id,
             )
-            return kwargs.get("prompt_cache_key")
+            return kwargs.get("extra_body", {}).get("prompt_cache_key")
 
         assert chat_key(self.RESPONSE_1) != chat_key(self.RESPONSE_2)
 
