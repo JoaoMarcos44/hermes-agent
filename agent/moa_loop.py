@@ -1106,7 +1106,7 @@ class MoAChatCompletions:
             if api_kwargs.get("timeout") is not None:
                 stream_kwargs["timeout"] = api_kwargs["timeout"]
         # Pop the runtime's extra_body so the explicit kwarg never collides with **agg_runtime.
-        agg_extra_body = _merge_slot_extra_body(agg_runtime.pop("extra_body", None), api_kwargs.get("extra_body"))
+        agg_extra_body = _merge_slot_extra_body(agg_runtime.pop("extra_body", None), api_kwargs.get("extra_body")) or {}
         request_kwargs = {"extra_body": agg_extra_body}
         # Reuse the transport's canonical identity: only the stable leading system/developer
         # prefix plus tools and conversation scope participate, never guidance or tool transcript.
@@ -1119,9 +1119,11 @@ class MoAChatCompletions:
             ),
             session_id=getattr(self, "session_id", None),
         )
+        if "prompt_cache_key" in request_kwargs:
+            agg_extra_body["prompt_cache_key"] = request_kwargs.pop("prompt_cache_key")
         agg_response = call_llm(
             task="moa_aggregator", messages=agg_messages, temperature=prepared["aggregator_temperature"],
-            max_tokens=api_kwargs.get("max_tokens"), tools=tools, **request_kwargs,
+            max_tokens=api_kwargs.get("max_tokens"), tools=tools, extra_body=agg_extra_body,
             reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
             **stream_kwargs, **agg_runtime,
         )
