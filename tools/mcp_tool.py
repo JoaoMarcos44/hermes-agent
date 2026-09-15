@@ -646,11 +646,26 @@ def _mcp_registry_scope() -> Optional[str]:
     flag is off. Keep the flag as the deployment-level guard for ambient
     gateway work, but never collapse an explicitly routed profile back into
     the process-global MCP slot (#111151).
+
+    The dashboard may route the ``default`` profile explicitly (override ==
+    process home). That profile already has the global slot from startup
+    discovery — creating a second scoped slot would duplicate the connection
+    for no isolation benefit. Normalize it back to the global slot only when
+    the multiplexer is off (the multiplexer's own default is intentionally
+    scoped).
     """
-    from hermes_constants import get_hermes_home_override
+    from hermes_constants import get_hermes_home_override, get_process_hermes_home, hermes_home_key
     from agent.secret_scope import is_multiplex_active
-    if get_hermes_home_override() is None and not is_multiplex_active():
+
+    override = get_hermes_home_override()
+    if override is None and not is_multiplex_active():
         return None
+    if override is not None and not is_multiplex_active():
+        try:
+            if hermes_home_key(override) == hermes_home_key(get_process_hermes_home()):
+                return None
+        except Exception:
+            pass
     from tools.registry import registry
     return registry.current_scope_key()
 
