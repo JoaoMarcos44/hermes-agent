@@ -33,25 +33,35 @@ def resolve_and_repair_transcript_batch(
     made of it): a blank row is updated in place; a non-blank one (concurrent winner) has its canonical
     content adopted without overwrite. Returns the messages that must be inserted as fresh rows."""
     inserted_rows: List[Dict[str, Any]] = []
+    seen_ids = set()
     for msg in messages:
-        existing_row_id = msg.get("_row_id") if isinstance(msg, dict) else None
-        target_row = None
-        if isinstance(existing_row_id, int) and msg.get("role", "unknown") == "assistant":
-            target_row = _active_assistant_row(conn, session_id, existing_row_id)
-        if target_row is None:
+        if not isinstance(msg, dict):
             inserted_rows.append(msg)
             continue
-        target_id = int(target_row["id"])
-        decoded = decode_content_fn(target_row["content"])
-        msg["_row_id"] = target_id
-        if is_content_blank(decoded):
-            conn.execute(
-                "UPDATE messages SET content = ? "
-                "WHERE id = ? AND session_id = ? AND active = 1",
-                (encode_content_fn(msg.get("content")), target_id, session_id),
-            )
+        row = None
+        existing_id = msg.get("_row_id")
+        if isinstance(existing_id, int):
+            row = conn.execute("SELECT * FROM messages WHERE session_id = ? AND active = 1 AND id = ?", (session_id, existing_id)).fetchone()
+        tool_id = msg.get("tool_call_id")
+        if row is None and isinstance(tool_id, str) and tool_id:
+            row = conn.execute("SELECT * FROM messages WHERE session_id = ? AND active = 1 AND role = ? AND tool_call_id = ? ORDER BY id LIMIT 1", (session_id, msg.get("role", "unknown"), tool_id)).fetchone()
+        if row is None and not (isinstance(tool_id, str) and tool_id):
+            encoded = encode_content_fn(msg.get("content"))
+            row = conn.execute("SELECT * FROM messages WHERE session_id = ? AND active = 1 AND role = ? AND timestamp IS ? AND content IS ? ORDER BY id LIMIT 1", (session_id, msg.get("role", "unknown"), msg.get("timestamp"), encoded)).fetchone()
+        if row is None:
+            inserted_rows.append(msg)
+            continue
+        if row["id"] in seen_ids:
+            continue
+        seen_ids.add(row["id"])
+        msg["_row_id"] = int(row["id"])
+        decoded = decode_content_fn(row["content"])
+        if msg.get("_repair_mutated"):
+            conn.execute("UPDATE messages SET content = ?, tool_calls = ? WHERE id = ? AND session_id = ? AND active = 1", (encode_content_fn(msg.get("content")), __import__("json").dumps(msg.get("tool_calls")) if msg.get("tool_calls") is not None else None, row["id"], session_id))
+        elif is_content_blank(decoded):
+            conn.execute("UPDATE messages SET content = ? WHERE id = ? AND session_id = ? AND active = 1", (encode_content_fn(msg.get("content")), row["id"], session_id))
         else:
-            msg["_canonical_content"] = decoded  # concurrent winner: adopt, don't overwrite
+            msg["_canonical_content"] = decoded
     return inserted_rows
 
 
