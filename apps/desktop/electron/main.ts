@@ -12536,7 +12536,11 @@ async function runPoolBackendStart(profile, entry, opts: { forceLocal?: boolean;
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-  const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
+  const spawnSpec = sessionProfileSpawnSpec({ selectedProfile: profile, hermesHome: HERMES_HOME })
+  if (!spawnSpec) {
+    throw new Error(`Cannot start local backend for profile "${profile}": Hermes home is unavailable`)
+  }
+  const backendArgs = [...spawnSpec.argvProfileFlag, 'serve', '--host', '127.0.0.1', '--port', '0']
 
   const backend = await ensureRuntime(await resolveHermesBackend(backendArgs), () =>
     assertPoolEntryStillOwned(poolKey, entry)
@@ -12572,7 +12576,7 @@ async function runPoolBackendStart(profile, entry, opts: { forceLocal?: boolean;
       env: desktopBackendSpawnEnv(
         {
           ...process.env,
-          HERMES_HOME,
+          ...spawnSpec.envOverlay,
           ...backend.env,
           // Pin the gateway's tool/terminal cwd to the same directory we chose for
           // the child process. Inherited TERMINAL_CWD (or a stale config bridge)
@@ -12959,7 +12963,7 @@ async function runHermesStart() {
 
     const token = crypto.randomBytes(32).toString('base64url')
     const spawnSpec = sessionProfileSpawnSpec({ selectedProfile: primaryProfile, hermesHome: HERMES_HOME })
-    const backendArgs = [...spawnSpec!.argvProfileFlag, 'serve', '--host', '127.0.0.1', '--port', '0']
+    const backendArgs = spawnSpec ? [...spawnSpec.argvProfileFlag, 'serve', '--host', '127.0.0.1', '--port', '0'] : null
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
 
     const setup = await runPrimaryBackendStartup({
@@ -12970,6 +12974,10 @@ async function runHermesStart() {
         ensureRuntime(backend, () => backendConnectionState.assertCurrentAttempt(connectionAttempt)),
       prepareLocalBackend: async () => {
         await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
+
+        if (!backendArgs) {
+          throw new Error('Cannot start local backend: Hermes home is unavailable')
+        }
 
         return resolveHermesBackend(backendArgs)
       },

@@ -13,8 +13,10 @@ export function sessionProfileSpawnSpec({
     return null
   }
 
+  const profile = selectedProfile.trim() || 'default'
+
   return {
-    argvProfileFlag: ['--profile', selectedProfile],
+    argvProfileFlag: ['--profile', profile],
     envOverlay: { HERMES_HOME: hermesHome }
   }
 }
