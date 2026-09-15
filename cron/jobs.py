@@ -2684,11 +2684,17 @@ def claim_job_for_fire(
             return False  # someone holds a fresh claim
         from cron.occurrences import completed_occurrence, scheduled_instant
 
+        # Determine the due instant for this claim. If the tick already advanced next_run_at
+        # and stamped pending_slot, use pending_slot.scheduled_at (the original due instant).
+        # Otherwise, for external fires (webhook, manual), next_run_at is the due instant.
+        pending = job.get("pending_slot")
+        due_instant = pending.get("scheduled_at") if isinstance(pending, dict) else job.get("next_run_at")
+
         # ``manual`` (an off-tick run-now) must NOT stamp an occurrence identity: outside a
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
-        instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
+        instant = None if manual_fire else scheduled_instant(due_instant)
         if instant and completed_occurrence(job, instant):
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -2703,10 +2709,21 @@ def claim_job_for_fire(
         job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
+        # Only advance next_run_at for recurring jobs if the tick hasn't already advanced it.
+        # The tick advances next_run_at and stamps pending_slot; if pending_slot was present,
+        # next_run_at is already the NEXT occurrence, so don't advance again.
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
-            nxt = compute_next_run(job["schedule"], now.isoformat())
-            if nxt:
-                job["next_run_at"] = nxt
+            current_next = job.get("next_run_at")
+            # If there was a pending_slot, next_run_at was already advanced by the tick.
+            # Only advance if no pending_slot (external fire) or next_run_at still equals due_instant.
+            should_advance = (pending is None) or (
+                isinstance(current_next, str)
+                and scheduled_instant(current_next) == scheduled_instant(due_instant)
+            )
+            if should_advance:
+                nxt = compute_next_run(job["schedule"], now.isoformat())
+                if nxt:
+                    job["next_run_at"] = nxt
         save_jobs(jobs)
         return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
 
@@ -3155,6 +3172,22 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     d.next_run_dt = _rearm_stale_error_recurring(d)
     if d.next_run_dt > now:
         return False
+
+    # Another process holds a fresh fire_claim for this recurring job — do NOT
+    # advance next_run_at or stamp pending_slot. The other process owns this
+    # occurrence; we'll pick it up when their claim expires or they clear it.
+    # This prevents silently advancing next_run_at when the claim is lost.
+    if recurring and not manual_run:
+        from cron.jobs import _claim_is_live, _machine_id, FIRE_CLAIM_TTL_SECONDS
+        fire_claim = job.get("fire_claim")
+        if fire_claim and _claim_is_live(fire_claim, now, FIRE_CLAIM_TTL_SECONDS):
+            claim_owner = fire_claim.get("by", "")
+            my_id = _machine_id()
+            if not claim_owner.startswith(my_id + ":"):
+                logger.debug(
+                    "Job '%s': skipping due job — fresh fire_claim held by %s",
+                    job.get("name", job.get("id", "?")), claim_owner)
+                return False
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
     job["_scheduled_instant"] = None if manual_run else scheduled_instant(job.get("next_run_at"))

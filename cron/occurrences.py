@@ -80,6 +80,14 @@ def unclaimed_pending_slot(job, now):
         return None
     if _job_running_in_this_process(str(job.get("id", ""))):
         return None
-    if pending.get("by") != _machine_id() and _claim_is_live(pending, now, FIRE_CLAIM_TTL_SECONDS):
+    # Check if the pending_slot belongs to our host:PID (ignoring the token suffix).
+    # If it's our own process but the job isn't running here, the slot is orphaned and should be restored.
+    by = pending.get("by", "")
+    my_host_pid = _machine_id()  # "host:pid"
+    if by.startswith(my_host_pid + ":"):
+        # Our own process's stamp — if the job isn't running here, it's orphaned.
+        return slot
+    # Different host:PID — honour the claim if it's still live.
+    if _claim_is_live(pending, now, FIRE_CLAIM_TTL_SECONDS):
         return None
     return slot
