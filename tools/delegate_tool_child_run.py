@@ -233,6 +233,7 @@ class _Heartbeat:
         # activity_ts) all froze; thresholds differ idle vs in-tool.
         self.last_seen = {"iter": 0, "tool": None, "ts": None, "stale": 0}
         self.handle = None
+        self.stale_event = threading.Event()
 
     def start(self) -> None:
         from agent.periodic_scheduler import schedule
@@ -274,7 +275,8 @@ class _Heartbeat:
                     "Subagent %d appears stale (no progress for %d heartbeat cycles, tool=%s) — stopping heartbeat",
                     task_index, last_seen["stale"], child_tool or "<none>",
                 )
-                return False  # stop touching parent, let gateway timeout fire
+                self.stale_event.set()
+                return False  # stop parent touches; await_child collects or times out
             if child_tool:
                 desc = f"delegate_task: subagent running {child_tool} (iteration {child_iter}/{child_max})"
             elif child_summary.get("last_activity_desc", ""):
@@ -634,6 +636,7 @@ class _ChildRun:
     goal: str
     subagent_id: Optional[str]
     child_progress_cb: Any
+    heartbeat: Any = None
     child_start: float = field(default_factory=time.monotonic)
     worktree_info: Optional[Dict[str, str]] = None
     child_task_id: str = ""
@@ -711,7 +714,9 @@ class _ChildRun:
         """Run the child's conversation on a daemon worker: ``(result, None, False)`` or ``(None, error_entry,
         close_deferred)`` on timeout/exception.
 
-        Hard timeout is off by default (``result(timeout=None)``; stuck children are the heartbeat's job). Daemon
+        Hard timeout is off by default. Stuck children are the heartbeat's job: a stale
+        Event unblocks this wait so a finished-but-idle worker can still be collected, and
+        a truly wedged worker becomes a structured timeout instead of hanging forever. Daemon
         worker: an abandoned timed-out child on a non-daemon thread would block interpreter exit at atexit join. The
         worker installs a non-interactive approval callback (deny/approve per delegation.subagent_auto_approve) so
         dangerous-command prompts never fall back to ``input()`` and deadlock the parent TUI. On failure: steer
@@ -720,7 +725,9 @@ class _ChildRun:
         via a Future done-callback (``close_deferred=True``) — closing here would race its still-unwinding finally
         path.
         """
-        from tools.delegate_tool import (_get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb)
+        from tools.delegate_tool import (
+            _STALE_RESULT_GRACE_SECONDS, _get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb,
+        )
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
         child_timeout = _get_child_timeout()
@@ -743,7 +750,21 @@ class _ChildRun:
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         try:
-            return future.result(timeout=child_timeout), None, False
+            if child_timeout is not None:
+                return future.result(timeout=child_timeout), None, False
+            while True:
+                try:
+                    return future.result(timeout=0.05), None, False
+                except FuturesTimeoutError:
+                    if not self.heartbeat or not self.heartbeat.stale_event.is_set():
+                        continue
+                    _late_pending_steer = self.close_steering()
+                    _signal_child_stop(child)
+                    try:
+                        return future.result(timeout=_STALE_RESULT_GRACE_SECONDS), None, False
+                    except FuturesTimeoutError as stale_exc:
+                        exc = stale_exc
+                        break
         except Exception as wait_exc:
             exc: BaseException = wait_exc  # ``as`` targets are unbound after the except block
         finally:
@@ -777,11 +798,15 @@ class _ChildRun:
             _err = (
                 f"Subagent timed out after {child_timeout}s without making any API call — the child never reached its "
                 f"first LLM request (prompt construction, credential resolution, or transport may be stuck)."
+            ) if child_timeout is not None else (
+                "Subagent made no progress before any API call; the pending worker was abandoned."
             )
         else:
             _err = (
                 f"Subagent timed out after {child_timeout}s with {child_api_calls} API call(s) completed — likely "
                 f"stuck on a slow API call, tool call, or unresponsive network request."
+            ) if child_timeout is not None else (
+                f"Subagent made no progress after {child_api_calls} API call(s); the pending worker was abandoned."
             )
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
