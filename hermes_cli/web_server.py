@@ -137,6 +137,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 # Desktop `serve` only (start_server(start_mcp_discovery_after_bind=True)):
 # seconds after the READY sentinel before the MCP discovery thread starts.
 _DESKTOP_MCP_DISCOVERY_DELAY_S = 1.0
+_STATEDB_EAGER_RECONCILE_JOIN_TIMEOUT_S = 5.0
 
 
 @asynccontextmanager
@@ -154,11 +155,12 @@ async def _lifespan(app: "FastAPI"):
     # every poll while the read-probe heal loses to sibling lock contention.
     # Daemon thread so a locked store never delays the socket (Desktop
     # ready-probe times out at 10s, GH-73083).
-    threading.Thread(
+    statedb_eager_reconcile_thread = threading.Thread(
         target=_eager_reconcile_own_session_db,
         daemon=True,
         name="statedb-eager-reconcile",
-    ).start()
+    )
+    statedb_eager_reconcile_thread.start()
 
     # Import hermes_cli.gateway *before* the yield: on Windows + 3.11 the
     # import holds the GIL, so run_in_executor still froze the loop 15-22s and
@@ -256,6 +258,9 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        statedb_eager_reconcile_thread.join(
+            timeout=_STATEDB_EAGER_RECONCILE_JOIN_TIMEOUT_S
+        )
         hosted_room_start_cancel.set()
         _hosted_groups.stop_hosted_room_service(timeout=5.0)
         hosted_room_start_thread.join(timeout=1.0)
