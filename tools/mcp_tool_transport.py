@@ -453,15 +453,21 @@ class MCPServerTransportMixin:
                               "mcp.client.streamable_http is not available. "
                               "Upgrade the mcp package to get HTTP support.")
         url = config["url"]
+        logger.debug("MCP server '%s': connecting to %s", self.name, url)
         headers = dict(config.get("headers") or {})
         # Agent Plugins v1 strict_redirect_headers: configured headers MUST NOT follow a cross-origin
         # redirect — capture their names BEFORE client-generated headers are merged in.
         configured_header_names = {key.lower() for key in headers}
         headers = _apply_identity_header(self.name, config, headers)  # explicit same-name headers win
-        # Seed MCP-Protocol-Version (user override wins) from the HANDSHAKE version, not the latest: a
-        # 2026-07-28 header routes the handshake-era ``initialize()`` onto the envelope ladder, which rejects it.
-        if not any(key.lower() == "mcp-protocol-version" for key in headers):
-            headers["mcp-protocol-version"] = _core.LATEST_HANDSHAKE_VERSION
+        # Do NOT seed ``mcp-protocol-version`` as a sticky httpx default header:
+        # the SDK manages it per-request via its negotiated-version cache
+        # (cleared before ``initialize`` so the handshake carries no version).
+        # Seeding ``LATEST_HANDSHAKE_VERSION`` (2025-11-25) here leaked
+        # 2025-11-25 onto every request including the handshake, which a
+        # modern stateless server (2026-07-28, e.g. Google Drive
+        # ``.../mcp/v1``) rejects — the raw curl without that header
+        # succeeded for that reason. User-provided headers still win
+        # (captured in ``configured_header_names``). See #113359.
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
         common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
                   self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))

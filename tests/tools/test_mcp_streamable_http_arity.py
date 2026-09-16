@@ -146,10 +146,19 @@ def test_the_seeded_protocol_header_matches_the_handshake_the_client_sends():
 
 
 def test_the_seeded_header_is_the_handshake_version_on_the_wire():
-    """Asserted through the header dict `_run_http` actually builds."""
+    """No auto-seeded ``mcp-protocol-version``: the SDK manages it per-request.
+
+    Previously Hermes seeded ``LATEST_HANDSHAKE_VERSION`` (2025-11-25) as a
+    sticky httpx header, leaking onto the ``initialize`` handshake. A modern
+    stateless server (2026-07-28, e.g. Google Drive .../mcp/v1) rejects the
+    handshake when that header is present — the raw curl without it succeeds.
+    The SDK now owns the header via its negotiated-version cache (cleared
+    before initialize). Only an explicit user header should reach the wire.
+    See #113359.
+    """
     from unittest.mock import patch as _patch
 
-    from tools.mcp_tool import MCPServerTask, LATEST_HANDSHAKE_VERSION
+    from tools.mcp_tool import MCPServerTask
 
     server = MCPServerTask("remote")
     seen: dict = {}
@@ -175,7 +184,7 @@ def test_the_seeded_header_is_the_handshake_version_on_the_wire():
     asyncio.run(_drive())
 
     headers = {k.lower(): v for k, v in (seen.get("headers") or {}).items()}
-    assert headers.get("mcp-protocol-version") == LATEST_HANDSHAKE_VERSION
+    assert "mcp-protocol-version" not in headers
 
 
 def test_an_explicit_protocol_header_still_wins():
