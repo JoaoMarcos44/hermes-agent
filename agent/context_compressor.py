@@ -983,6 +983,22 @@ _PRESSURE_KEEP_RECENT_MESSAGES = 3
 # pass 2, so they ride every later request until anti-thrash disables compression (#92699).
 _MAX_KEEP_TOOL_IMAGES = 3
 
+# Send-path eviction thresholds. The count above is the COMPACTION keep-window; the send path
+# must not use it, because evicting at 3 images retires one more message on every new image and
+# each retirement edits a row inside the Anthropic cached prefix, re-writing the whole history.
+# Mirror the provider's own constraint instead: hold images until the request would cross a real
+# API limit, then retire a BATCH, so the cost is one slower turn per batch and zero below it.
+#
+# 20 is the documented threshold at which Anthropic applies a stricter per-image dimension cap
+# (2000 px) to EVERY image in the request, counting images nested in tool_result content. Staying
+# at or below it keeps large screenshots legal. The hard ceilings are higher (100 images per
+# request on 200K-context models, 600 otherwise) but the 32 MB request-size limit usually binds
+# first, which the byte budget below guards with headroom for the text portion of the request.
+_OUTBOUND_IMAGE_LIMIT = 20
+_OUTBOUND_IMAGE_BUDGET_BYTES = 24_000_000
+_IMAGE_EVICTION_BATCH = 8
+
+
 # Below this window the threshold is floored (raise-only): at 50% the incompressible
 # floor eats the reclaimed headroom and compaction re-fires every 1-2 turns.
 _SMALL_CTX_WINDOW_LIMIT = 512_000
@@ -1246,21 +1262,57 @@ def _retire_stale_tool_result_images(result: List[Dict[str, Any]], keep_newest: 
     return pruned
 
 
+def _image_payload_bytes(msg: Dict[str, Any]) -> int:
+    """Serialized size of the image parts in a tool message (0 when it carries none)."""
+    content = msg.get("content")
+    inner = content.get("content") if isinstance(content, dict) and content.get("_multimodal") else content
+    if not isinstance(inner, list):
+        return 0
+    return sum(len(json.dumps(p, ensure_ascii=False)) for p in inner if _is_image_part(p))
+
+
 def evict_stale_outbound_tool_images(
     api_messages: List[Dict[str, Any]],
     keep_newest: int = _MAX_KEEP_TOOL_IMAGES,
 ) -> int:
     """Drop stale screenshot/vision payloads from the per-call API copy.
 
-    Compression's keep-newest pass only runs when prune/compress fires, and
-    the Anthropic adapter's screenshot eviction only sees nested
-    ``tool_result`` blocks. OpenAI-style ``image_url`` tool results
-    otherwise ride every subsequent request until a 413 forces the reactive
-    strip (#89286). Call this on the cloned ``api_messages`` list after
-    sanitization so older frames never leave the box (#89296). Do not pass
-    persisted history — the rewrite is send-path only.
+    Compression's keep-newest pass only runs when prune/compress fires, and the Anthropic
+    adapter's screenshot eviction only sees nested ``tool_result`` blocks. OpenAI-style
+    ``image_url`` tool results otherwise ride every subsequent request until a 413 forces
+    the reactive strip (#89286). Call this on the cloned ``api_messages`` list after
+    sanitization (#89296). Do not pass persisted history — the rewrite is send-path only.
+
+    Eviction is driven by the PROVIDER LIMIT, not by a keep-newest count. Retiring an image
+    edits a message the provider has already cached, and Anthropic matches its prompt cache
+    on an exact byte prefix, so every retirement re-writes the whole conversation. A count
+    of N retires one more message on each new image, making every turn a full-prefix miss.
+
+    Keeping images until the request nears the API's own per-request image and byte limits,
+    then retiring a batch, costs one slower turn per batch instead of one per image, and
+    costs nothing at all while the request is under the limits.
     """
-    return _retire_stale_tool_result_images(api_messages, keep_newest=keep_newest)
+    images = [
+        (i, size)
+        for i in range(len(api_messages) - 1, -1, -1)
+        if isinstance(api_messages[i], dict)
+        and api_messages[i].get("role") == "tool"
+        and (size := _image_payload_bytes(api_messages[i])) > 0
+    ]
+    over = len(images) > _OUTBOUND_IMAGE_LIMIT or sum(s for _, s in images) > _OUTBOUND_IMAGE_BUDGET_BYTES
+    if not over:
+        return 0
+
+    # Retire a whole batch so the next several turns stay under the limit and append cleanly.
+    retire = min(_IMAGE_EVICTION_BATCH, max(len(images) - keep_newest, 0))
+    pruned = 0
+    for i, _ in images[-retire:]:
+        new_msg = _strip_images_from_tool_msg(api_messages[i])
+        if new_msg is not None:
+            api_messages[i] = new_msg
+            pruned += 1
+    return pruned
+
 
 
 def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
