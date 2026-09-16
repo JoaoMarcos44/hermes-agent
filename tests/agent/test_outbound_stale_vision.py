@@ -109,6 +109,22 @@ class TestOutboundImageRetireCount:
         assert sum(huge[:kept]) <= _OUTBOUND_IMAGE_BUDGET_BYTES
         assert retire >= _IMAGE_EVICTION_BATCH
 
+    def test_part_weights_count_as_api_blocks(self):
+        sizes = [10] * 20
+        weights = [2] * 20
+        retire = _outbound_image_retire_count(sizes, weights_newest_first=weights)
+        kept = 20 - retire
+        assert sum(weights[:kept]) <= _OUTBOUND_IMAGE_LIMIT
+        assert retire >= _IMAGE_EVICTION_BATCH
+
+    def test_reserved_images_consume_the_ceiling(self):
+        sizes = [10] * 10
+        assert len(sizes) <= _OUTBOUND_IMAGE_LIMIT
+        retire = _outbound_image_retire_count(sizes, reserved_count=15)
+        kept = 10 - retire
+        assert kept + 15 <= _OUTBOUND_IMAGE_LIMIT
+        assert retire >= _IMAGE_EVICTION_BATCH
+
 
 class TestOutboundStaleVisionEviction:
     def test_sanitize_alone_keeps_every_screenshot(self):
@@ -214,3 +230,34 @@ class TestOutboundStaleVisionEviction:
         evict_stale_outbound_tool_images(outbound)
         user = next(m for m in outbound if m.get("role") == "user")
         assert user["content"][1]["image_url"]["url"].endswith("USERUPLOAD")
+
+    def test_user_uploads_count_toward_limit_without_being_rewritten(self):
+        history: list[dict] = []
+        for u in range(15):
+            history.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"look {u}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,USER{u}"},
+                        },
+                    ],
+                }
+            )
+        for i in range(10):
+            history.extend(_image_tool(i))
+        outbound = sanitize_api_messages(history)
+        evict_stale_outbound_tool_images(outbound)
+        user_urls = [
+            part["image_url"]["url"]
+            for m in outbound
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+            for part in m["content"]
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+        assert len(user_urls) == 15
+        kept_tools = _image_bearing_tool_ids(outbound)
+        assert len(kept_tools) + 15 <= _OUTBOUND_IMAGE_LIMIT
+        assert len(kept_tools) < 10
