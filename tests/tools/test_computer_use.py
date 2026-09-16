@@ -469,9 +469,9 @@ class TestAnthropicAdapterMultimodal:
 
         # Build screenshots interleaved with assistant messages. The eviction frontier
         # advances in whole batches, so use a count that lands exactly on one advance.
-        from agent.anthropic_message_convert import (
+        from agent.context_compressor import (
+            _IMAGE_EVICTION_BATCH as _SCREENSHOT_EVICTION_BATCH,
             _OUTBOUND_IMAGE_LIMIT,
-            _SCREENSHOT_EVICTION_BATCH,
         )
 
         total = _OUTBOUND_IMAGE_LIMIT + 1
@@ -525,10 +525,10 @@ class TestAnthropicAdapterMultimodal:
         forcing a full-prefix re-write that costs far more than the image tokens it
         reclaims.
         """
-        from agent.anthropic_message_convert import (
+        from agent.anthropic_message_convert import convert_messages_to_anthropic
+        from agent.context_compressor import (
+            _IMAGE_EVICTION_BATCH as _SCREENSHOT_EVICTION_BATCH,
             _OUTBOUND_IMAGE_LIMIT,
-            _SCREENSHOT_EVICTION_BATCH,
-            convert_messages_to_anthropic,
         )
 
         fake_png = "iVBORw0KGgo="
@@ -571,17 +571,28 @@ class TestAnthropicAdapterMultimodal:
                 )
             )
 
-        # The frontier must hold across at least one new screenshot. Asserted as an
-        # absolute invariant rather than against the batch constant, so shrinking the
-        # batch back to a one-step frontier fails this test.
-        counts = [placeholder_count(n) for n in range(_OUTBOUND_IMAGE_LIMIT - 2,
-                                                      _OUTBOUND_IMAGE_LIMIT + _SCREENSHOT_EVICTION_BATCH)]
+        start = _OUTBOUND_IMAGE_LIMIT - 2
+        end = _OUTBOUND_IMAGE_LIMIT + 3 * _SCREENSHOT_EVICTION_BATCH
+        counts = [placeholder_count(n) for n in range(start, end + 1)]
         held = [a == b for a, b in zip(counts, counts[1:])]
         assert any(held), (
             f"eviction rewrote a new block on every screenshot (counts={counts}); "
             "each step invalidates the cached prefix"
         )
         assert counts[-1] >= counts[0], "eviction must still make progress"
+        assert counts[-1] >= 3 * _SCREENSHOT_EVICTION_BATCH
+
+        def image_count(n: int) -> int:
+            return n - placeholder_count(n)
+
+        for n in (
+            _OUTBOUND_IMAGE_LIMIT,
+            _OUTBOUND_IMAGE_LIMIT + 1,
+            _OUTBOUND_IMAGE_LIMIT + _SCREENSHOT_EVICTION_BATCH + 1,
+            40,
+            60,
+        ):
+            assert image_count(n) <= _OUTBOUND_IMAGE_LIMIT, (n, image_count(n))
 
 
 # ---------------------------------------------------------------------------

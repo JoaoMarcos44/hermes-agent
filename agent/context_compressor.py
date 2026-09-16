@@ -1271,10 +1271,39 @@ def _image_payload_bytes(msg: Dict[str, Any]) -> int:
     return sum(len(json.dumps(p, ensure_ascii=False)) for p in inner if _is_image_part(p))
 
 
-def evict_stale_outbound_tool_images(
-    api_messages: List[Dict[str, Any]],
-    keep_newest: int = _MAX_KEEP_TOOL_IMAGES,
+def _outbound_image_retire_count(
+    sizes_newest_first: List[int],
+    *,
+    limit: int = _OUTBOUND_IMAGE_LIMIT,
+    budget: int = _OUTBOUND_IMAGE_BUDGET_BYTES,
+    batch: int = _IMAGE_EVICTION_BATCH,
 ) -> int:
+    """Oldest image items to drop so a stateless send copy stays within ``limit`` and ``budget``.
+
+    Every request reclones history and recomputes eviction from scratch. Dropping
+    ``count - limit`` would move the frontier on every new image and rewrite the
+    cached prefix; dropping a single fixed batch would stop enforcing the limit
+    after the first window. Walk up in whole batches until both constraints hold
+    (the last step may be short when fewer items remain).
+    """
+    count = len(sizes_newest_first)
+    if count == 0 or batch <= 0:
+        return 0
+
+    def _fits(retire: int) -> bool:
+        kept = count - retire
+        return kept <= limit and sum(sizes_newest_first[:kept]) <= budget
+
+    if _fits(0):
+        return 0
+
+    retire = 0
+    while retire < count and not _fits(retire):
+        retire += min(batch, count - retire)
+    return retire
+
+
+def evict_stale_outbound_tool_images(api_messages: List[Dict[str, Any]]) -> int:
     """Drop stale screenshot/vision payloads from the per-call API copy.
 
     Compression's keep-newest pass only runs when prune/compress fires, and the Anthropic
@@ -1289,8 +1318,10 @@ def evict_stale_outbound_tool_images(
     of N retires one more message on each new image, making every turn a full-prefix miss.
 
     Keeping images until the request nears the API's own per-request image and byte limits,
-    then retiring a batch, costs one slower turn per batch instead of one per image, and
-    costs nothing at all while the request is under the limits.
+    then retiring batches until both constraints hold, costs one slower turn per batch
+    instead of one per image, and costs nothing while the request is under the limits.
+    Compaction's keep-newest window is intentionally not used here: a keep-floor would
+    prevent the byte budget from being enforced when a few huge images already overflow.
     """
     images = [
         (i, size)
@@ -1299,12 +1330,10 @@ def evict_stale_outbound_tool_images(
         and api_messages[i].get("role") == "tool"
         and (size := _image_payload_bytes(api_messages[i])) > 0
     ]
-    over = len(images) > _OUTBOUND_IMAGE_LIMIT or sum(s for _, s in images) > _OUTBOUND_IMAGE_BUDGET_BYTES
-    if not over:
+    retire = _outbound_image_retire_count([size for _, size in images])
+    if retire <= 0:
         return 0
 
-    # Retire a whole batch so the next several turns stay under the limit and append cleanly.
-    retire = min(_IMAGE_EVICTION_BATCH, max(len(images) - keep_newest, 0))
     pruned = 0
     for i, _ in images[-retire:]:
         new_msg = _strip_images_from_tool_msg(api_messages[i])
