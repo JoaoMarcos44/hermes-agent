@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
+from agent.redact import redact_reentry_fields
 from hermes_state_common import _BOUNDARY_END_REASONS
 
 # Hidden from browsing/searching — integrations (HERMES_SESSION_SOURCE=tool), delegate
@@ -83,8 +84,11 @@ def _get_session_meta(db, session_id: str) -> dict:
 
 
 def _session_meta_block(meta: Dict[str, Any]) -> Dict[str, Any]:
-    return {"when": _format_timestamp(meta.get("started_at")), "source": meta.get("source"),
-            "model": meta.get("model"), "title": meta.get("title")}
+    return redact_reentry_fields(
+        {"when": _format_timestamp(meta.get("started_at")), "source": meta.get("source"),
+         "model": meta.get("model"), "title": meta.get("title")},
+        "title",
+    )
 
 
 def _ok(**payload) -> str:
@@ -261,7 +265,7 @@ def _discovery_entry(lineage_root: Optional[str], **fields) -> Dict[str, Any]:
         "bookend_start", "messages", "bookend_end", "messages_before", "messages_after", "detail")}
     if lineage_root and lineage_root != entry["session_id"]:
         entry["parent_session_id"] = lineage_root
-    return entry
+    return redact_reentry_fields(entry, "title", "snippet")
 
 
 def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -485,10 +489,11 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
         # Compression continuation: the root was summarised into the live child, so hide
         # it. /new-reset children carry no transcript — keep that root browsable.
         hidden = {current_session_id, current_root if has_compression_hop and current_root else None}
-        results = [{
+        results = [redact_reentry_fields({
             "session_id": s.get("id", ""), "link": _session_link(s.get("id", ""), link_profile),
             "title": s.get("title") or None, **{k: s.get(k, "") for k in ("source", "started_at", "last_active")},
-            "message_count": s.get("message_count", 0), "preview": s.get("preview", "")}
+            "message_count": s.get("message_count", 0), "preview": s.get("preview", "")},
+            "title", "preview")
             for s in [x for x in sessions if x.get("id", "") not in hidden][:limit]]
         return _ok(mode="browse", results=results, count=len(results), message=(
             f"Showing {len(results)} most recent sessions. Pass a query= to search, "

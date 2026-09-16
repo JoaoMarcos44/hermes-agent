@@ -951,6 +951,29 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     return text
 
 
+# Text derived from stored conversation can re-enter a later, unrelated prompt
+# (compaction summaries, session-search titles/snippets/previews). Ordinary
+# ``security.redact_secrets: false`` is for live tool output, not this class.
+_REENTRY_REDACT_KWARGS = {"force": True, "redact_url_credentials": True}
+
+
+def redact_reentry_text(text: object) -> str:
+    """Strict-redact model-visible text derived from stored conversation data."""
+    if text is None:
+        return ""
+    return redact_sensitive_text(str(text), **_REENTRY_REDACT_KWARGS)
+
+
+def redact_reentry_fields(payload: dict, *keys: str) -> dict:
+    """Shallow-copy *payload*, strictly redacting the named derived-text fields."""
+    out = dict(payload)
+    for key in keys:
+        if key not in out or out[key] is None:
+            continue
+        out[key] = redact_reentry_text(out[key])
+    return out
+
+
 # Commands whose stdout is an env-var dump: terminal redaction runs the
 # ENV-assignment pass (code_file=False) for these so opaque tokens with no vendor
 # prefix are masked; everything else uses code_file=True (``MAX_TOKENS=100``).

@@ -210,6 +210,84 @@ class TestBrowseShape:
 
 
 # =========================================================================
+# Derived metadata re-enters later prompts — same strict policy as compaction
+# =========================================================================
+
+_REENTRY_SECRET = "sk-proj-" + ("a" * 40)
+_REENTRY_OAUTH_URL = (
+    "https://localhost/callback?code=opaque-code-123"
+    "&access_token=opaque-token-456&state=keep"
+)
+_REENTRY_NEEDLE = "reentryneedle"
+
+
+def _seed_reentry_session(db):
+    db.create_session("s_reentry", source="cli")
+    db._conn.execute(
+        "UPDATE sessions SET title = ? WHERE id = ?",
+        (f"Deploy {_REENTRY_NEEDLE} {_REENTRY_SECRET}", "s_reentry"),
+    )
+    db.append_message(
+        "s_reentry",
+        role="user",
+        content=f"{_REENTRY_NEEDLE} uses {_REENTRY_SECRET} at {_REENTRY_OAUTH_URL}",
+    )
+    db._conn.commit()
+
+
+class TestReentryMetadataRedaction:
+    """Titles, FTS snippets, and browse previews are derived text.
+
+    Compaction already force-redacts that class even when
+    ``security.redact_secrets`` is off. Explicit full-message reads stay raw.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _ordinary_redaction_off(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+    def test_discover_title_and_snippet_hide_secrets_and_url_credentials(self, db):
+        _seed_reentry_session(db)
+        discovered = json.loads(session_search(query=_REENTRY_NEEDLE, db=db))["results"][0]
+        title = discovered.get("title") or ""
+        snippet = discovered.get("snippet") or ""
+        assert _REENTRY_SECRET not in title
+        assert _REENTRY_SECRET not in snippet
+        assert "sk-proj-" not in title
+        assert "sk-proj-" not in snippet
+        assert "opaque-code-123" not in snippet
+        assert "opaque-token-456" not in snippet
+        # Compact discover still hydrates the matching message (issue out of scope).
+        contents = " ".join(m.get("content") or "" for m in (discovered.get("messages") or []))
+        assert _REENTRY_SECRET in contents
+
+    def test_browse_title_and_preview_hide_secrets(self, db):
+        _seed_reentry_session(db)
+        browsed = next(
+            row for row in json.loads(session_search(db=db))["results"]
+            if row["session_id"] == "s_reentry"
+        )
+        assert _REENTRY_SECRET not in (browsed.get("title") or "")
+        assert "sk-proj-" not in (browsed.get("title") or "")
+        assert _REENTRY_SECRET not in (browsed.get("preview") or "")
+
+    def test_explicit_read_redacts_title_only(self, db):
+        _seed_reentry_session(db)
+        read = json.loads(session_search(session_id="s_reentry", db=db))
+        assert _REENTRY_SECRET not in (read["session_meta"].get("title") or "")
+        assert _REENTRY_SECRET in read["messages"][0]["content"]
+
+    def test_title_match_snippet_hides_secrets(self, db):
+        _seed_reentry_session(db)
+        raw_title = f"Deploy {_REENTRY_NEEDLE} {_REENTRY_SECRET}"
+        result = json.loads(session_search(query=raw_title, db=db))
+        assert result["count"] >= 1
+        for row in result["results"]:
+            assert _REENTRY_SECRET not in (row.get("title") or "")
+            assert _REENTRY_SECRET not in (row.get("snippet") or "")
+
+
+# =========================================================================
 # Discovery shape (with query)
 # =========================================================================
 

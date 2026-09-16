@@ -72,6 +72,14 @@ def test_helper_is_strict_even_when_redaction_disabled():
     assert _redact_compaction_text(None) == ""
 
 
+def test_compaction_helper_shares_session_search_reentry_policy():
+    from agent.redact import redact_reentry_text
+
+    sample = f"key {SECRET} url {OAUTH_URL}"
+    assert _redact_compaction_text(sample) == redact_reentry_text(sample)
+    assert redact_reentry_text(None) == ""
+
+
 def test_serializer_input_redacts_content_and_tool_args():
     c = _compressor()
     messages = [
