@@ -12,6 +12,7 @@ The Desktop's relay door on each connected gateway. Contracts:
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -336,3 +337,67 @@ def test_gateway_drains_the_mailbox_the_tools_write_to(tmp_path, monkeypatch, su
     assert methods_bot_relay._relay_root() == writer_root
     drained = _result(srv._methods["bot_relay.outbox.drain"](1, {}))
     assert [e["id"] for e in drained["envelopes"]] == [env["id"]]
+
+
+def _lock_raising(error):
+    class _Lock:
+        def __enter__(self):
+            raise error
+
+        def __exit__(self, *_args):
+            return False
+
+    return _Lock()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code", "expected_reason"),
+    [
+        ("busy", 5096, "target_busy"),
+        ("timeout", 5093, "delivery_timeout"),
+        ("classified", 5094, "provider_auth_or_access"),
+        ("invalid_exception_reason", 5094, "unknown"),
+    ],
+    ids=["target-busy", "delivery-timeout", "classified", "closed-vocabulary"],
+)
+def test_deliver_refusals_carry_a_closed_reason(
+    home, monkeypatch, failure_kind, expected_code, expected_reason
+):
+    """Every refusal exposes the code that survives the Desktop relay hop.
+
+    The handler's JSON-RPC code is not forwarded to the sender. Only
+    ``error.data.reason`` reaches the reply file, so a missing or arbitrary
+    exception ``reason`` becomes a misleading ``unknown`` or an open-ended
+    value at the user-facing boundary.
+    """
+    monkeypatch.setattr(
+        bot_relay,
+        "local_delivery_command",
+        lambda profile, query: ["__delivery__", profile, query],
+    )
+
+    if failure_kind == "timeout":
+        def _timeout(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(["hermes"], 600)
+
+        monkeypatch.setattr(subprocess, "run", _timeout)
+    else:
+        if failure_kind == "busy":
+            failure = bot_relay.TurnBusyError("ops", 0.2)
+        elif failure_kind == "classified":
+            failure = RuntimeError("Error code: 401 - invalid api key")
+        else:
+            failure = RuntimeError("unclassified relay failure")
+            failure.reason = "operator explanation"
+        monkeypatch.setattr(
+            bot_relay,
+            "acquire_turn_lock",
+            lambda *_args, **_kwargs: _lock_raising(failure),
+        )
+
+    out = srv._methods["bot_relay.deliver"](
+        1, {"profile": "ops", "message": "ping"}
+    )
+    error = out["error"]
+    assert error["code"] == expected_code
+    assert error["data"]["reason"] == expected_reason

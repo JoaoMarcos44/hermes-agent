@@ -34,6 +34,17 @@ def _run_delivery(profile: str, tmp: str, env: dict | None = None) -> subprocess
         errors="replace", timeout=TURN_ATTEMPT_TIMEOUT_SECONDS, env=env)
 
 
+def _delivery_failure_reason(error: BaseException) -> str:
+    """Return a relay reason from the closed vocabulary."""
+    from tools.bot_failure_reasons import ALL_REASONS, classify_agent_error
+
+    supplied = str(getattr(error, "reason", "") or "").strip()
+    # ``target_busy`` is relay-specific and predates the general reason set.
+    if supplied == "target_busy" or supplied in ALL_REASONS:
+        return supplied
+    return classify_agent_error(str(error))
+
+
 @method("bot_relay.roster.sync")
 def _(rid, params: dict, _root=_relay_root) -> dict:
     """Replace this gateway's view of agents on OTHER connections → ``{count}`` accepted rows
@@ -57,7 +68,8 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
 
 
 @method("bot_relay.deliver")
-def _(rid, params: dict, _root=_relay_root, _run=_run_delivery) -> dict:
+def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
+      _failure_reason=_delivery_failure_reason) -> dict:
     """Deliver a relayed DM (``profile``, attribution-prefixed ``message``) into a Bot Chat ON THIS
     GATEWAY via the one-turn ``hermes -p <profile> chat -c "Bot Chat"`` transport local DMs use →
     ``{reply}``. Blocking by design (Desktop relay worker; the RPC pool keeps it off the reader)."""
@@ -154,10 +166,22 @@ def _(rid, params: dict, _root=_relay_root, _run=_run_delivery) -> dict:
         reply = _bot_mode_delivery_text((proc.stdout or "").strip(), successful=True)
         return _ok(rid, {"reply": reply})
     except subprocess.TimeoutExpired:
-        return _err(rid, 5093, "delivery turn timed out")
+        from tools.bot_failure_reasons import DELIVERY_TIMEOUT
+
+        return _err(
+            rid,
+            5093,
+            "delivery turn timed out",
+            data={"reason": DELIVERY_TIMEOUT},
+        )
     except Exception as e:
-        # 'target_busy' extends the structured refusal enum.
-        return _err(rid, 5096 if getattr(e, "reason", "") == "target_busy" else 5094, str(e))
+        reason = _failure_reason(e)
+        return _err(
+            rid,
+            5096 if reason == "target_busy" else 5094,
+            str(e),
+            data={"reason": reason},
+        )
 
 
 @method("bot_relay.reply")
