@@ -977,8 +977,8 @@ _FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
 # Under pressure, demote large tool outputs even inside the protected region but
 # keep this many trailing messages verbatim.
 _PRESSURE_KEEP_RECENT_MESSAGES = 3
-# Newest image-bearing tool results kept verbatim; older image payloads retire
-# even inside protect_last_n (matches the Anthropic adapter's keep-window).
+# Newest image-bearing tool results kept verbatim during compaction; older image
+# payloads retire even inside protect_last_n. The send path does not use this window.
 # Native vision_analyze / computer_use screenshots that sit inside the protected tail cannot be demoted by
 # pass 2, so they ride every later request until anti-thrash disables compression (#92699).
 _MAX_KEEP_TOOL_IMAGES = 3
@@ -1262,13 +1262,18 @@ def _retire_stale_tool_result_images(result: List[Dict[str, Any]], keep_newest: 
     return pruned
 
 
-def _image_payload_bytes(msg: Dict[str, Any]) -> int:
-    """Serialized size of the image parts in a tool message (0 when it carries none)."""
-    content = msg.get("content")
+def _image_parts_stats(content: Any) -> tuple[int, int]:
+    """Return ``(image_part_count, serialized_image_bytes)`` for a message body."""
     inner = content.get("content") if isinstance(content, dict) and content.get("_multimodal") else content
     if not isinstance(inner, list):
-        return 0
-    return sum(len(json.dumps(p, ensure_ascii=False)) for p in inner if _is_image_part(p))
+        return 0, 0
+    count = 0
+    nbytes = 0
+    for part in inner:
+        if _is_image_part(part):
+            count += 1
+            nbytes += len(json.dumps(part, ensure_ascii=False))
+    return count, nbytes
 
 
 def _outbound_image_retire_count(
@@ -1277,6 +1282,9 @@ def _outbound_image_retire_count(
     limit: int = _OUTBOUND_IMAGE_LIMIT,
     budget: int = _OUTBOUND_IMAGE_BUDGET_BYTES,
     batch: int = _IMAGE_EVICTION_BATCH,
+    weights_newest_first: Optional[List[int]] = None,
+    reserved_count: int = 0,
+    reserved_bytes: int = 0,
 ) -> int:
     """Oldest image items to drop so a stateless send copy stays within ``limit`` and ``budget``.
 
@@ -1285,14 +1293,22 @@ def _outbound_image_retire_count(
     cached prefix; dropping a single fixed batch would stop enforcing the limit
     after the first window. Walk up in whole batches until both constraints hold
     (the last step may be short when fewer items remain).
+
+    ``weights_newest_first`` is the per-item image-block count (the API limit is
+    blocks, not messages). ``reserved_*`` are non-evictable images (user uploads)
+    that still consume the same per-request ceiling.
     """
     count = len(sizes_newest_first)
     if count == 0 or batch <= 0:
         return 0
+    weights = weights_newest_first if weights_newest_first is not None else [1] * count
 
     def _fits(retire: int) -> bool:
         kept = count - retire
-        return kept <= limit and sum(sizes_newest_first[:kept]) <= budget
+        return (
+            sum(weights[:kept]) + reserved_count <= limit
+            and sum(sizes_newest_first[:kept]) + reserved_bytes <= budget
+        )
 
     if _fits(0):
         return 0
@@ -1322,20 +1338,34 @@ def evict_stale_outbound_tool_images(api_messages: List[Dict[str, Any]]) -> int:
     instead of one per image, and costs nothing while the request is under the limits.
     Compaction's keep-newest window is intentionally not used here: a keep-floor would
     prevent the byte budget from being enforced when a few huge images already overflow.
+    User uploads are never rewritten; they still count toward the API block/byte ceiling
+    so tool screenshots are what give way when the request would otherwise go over.
     """
-    images = [
-        (i, size)
-        for i in range(len(api_messages) - 1, -1, -1)
-        if isinstance(api_messages[i], dict)
-        and api_messages[i].get("role") == "tool"
-        and (size := _image_payload_bytes(api_messages[i])) > 0
-    ]
-    retire = _outbound_image_retire_count([size for _, size in images])
+    images: List[tuple[int, int, int]] = []
+    reserved_count = reserved_bytes = 0
+    for i in range(len(api_messages) - 1, -1, -1):
+        msg = api_messages[i]
+        if not isinstance(msg, dict):
+            continue
+        weight, size = _image_parts_stats(msg.get("content"))
+        if weight == 0:
+            continue
+        if msg.get("role") == "tool":
+            images.append((i, weight, size))
+        else:
+            reserved_count += weight
+            reserved_bytes += size
+    retire = _outbound_image_retire_count(
+        [size for _, _, size in images],
+        weights_newest_first=[weight for _, weight, _ in images],
+        reserved_count=reserved_count,
+        reserved_bytes=reserved_bytes,
+    )
     if retire <= 0:
         return 0
 
     pruned = 0
-    for i, _ in images[-retire:]:
+    for i, _, _ in images[-retire:]:
         new_msg = _strip_images_from_tool_msg(api_messages[i])
         if new_msg is not None:
             api_messages[i] = new_msg

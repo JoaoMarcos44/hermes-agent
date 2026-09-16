@@ -592,16 +592,18 @@ def _manage_thinking_signatures(result: List[Dict[str, Any]], base_url: str | No
         m.pop("_thinking_signature_invalidated", None)  # internal flag, never on the wire
 
 
-def _tool_result_image_bytes(block: Dict[str, Any]) -> int:
-    """Serialized size of Anthropic ``image`` parts inside a ``tool_result`` block."""
+def _tool_result_image_stats(block: Dict[str, Any]) -> tuple[int, int]:
+    """Return ``(image_block_count, serialized_bytes)`` for an Anthropic ``tool_result``."""
     inner = block.get("content")
     if not isinstance(inner, list):
-        return 0
-    return sum(
-        len(json.dumps(part, ensure_ascii=False))
-        for part in inner
-        if isinstance(part, dict) and part.get("type") == "image"
-    )
+        return 0, 0
+    count = 0
+    nbytes = 0
+    for part in inner:
+        if isinstance(part, dict) and part.get("type") == "image":
+            count += 1
+            nbytes += len(json.dumps(part, ensure_ascii=False))
+    return count, nbytes
 
 
 def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
@@ -613,17 +615,33 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
     one more block per new screenshot makes every turn a full-prefix miss. Holding images
     until the limit and then dropping batches until both the count and byte budget hold
     costs one slower turn per batch instead. Uses the same retire policy as the OpenAI-shaped
-    send path so the two stages cannot drift.
+    send path so the two stages cannot drift. User image blocks count toward the ceiling
+    but are not rewritten.
     """
-    blocks = [
-        block
-        for msg in reversed(result)
-        for block in (msg.get("content") if isinstance(msg.get("content"), list) else [])
-        if _block_type(block) == "tool_result"
-        and isinstance(block.get("content"), list)
-        and _has_block_type(block["content"], {"image"})
-    ]
-    retire = _outbound_image_retire_count([_tool_result_image_bytes(block) for block in blocks])
+    blocks: List[Dict[str, Any]] = []
+    weights: List[int] = []
+    sizes: List[int] = []
+    reserved_count = reserved_bytes = 0
+    for msg in reversed(result):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if _block_type(block) == "tool_result":
+                weight, size = _tool_result_image_stats(block)
+                if weight:
+                    blocks.append(block)
+                    weights.append(weight)
+                    sizes.append(size)
+            elif _block_type(block) == "image":
+                reserved_count += 1
+                reserved_bytes += len(json.dumps(block, ensure_ascii=False))
+    retire = _outbound_image_retire_count(
+        sizes,
+        weights_newest_first=weights,
+        reserved_count=reserved_count,
+        reserved_bytes=reserved_bytes,
+    )
     if retire <= 0:
         return
     for block in blocks[-retire:]:
