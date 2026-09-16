@@ -14,12 +14,7 @@ from agent.anthropic_endpoints import (
     _is_deepseek_anthropic_endpoint, _is_kimi_family_endpoint, _is_nous_portal_endpoint,
     _is_third_party_anthropic_endpoint, _model_name_is_deepseek_thinking,
 )
-from agent.context_compressor import (
-    _IMAGE_EVICTION_BATCH,
-    _IMAGE_EVICTION_BATCH as _SCREENSHOT_EVICTION_BATCH,
-    _MAX_KEEP_TOOL_IMAGES as _MAX_KEEP_SCREENSHOTS,
-    _OUTBOUND_IMAGE_LIMIT,
-)
+from agent.context_compressor import _outbound_image_retire_count
 
 logger = logging.getLogger(__name__)
 
@@ -597,6 +592,18 @@ def _manage_thinking_signatures(result: List[Dict[str, Any]], base_url: str | No
         m.pop("_thinking_signature_invalidated", None)  # internal flag, never on the wire
 
 
+def _tool_result_image_bytes(block: Dict[str, Any]) -> int:
+    """Serialized size of Anthropic ``image`` parts inside a ``tool_result`` block."""
+    inner = block.get("content")
+    if not isinstance(inner, list):
+        return 0
+    return sum(
+        len(json.dumps(part, ensure_ascii=False))
+        for part in inner
+        if isinstance(part, dict) and part.get("type") == "image"
+    )
+
+
 def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
     """Retire screenshot payloads once the request nears the API's per-request image limit.
 
@@ -604,7 +611,9 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
     count: retiring an image edits a block the provider has already cached, and Anthropic
     matches its prompt cache on an exact byte prefix, so a count-based window that retires
     one more block per new screenshot makes every turn a full-prefix miss. Holding images
-    until the limit and then dropping a batch costs one slower turn per batch instead.
+    until the limit and then dropping batches until both the count and byte budget hold
+    costs one slower turn per batch instead. Uses the same retire policy as the OpenAI-shaped
+    send path so the two stages cannot drift.
     """
     blocks = [
         block
@@ -614,9 +623,9 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
         and isinstance(block.get("content"), list)
         and _has_block_type(block["content"], {"image"})
     ]
-    if len(blocks) <= _OUTBOUND_IMAGE_LIMIT:
+    retire = _outbound_image_retire_count([_tool_result_image_bytes(block) for block in blocks])
+    if retire <= 0:
         return
-    retire = min(_SCREENSHOT_EVICTION_BATCH, max(len(blocks) - _MAX_KEEP_SCREENSHOTS, 0))
     for block in blocks[-retire:]:
         placeholder = _text_block("[screenshot removed to save context]")
         block["content"] = [
