@@ -14,6 +14,12 @@ from agent.anthropic_endpoints import (
     _is_deepseek_anthropic_endpoint, _is_kimi_family_endpoint, _is_nous_portal_endpoint,
     _is_third_party_anthropic_endpoint, _model_name_is_deepseek_thinking,
 )
+from agent.context_compressor import (
+    _IMAGE_EVICTION_BATCH,
+    _IMAGE_EVICTION_BATCH as _SCREENSHOT_EVICTION_BATCH,
+    _MAX_KEEP_TOOL_IMAGES as _MAX_KEEP_SCREENSHOTS,
+    _OUTBOUND_IMAGE_LIMIT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -592,19 +598,30 @@ def _manage_thinking_signatures(result: List[Dict[str, Any]], base_url: str | No
 
 
 def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
-    """Keep only the 3 most recent computer-use screenshots (~1,465 tokens each); older images
-    become a placeholder text block. Mutates ``result`` in place."""
-    image_count = 0
-    for msg in reversed(result):
-        content = msg.get("content")
-        for block in content if isinstance(content, list) else []:
-            inner = block.get("content") if _block_type(block) == "tool_result" else None
-            if not isinstance(inner, list) or not _has_block_type(inner, {"image"}):
-                continue
-            image_count += 1
-            if image_count > 3:
-                placeholder = _text_block("[screenshot removed to save context]")
-                block["content"] = [placeholder if b.get("type") == "image" else b for b in inner]
+    """Retire screenshot payloads once the request nears the API's per-request image limit.
+
+    Mutates ``result`` in place. Eviction is triggered by the LIMIT, not by a keep-newest
+    count: retiring an image edits a block the provider has already cached, and Anthropic
+    matches its prompt cache on an exact byte prefix, so a count-based window that retires
+    one more block per new screenshot makes every turn a full-prefix miss. Holding images
+    until the limit and then dropping a batch costs one slower turn per batch instead.
+    """
+    blocks = [
+        block
+        for msg in reversed(result)
+        for block in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+        if _block_type(block) == "tool_result"
+        and isinstance(block.get("content"), list)
+        and _has_block_type(block["content"], {"image"})
+    ]
+    if len(blocks) <= _OUTBOUND_IMAGE_LIMIT:
+        return
+    retire = min(_SCREENSHOT_EVICTION_BATCH, max(len(blocks) - _MAX_KEEP_SCREENSHOTS, 0))
+    for block in blocks[-retire:]:
+        placeholder = _text_block("[screenshot removed to save context]")
+        block["content"] = [
+            placeholder if b.get("type") == "image" else b for b in block["content"]
+        ]
 
 
 def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
