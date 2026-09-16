@@ -1958,3 +1958,77 @@ def test_empty_dict_default_sections_are_open_containers():
     known, suggestion = _validate_config_key("compression.model_threshold.gpt-5")
     assert known is False
     assert suggestion == "compression.model_thresholds"
+
+
+class TestSaveConfigEmptyFileGuard:
+    """#113301: an existing config.yaml that reads as no-settings must not be saved over —
+    strip_defaults would collapse the file to the caller's non-default values (32 -> 7)."""
+
+    def test_save_config_refuses_when_existing_file_reads_empty(self, tmp_path):
+        import os
+
+        import yaml
+        from unittest.mock import patch
+
+        from hermes_cli.config import load_config, save_config
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+            config["model"] = "test/replacement"
+            with __import__("pytest").raises(RuntimeError, match="Refusing to save configuration"):
+                save_config(config)
+
+        assert config_path.read_text(encoding="utf-8") == ""
+
+    def test_save_config_refuses_when_existing_file_is_whitespace_only(self, tmp_path):
+        import os
+        from unittest.mock import patch
+
+        from hermes_cli.config import save_config
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("\n# torn write left nothing readable\n\n", encoding="utf-8")
+        original = config_path.read_text(encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with __import__("pytest").raises(RuntimeError, match="Refusing to save configuration"):
+                save_config({"model": "test/replacement"})
+
+        assert config_path.read_text(encoding="utf-8") == original
+
+    def test_save_config_without_existing_file_is_first_install(self, tmp_path):
+        import os
+
+        import yaml
+        from unittest.mock import patch
+
+        from hermes_cli.config import save_config
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config({"model": "test/first-install"})
+
+        saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+        assert saved["model"] == "test/first-install"
+
+    def test_save_config_on_intact_file_preserves_explicit_defaults(self, tmp_path):
+        import os
+
+        import yaml
+        from unittest.mock import patch
+
+        from hermes_cli.config import load_config, save_config
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("model:\n  provider: test/p\nskills:\n  write_approval: true\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+            config["model"] = "test/other"
+            save_config(config)
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["model"] == "test/other"
+        assert saved["skills"]["write_approval"] is True
