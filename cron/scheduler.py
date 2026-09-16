@@ -2401,12 +2401,21 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
                     if self_removal_delivery_allowed(job_id):
                         # Record dropped by this run; nothing left to keep fresh.
+                        last_confirmed = time.monotonic()
                         continue
-                    lost_ownership.set()
-                    logger.warning(
-                        "Job '%s': fire claim ownership lost; interrupting stale run",
-                        job_id)
-                    return
+                    # Transient owner mismatch or claim churn can occur under lock
+                    # contention during long runs; apply the same grace as exceptions
+                    # instead of immediate loss (#113357 root cause).
+                    if (
+                        time.monotonic() - last_confirmed
+                        >= _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS
+                    ):
+                        lost_ownership.set()
+                        logger.warning(
+                            "Job '%s': fire claim ownership lost; interrupting stale run",
+                            job_id)
+                        return
+                    continue
                 last_confirmed = time.monotonic()
             except Exception:
                 logger.debug("Job '%s': fire_claim heartbeat failed", job_id, exc_info=True)
