@@ -14,7 +14,6 @@ from agent.anthropic_endpoints import (
     _is_deepseek_anthropic_endpoint, _is_kimi_family_endpoint, _is_nous_portal_endpoint,
     _is_third_party_anthropic_endpoint, _model_name_is_deepseek_thinking,
 )
-from agent.context_compressor import _outbound_image_retire_count
 
 logger = logging.getLogger(__name__)
 
@@ -639,6 +638,10 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
             elif _block_type(block) == "image":
                 reserved_count += 1
                 reserved_bytes += len(json.dumps(block, ensure_ascii=False))
+    if not blocks and not reserved_count:
+        return
+    from agent.context_compressor import _outbound_image_retire_count
+
     retire = _outbound_image_retire_count(
         sizes,
         weights_newest_first=weights,

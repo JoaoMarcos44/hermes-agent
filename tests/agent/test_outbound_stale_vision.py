@@ -139,6 +139,8 @@ class TestOutboundImageRetireCount:
         """The keep floor only overrides the limit when reserved uploads make it unreachable."""
         # Surviving tool blocks alone exceed the block limit: one 25-block tool_result must go.
         assert _outbound_image_retire_count([10], weights_newest_first=[25]) == 1
+        # Four 10-block tool results (keeping 30 past floor violates limit): retire all past floor.
+        assert _outbound_image_retire_count([10] * 4, weights_newest_first=[10, 10, 10, 10]) == 4
         # Tool bytes + reserved bytes over budget while reserved alone fits: retire past the floor.
         mb = 1_000_000
         assert _outbound_image_retire_count([5 * mb] * 4, reserved_bytes=20 * mb) == 4

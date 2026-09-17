@@ -54,6 +54,9 @@ class _FakeRegistry:
             return SimpleNamespace(name=name)  # truthy = tool exists
         return None
 
+    def register(self, *args, **kwargs):
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Response side: mcp__ wire name -> registry name
