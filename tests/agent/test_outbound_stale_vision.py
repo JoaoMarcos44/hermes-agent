@@ -144,8 +144,11 @@ class TestOutboundImageRetireCount:
         # Tool bytes + reserved bytes over budget while reserved alone fits: retire past the floor.
         mb = 1_000_000
         assert _outbound_image_retire_count([5 * mb] * 4, reserved_bytes=20 * mb) == 4
-        # Reserved bytes alone already blow the budget: no retirement can fix it, floor wins.
-        assert _outbound_image_retire_count([5 * mb] * 4, reserved_bytes=_OUTBOUND_IMAGE_BUDGET_BYTES + 1) == 1
+        # Reserved bytes alone already exceed the budget: the floor must still not hold, because
+        # the budget sits below the API's hard request ceiling and the tool bytes are what push
+        # the request over it (25 MB uploads + 9 MB screenshots -> 413; 25 MB alone is accepted).
+        assert _outbound_image_retire_count([3 * mb] * 3, reserved_bytes=25 * mb) == 3
+        assert _outbound_image_retire_count([5 * mb] * 4, reserved_bytes=_OUTBOUND_IMAGE_BUDGET_BYTES + 1) == 4
 
 
 class TestOutboundStaleVisionEviction:
@@ -284,6 +287,45 @@ class TestOutboundStaleVisionEviction:
         assert len(kept_tools) + 15 <= _OUTBOUND_IMAGE_LIMIT
         assert len(kept_tools) < 10
         assert len(kept_tools) >= _MAX_KEEP_TOOL_IMAGES
+
+    def test_mixed_request_stays_under_the_api_byte_ceiling(self):
+        """Uploads alone over the 24 MB budget must not shelter tool bytes that push a 413.
+
+        Five 5 MB uploads + three 3 MB screenshots serialize to ~34 MB, over Anthropic's
+        32 MB request ceiling; retiring the screenshots brings it back under.
+        """
+        import json
+
+        mb = 1_000_000
+        history: list[dict] = []
+        for u in range(5):
+            history.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"look {u}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64," + "U" * (5 * mb)},
+                        },
+                    ],
+                }
+            )
+        for i in range(3):
+            history.extend(_image_tool(i, blob="T" * (3 * mb)))
+        outbound = sanitize_api_messages(history)
+        assert len(json.dumps(outbound)) > 32 * mb
+        assert evict_stale_outbound_tool_images(outbound) == 3
+        assert _image_bearing_tool_ids(outbound) == []
+        assert len(json.dumps(outbound)) < 32 * mb
+        user_images = [
+            part
+            for m in outbound
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+            for part in m["content"]
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+        assert len(user_images) == 5
 
     def test_user_uploads_filling_ceiling_keep_newest_screenshots(self):
         history: list[dict] = []

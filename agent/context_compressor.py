@@ -1341,13 +1341,15 @@ def _floor_holds(kept_weights: List[int], kept_sizes: List[int], *, limit: int, 
     The floor exists so reserved user uploads cannot strip the newest screenshots. It must
     not shelter a residual violation that retiring tool content would fix: over the block
     limit the API only tightens the per-image dimension cap (soft), so the floor wins
-    unless the surviving tool blocks alone exceed it; over the byte budget the request is
-    rejected outright (hard), so the floor wins only when reserved bytes alone already make
-    the budget unreachable.
+    unless the surviving tool blocks alone exceed it. Over the byte budget the request is
+    rejected outright (hard), so the floor never wins: ``budget`` sits below the API's
+    request ceiling, and even when reserved uploads alone exceed the budget, retiring the
+    tool bytes is what keeps the request under the ceiling (25 MB of uploads + 9 MB of
+    screenshots is a 413; 25 MB alone is not).
     """
     if sum(kept_weights) > limit:
         return False
-    return sum(kept_sizes) + reserved_bytes <= budget or reserved_bytes > budget
+    return sum(kept_sizes) + reserved_bytes <= budget
 
 
 def evict_stale_outbound_tool_images(api_messages: List[Dict[str, Any]]) -> int:
