@@ -16,6 +16,7 @@ from __future__ import annotations
 from agent.agent_runtime_helpers import sanitize_api_messages
 from agent.context_compressor import (
     _IMAGE_EVICTION_BATCH,
+    _MAX_KEEP_TOOL_IMAGES,
     _OUTBOUND_IMAGE_BUDGET_BYTES,
     _OUTBOUND_IMAGE_LIMIT,
     _outbound_image_retire_count,
@@ -122,8 +123,17 @@ class TestOutboundImageRetireCount:
         assert len(sizes) <= _OUTBOUND_IMAGE_LIMIT
         retire = _outbound_image_retire_count(sizes, reserved_count=15)
         kept = 10 - retire
+        assert kept >= _MAX_KEEP_TOOL_IMAGES
+        assert kept < 10
         assert kept + 15 <= _OUTBOUND_IMAGE_LIMIT
-        assert retire >= _IMAGE_EVICTION_BATCH
+
+    def test_reserved_over_limit_never_strips_newest_tool_images(self):
+        """User uploads may fill the API ceiling; the newest screenshots must still reach the model."""
+        sizes = [10] * 4
+        retire = _outbound_image_retire_count(sizes, reserved_count=_OUTBOUND_IMAGE_LIMIT + 1)
+        kept = 4 - retire
+        assert kept == _MAX_KEEP_TOOL_IMAGES
+        assert retire == 1
 
 
 class TestOutboundStaleVisionEviction:
@@ -261,3 +271,32 @@ class TestOutboundStaleVisionEviction:
         kept_tools = _image_bearing_tool_ids(outbound)
         assert len(kept_tools) + 15 <= _OUTBOUND_IMAGE_LIMIT
         assert len(kept_tools) < 10
+        assert len(kept_tools) >= _MAX_KEEP_TOOL_IMAGES
+
+    def test_user_uploads_filling_ceiling_keep_newest_screenshots(self):
+        history: list[dict] = []
+        for u in range(_OUTBOUND_IMAGE_LIMIT + 1):
+            history.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"look {u}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,USER{u}"},
+                        },
+                    ],
+                }
+            )
+        history.extend(_image_tool(0))
+        outbound = sanitize_api_messages(history)
+        evict_stale_outbound_tool_images(outbound)
+        assert _image_bearing_tool_ids(outbound) == ["call_0"]
+        user_images = [
+            part
+            for m in outbound
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+            for part in m["content"]
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+        assert len(user_images) == _OUTBOUND_IMAGE_LIMIT + 1
