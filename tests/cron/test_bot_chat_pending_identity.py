@@ -80,3 +80,20 @@ def test_corrupt_record_is_retained_without_blocking_other_admissions(tmp_path, 
     queue.drain()
     assert seen == ["first", "second"]
     assert broken.read_text(encoding="utf-8") == "{"
+
+
+@pytest.mark.parametrize("payload", ["42", "[]"])
+def test_parseable_non_object_receipt_does_not_wedge_queue(tmp_path, monkeypatch, payload):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    queue.defer("a" * 64, {"id": "job"}, "first", "", tmp_path)
+    broken = tmp_path / "cron" / "bot_chat_pending" / f"{'e' * 64}.json"
+    broken.write_text(payload, encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(delivery, "_deliver_to_bot_chat", lambda j, c, p, **kw: seen.append(c))
+    queue.drain()
+    queue.defer("b" * 64, {"id": "next"}, "second", "", tmp_path)
+    queue.drain()
+    assert seen == ["first", "second"]
+    assert broken.read_text(encoding="utf-8") == payload
+    with pytest.raises(ValueError):
+        queue.read_pending("e" * 64)

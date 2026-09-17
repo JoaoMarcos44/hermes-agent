@@ -24,6 +24,8 @@ from multiprocessing import Lock, Pool
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from utils import parse_json_object
+
 import fire
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
@@ -489,12 +491,12 @@ class BatchRunner:
                     continue
 
                 try:
-                    entry = json.loads(line)
+                    entry = parse_json_object(line)
                     if 'prompt' not in entry:
                         print(f"⚠️  Warning: Line {line_num} missing 'prompt' field, skipping")
                         continue
                     dataset.append(entry)
-                except json.JSONDecodeError as e:
+                except ValueError as e:
                     print(f"⚠️  Warning: Invalid JSON on line {line_num}: {e}")
                     continue
 
@@ -551,13 +553,13 @@ class BatchRunner:
                 with open(batch_file, 'r', encoding='utf-8') as f:
                     for line in f:
                         try:
-                            entry = json.loads(line.strip())
+                            entry = parse_json_object(line.strip())
                             if entry.get("failed", False):
                                 continue
                             prompt_text = _entry_prompt_text(entry)
                             if prompt_text:
                                 completed_prompts.add(prompt_text)
-                        except json.JSONDecodeError:
+                        except ValueError:
                             continue
             except Exception as e:
                 print(f"  ⚠️  Warning: Error reading {batch_file.name}: {e}")
@@ -720,7 +722,7 @@ class BatchRunner:
                     for line in infile:
                         total_entries += 1
                         try:
-                            data = json.loads(line)
+                            data = parse_json_object(line)
 
                             if data.get("discarded"):
                                 tombstone_entries += 1
@@ -734,7 +736,7 @@ class BatchRunner:
                                 print(f"   ⚠️  Filtering corrupted entry (batch {batch_num}): invalid tool '{invalid_preview}'")
                                 continue
                             outfile.write(line)
-                        except json.JSONDecodeError:
+                        except ValueError:
                             filtered_entries += 1
                             print(f"   ⚠️  Filtering invalid JSON entry (batch {batch_num})")
 

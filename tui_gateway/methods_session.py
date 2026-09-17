@@ -6,6 +6,8 @@ server.py the same way (tests monkeypatching ``server.X`` still intercept)."""
 
 import contextlib
 
+from utils import parse_json_object, read_json_object_file
+
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -2159,7 +2161,7 @@ def _legacy_spawn_tree_entry(p, session_dir_name: str) -> dict | None:
         return None
     raw = {}
     with contextlib.suppress(Exception):
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = parse_json_object(p.read_text(encoding="utf-8"))
     subagents = raw.get("subagents") or []
     return {"path": str(p), "session_id": raw.get("session_id") or session_dir_name,
             "finished_at": raw.get("finished_at") or stat.st_mtime, "started_at": raw.get("started_at"),
@@ -2195,8 +2197,8 @@ def _(rid, params: dict) -> dict:
     except (ValueError, OSError) as exc:
         return _err(rid, 4030, f"path outside spawn-trees root: {exc}")
     try:
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = read_json_object_file(resolved)
+    except (OSError, ValueError) as exc:
         return _err(rid, 5000, f"spawn_tree.load failed: {exc}")
     return _ok(rid, payload)
 

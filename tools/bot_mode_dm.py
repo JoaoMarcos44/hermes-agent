@@ -462,7 +462,8 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     intent: dict[str, Any]
     intent_path = Path(dm_file + ".live.json")
     if intent_path.exists():
-        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        from utils import read_json_object_file
+        intent = read_json_object_file(intent_path)
     else:
         assert profile_home is not None
         owner = find_canonical_live_owner(profile_home)
@@ -474,7 +475,8 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
         try:
             fd = os.open(intent_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            from utils import read_json_object_file
+            intent = read_json_object_file(intent_path)
         else:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(intent, stream)

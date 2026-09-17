@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 from tools.bot_mode_probe import _default_home, _hermes_root
-from utils import atomic_json_write
+from utils import atomic_json_write, read_json_object_file
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +240,7 @@ def _expire_if_stale(root: Path | str, path: Path, ttl: float, now: float) -> bo
     """True when the outbox envelope is older than ``ttl``; writes the 'queued_expired'
     reply so the sender's waiter resolves (best effort). Unreadable envelopes are left for the claim."""
     try:
-        env = json.loads(path.read_text(encoding="utf-8"))
+        env = read_json_object_file(path)
         created = float(env.get("created_at") or path.stat().st_mtime)
     except (OSError, ValueError):
         return False
@@ -287,7 +287,7 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
         claimed = base / CLAIMED_DIR / path.name
         with contextlib.suppress(OSError, ValueError):
             os.replace(path, claimed)  # atomic claim
-            out.append(json.loads(claimed.read_text(encoding="utf-8")))
+            out.append(read_json_object_file(claimed))
     return out
 
 

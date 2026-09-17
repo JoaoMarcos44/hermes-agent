@@ -330,6 +330,26 @@ def atomic_json_write(
                   fsync_dir=fsync_dir)
 
 
+def parse_json_object(text: str) -> dict:
+    """Decode *text* as a JSON object.
+
+    ``json.loads`` accepts any JSON value. Receipt and state scans then subscript
+    the result; a scalar or array wedges the whole directory. Raise ValueError so
+    existing ``except (OSError, ValueError)`` skip paths treat non-objects like
+    corrupt JSON. Distinct from :func:`read_json_or_empty`, which defaults to
+    ``{}`` and must not be used for exact-id receipts (that would overwrite).
+    """
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+    return data
+
+
+def read_json_object_file(path: Union[str, Path]) -> dict:
+    """Read *path* as a JSON object. Missing files raise FileNotFoundError."""
+    return parse_json_object(Path(path).read_text(encoding="utf-8"))
+
+
 def read_json_or_empty(path: Union[str, Path]) -> dict:
     """The JSON object at *path*, or ``{}`` when the file is missing, unreadable, malformed or
     not an object. The read half of every ``read → merge → atomic_json_write`` config store

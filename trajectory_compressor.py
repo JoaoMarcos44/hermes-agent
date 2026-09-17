@@ -23,9 +23,10 @@ import asyncio
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from dataclasses import asdict, dataclass, field
+
 from datetime import datetime
 
-from utils import base_url_host_matches, base_url_hostname
+from utils import base_url_host_matches, base_url_hostname, parse_json_object
 import fire
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.console import Console
@@ -77,10 +78,12 @@ def _load_jsonl(path: Path, on_error: Optional[Callable[[int, json.JSONDecodeErr
             if not line.strip():
                 continue
             try:
-                entries.append((line_num, json.loads(line)))
+                entries.append((line_num, parse_json_object(line)))
             except json.JSONDecodeError as e:
                 if on_error is not None:
                     on_error(line_num, e)
+            except ValueError:
+                continue
     return entries
 
 
@@ -572,7 +575,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
 
     async def process_entry_async(self, entry: Dict[str, Any]) -> Tuple[Dict[str, Any], TrajectoryMetrics]:
         """Compress one JSONL entry's ``conversations``; attach metrics when compressed."""
-        if "conversations" not in entry:
+        if not isinstance(entry, dict) or "conversations" not in entry:
             return entry, TrajectoryMetrics()
         compressed_trajectory, metrics = await self.compress_trajectory_async(entry["conversations"])
         result = dict(entry, conversations=compressed_trajectory)

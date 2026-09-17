@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int
 from hermes_constants import get_hermes_home
+from utils import parse_json_object
 
 PROTOCOL_VERSION = "1.0"
 
@@ -456,8 +457,8 @@ def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
     for line in lines:
         if line.strip():
             try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
+                out.append(parse_json_object(line))
+            except ValueError:
                 pass
     return out[-limit:]
 

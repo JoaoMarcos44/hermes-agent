@@ -6,14 +6,13 @@ turns, only pending requests are eligible: a persisted claim never expires.
 from __future__ import annotations
 
 import contextvars
-import json
 import logging
 import threading
 from pathlib import Path
 
 from hermes_cli.active_sessions import _FileLock
 from hermes_constants import get_hermes_home
-from utils import atomic_json_write
+from utils import atomic_json_write, read_json_object_file
 
 logger = logging.getLogger(__name__)
 _warned_unreadable: set[Path] = set()
@@ -27,7 +26,7 @@ def _root() -> Path:
 
 def read_pending(key: str) -> dict | None:
     try:
-        return json.loads((_root() / f"{key}.json").read_text(encoding="utf-8"))
+        return read_json_object_file(_root() / f"{key}.json")
     except FileNotFoundError:
         return None
 
@@ -36,8 +35,8 @@ def _records(root: Path) -> list[tuple[Path, dict]]:
     records = []
     for path in root.glob("*.json"):
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:  # ValueError: corrupt JSON and invalid UTF-8 alike
+            record = read_json_object_file(path)
+        except (OSError, ValueError) as exc:  # ValueError: corrupt JSON, invalid UTF-8, and non-objects
             # Keep damaged or unreadable receipts as evidence; never replay them or block peers
             # (same rule as tools/bot_live_delivery.py::_scan_read — one bad file must not wedge the dir).
             # The scheduler drains every tick: ERROR once per receipt per process, DEBUG after.
@@ -93,7 +92,10 @@ def _drain(root: Path) -> None:
         records = sorted(_records(root), key=lambda item: item[1]["sequence"])
     for path, _ in records:
         with _FileLock(root / ".lock"):
-            record = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                record = read_json_object_file(path)
+            except (OSError, ValueError):
+                continue
             if record["status"] != "queued":
                 continue
             home = Path(record["home"])

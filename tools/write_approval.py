@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
-from utils import atomic_json_write
+from utils import atomic_json_write, read_json_object_file
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     for p in _pending_files(subsystem):
         try:
-            records.append(json.loads(p.read_text(encoding="utf-8")))
+            records.append(read_json_object_file(p))
         except Exception:
             logger.warning("Skipping unreadable pending record: %s", p)
     records.sort(key=lambda r: r.get("created_at", 0))
@@ -106,7 +106,7 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     with suppress(Exception):
-        return json.loads(path.read_text(encoding="utf-8"))
+        return read_json_object_file(path)
     return None
 
 

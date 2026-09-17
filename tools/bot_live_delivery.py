@@ -7,7 +7,6 @@ not permission to execute the same input again. Receipts are permanent.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -15,7 +14,7 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from utils import atomic_json_write, atomic_write_text, fsync_directory
+from utils import atomic_json_write, atomic_write_text, fsync_directory, read_json_object_file
 from pathlib import Path
 from typing import Any
 
@@ -104,7 +103,7 @@ def _locked(home: Path | str):
 
 def _read(path: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return read_json_object_file(path)
     except FileNotFoundError:
         return None
 

@@ -21,6 +21,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from utils import read_json_object_file
+
 logger = logging.getLogger(__name__)
 
 # Reason tag for transcript messages dropped by the in-memory pending cap during live
@@ -146,7 +148,7 @@ def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
     entries = []
     for path in candidates:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = read_json_object_file(path)
         except Exception:
             continue
         if (payload.get("reason") != TRANSCRIPT_CAP_DROP_REASON
@@ -223,7 +225,7 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
             # One unparseable payload or rejected append must only skip THIS file: the file is
             # never unlinked, so aborting the pass would re-poison every later boot.
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = read_json_object_file(path)
                 # Agent-history snapshots are for manual operator recovery, not automatic DB
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":

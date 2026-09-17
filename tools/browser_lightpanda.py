@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from utils import read_json_object_file
+
 logger = logging.getLogger(__name__)
 
 LIGHTPANDA_INSTALL_URL = "https://lightpanda.io/docs/run-locally/installation/one-liner"
@@ -315,7 +317,7 @@ def reap_orphaned_lightpanda() -> int:
     for record_path in sorted(state_dir.glob("*.json")):
         session_name = record_path.stem
         try:
-            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record = read_json_object_file(record_path)
         except (OSError, ValueError):
             record_path.unlink(missing_ok=True)
             continue

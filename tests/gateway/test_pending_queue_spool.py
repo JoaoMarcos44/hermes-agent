@@ -221,3 +221,29 @@ class TestSpoolPrimitives:
         assert remaining == 0
         assert seen == ["c0", "c1", "c2"]
         assert _spool_files(spool_home) == []
+
+    def test_non_object_pending_file_is_preserved_and_spawn_index_skips_scalars(self, spool_home):
+        flush_dir = shutdown_flush._get_flush_dir()
+        flush_dir.mkdir(parents=True, exist_ok=True)
+        foreign = flush_dir / "pending-foreign.json"
+        foreign.write_text("42", encoding="utf-8")
+        replayed, remaining = shutdown_flush.drain_transcript_spool(
+            "sess-x", lambda m: None
+        )
+        assert replayed == 0
+        assert remaining == 0
+        assert foreign.exists()
+        assert foreign.read_text(encoding="utf-8") == "42"
+
+        from tui_gateway.server import _SPAWN_TREE_INDEX, _read_spawn_tree_index
+
+        session_dir = spool_home / "spawn-tree"
+        session_dir.mkdir()
+        healthy = session_dir / "ok.json"
+        healthy.write_text("{}", encoding="utf-8")
+        (session_dir / _SPAWN_TREE_INDEX).write_text(
+            "42\n" + json.dumps({"path": str(healthy)}) + "\n",
+            encoding="utf-8",
+        )
+        entries = _read_spawn_tree_index(session_dir)
+        assert entries == [{"path": str(healthy)}]

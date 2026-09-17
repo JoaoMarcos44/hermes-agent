@@ -26,7 +26,7 @@ from hermes_constants import (
     get_hermes_home, get_hermes_home_override, get_process_hermes_home, profile_name_for_home,
     reset_hermes_home_override, set_hermes_home_override)
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import file_signature, is_truthy_value
+from utils import file_signature, is_truthy_value, parse_json_object
 from hermes_state_ids import new_session_id
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import canonicalize_replay_history
@@ -3036,8 +3036,8 @@ def _read_spawn_tree_index(session_dir) -> list[dict]:
         with (session_dir / _SPAWN_TREE_INDEX).open("r", encoding="utf-8") as f:
             for line in f:
                 if line := line.strip():
-                    with contextlib.suppress(json.JSONDecodeError):
-                        out.append(json.loads(line))
+                    with contextlib.suppress(ValueError):
+                        out.append(parse_json_object(line))
     except OSError:
         return []
     return out
