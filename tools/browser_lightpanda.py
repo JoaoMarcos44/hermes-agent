@@ -316,6 +316,9 @@ def reap_orphaned_lightpanda() -> int:
         session_name = record_path.stem
         try:
             record = json.loads(record_path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                record_path.unlink(missing_ok=True)
+                continue
         except (OSError, ValueError):
             record_path.unlink(missing_ok=True)
             continue

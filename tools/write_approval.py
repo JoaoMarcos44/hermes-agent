@@ -93,7 +93,11 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     for p in _pending_files(subsystem):
         try:
-            records.append(json.loads(p.read_text(encoding="utf-8")))
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                records.append(data)
+            else:
+                logger.warning("Skipping non-dict pending record: %s", p)
         except Exception:
             logger.warning("Skipping unreadable pending record: %s", p)
     records.sort(key=lambda r: r.get("created_at", 0))
@@ -106,7 +110,8 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     with suppress(Exception):
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
     return None
 
 

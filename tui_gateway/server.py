@@ -3031,7 +3031,9 @@ def _read_spawn_tree_index(session_dir) -> list[dict]:
             for line in f:
                 if line := line.strip():
                     with contextlib.suppress(json.JSONDecodeError):
-                        out.append(json.loads(line))
+                        entry = json.loads(line)
+                        if isinstance(entry, dict):
+                            out.append(entry)
     except OSError:
         return []
     return out

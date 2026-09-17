@@ -125,6 +125,7 @@ def test_unreadable_ticket_does_not_wedge_bulk_scans(tmp_path, caplog):
     corrupt = root / f"{'1' * 32}.json"
     corrupt.write_text("{not json", encoding="utf-8")
     (root / f"{'2' * 32}.json").write_bytes(b"\xff\xfe\x00garbage")  # invalid UTF-8, not just bad JSON
+    (root / f"{'3' * 32}.json").write_text("[]", encoding="utf-8")  # parseable non-dict JSON
     with caplog.at_level(logging.WARNING, logger="tools.bot_live_delivery"):
         # Sender side: admission of a fresh id must survive the sequence sweep.
         admitted = mailbox.deliver_to_live_owner(tmp_path, owner, "second", delivery_id="f" * 32)
@@ -139,6 +140,8 @@ def test_unreadable_ticket_does_not_wedge_bulk_scans(tmp_path, caplog):
               if record.message.startswith(f"bot_live_delivery: skipping unreadable ticket {'e' * 32}.json")
               and "Permission denied" in record.message]
     assert len(denied) == 1, "one persistent bad ticket must warn once per process, not per scan"
+    assert any("skipping unreadable ticket" in r.message and "expected JSON object" in r.message
+               for r in caplog.records)
 
 
 @pytest.mark.skipif(os.name == "nt" or getattr(os, "geteuid", lambda: 1)() == 0,
@@ -158,3 +161,18 @@ def test_unreadable_ticket_keeps_exact_id_reads_fail_closed(tmp_path):
         mailbox.deliver_to_live_owner(tmp_path, owner, "same id", delivery_id="e" * 32)
     with pytest.raises(PermissionError):
         mailbox.read_delivery_result(tmp_path, "e" * 32)
+
+
+def test_non_dict_ticket_keeps_exact_id_reads_fail_closed(tmp_path):
+    from tools import bot_live_delivery as mailbox
+
+    owner = dict(profile_home=str(tmp_path.resolve()), session_id="chat",
+                 lease_id="lease", live_session_id="live")
+    root = tmp_path / "runtime" / mailbox.DELIVERY_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    bad = root / f"{'7' * 32}.json"
+    bad.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="expected JSON object"):
+        mailbox.deliver_to_live_owner(tmp_path, owner, "same id", delivery_id="7" * 32)
+    with pytest.raises(ValueError, match="expected JSON object"):
+        mailbox.read_delivery_result(tmp_path, "7" * 32)

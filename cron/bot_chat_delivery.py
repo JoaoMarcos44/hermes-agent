@@ -25,19 +25,28 @@ def _root() -> Path:
     return get_hermes_home().resolve() / "cron" / "bot_chat_pending"
 
 
-def read_pending(key: str) -> dict | None:
+def _read(path: Path) -> dict | None:
     try:
-        return json.loads((_root() / f"{key}.json").read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
+    if not isinstance(data, dict):
+        raise ValueError(f"expected JSON object, got {type(data).__name__}")
+    return data
+
+
+def read_pending(key: str) -> dict | None:
+    return _read(_root() / f"{key}.json")
 
 
 def _records(root: Path) -> list[tuple[Path, dict]]:
     records = []
     for path in root.glob("*.json"):
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:  # ValueError: corrupt JSON and invalid UTF-8 alike
+            record = _read(path)
+            if record is None:
+                continue
+        except (OSError, ValueError) as exc:  # ValueError: corrupt JSON, invalid UTF-8 and non-dict alike
             # Keep damaged or unreadable receipts as evidence; never replay them or block peers
             # (same rule as tools/bot_live_delivery.py::_scan_read — one bad file must not wedge the dir).
             # The scheduler drains every tick: ERROR once per receipt per process, DEBUG after.
@@ -86,8 +95,11 @@ def _drain(root: Path) -> None:
         records = sorted(_records(root), key=lambda item: item[1]["sequence"])
     for path, _ in records:
         with _FileLock(root / ".lock"):
-            record = json.loads(path.read_text(encoding="utf-8"))
-            if record["status"] != "queued":
+            try:
+                record = _read(path)
+            except (OSError, ValueError):
+                record = None
+            if not record or record.get("status") != "queued":
                 continue
             home = Path(record["home"])
             try:

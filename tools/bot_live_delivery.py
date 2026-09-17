@@ -104,9 +104,12 @@ def _locked(home: Path | str):
 
 def _read(path: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
+    if not isinstance(data, dict):
+        raise ValueError(f"expected JSON object, got {type(data).__name__}")
+    return data
 
 
 # Tickets already reported unreadable by this process. The live poller rescans the
@@ -126,7 +129,7 @@ def _scan_read(path: Path) -> dict[str, Any] | None:
     """
     try:
         record = _read(path)
-    except (OSError, ValueError) as exc:  # ValueError: corrupt JSON and invalid UTF-8 alike
+    except (OSError, ValueError) as exc:  # ValueError: corrupt JSON, invalid UTF-8 and non-dict alike
         level = logging.DEBUG if path in _warned_unreadable else logging.WARNING
         _warned_unreadable.add(path)
         log.log(level, "bot_live_delivery: skipping unreadable ticket %s (%s)", path.name, exc)

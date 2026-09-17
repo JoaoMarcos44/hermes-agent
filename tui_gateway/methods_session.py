@@ -2159,7 +2159,9 @@ def _legacy_spawn_tree_entry(p, session_dir_name: str) -> dict | None:
         return None
     raw = {}
     with contextlib.suppress(Exception):
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            raw = data
     subagents = raw.get("subagents") or []
     return {"path": str(p), "session_id": raw.get("session_id") or session_dir_name,
             "finished_at": raw.get("finished_at") or stat.st_mtime, "started_at": raw.get("started_at"),

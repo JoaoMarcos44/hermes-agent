@@ -462,7 +462,10 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     intent: dict[str, Any]
     intent_path = Path(dm_file + ".live.json")
     if intent_path.exists():
-        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        loaded = json.loads(intent_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError(f"expected JSON object in intent file, got {type(loaded).__name__}")
+        intent = loaded
     else:
         assert profile_home is not None
         owner = find_canonical_live_owner(profile_home)
@@ -474,7 +477,10 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
         try:
             fd = os.open(intent_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
-            intent = json.loads(intent_path.read_text(encoding="utf-8"))
+            loaded = json.loads(intent_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError(f"expected JSON object in intent file, got {type(loaded).__name__}")
+            intent = loaded
         else:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(intent, stream)
@@ -495,11 +501,11 @@ def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | 
     deadline = time.monotonic() + _LIVE_WAIT_SECONDS
     while True:
         record = read_delivery_result(home, delivery_id)
-        status = record["status"] if record else "ambiguous"
+        status = record["status"] if (record and isinstance(record, dict) and "status" in record) else "ambiguous"
         if status not in ("queued", "claimed") or time.monotonic() >= deadline:
             break
         time.sleep(min(0.5, max(0, deadline - time.monotonic())))
-    payload = {key: record[key] for key in ("reply", "error", "reason") if record and record.get(key)}
+    payload = {key: record[key] for key in ("reply", "error", "reason") if record and isinstance(record, dict) and record.get(key)}
     payload.update(status=status, delivery_id=delivery_id)
     if status in ("queued", "claimed", "ambiguous"):
         payload["detail"] = "Delivery remains pending or its outcome is unknown. Do not resend; receipt is retained."

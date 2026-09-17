@@ -149,6 +149,10 @@ def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
+        if not isinstance(payload, dict):
+            logger.warning("Removing structurally invalid transcript spool file %s", path)
+            path.unlink(missing_ok=True)
+            continue
         if (payload.get("reason") != TRANSCRIPT_CAP_DROP_REASON
                 or payload.get("session_key") != session_id):
             continue
@@ -224,6 +228,8 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
             # never unlinked, so aborting the pass would re-poison every later boot.
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
                 # Agent-history snapshots are for manual operator recovery, not automatic DB
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":

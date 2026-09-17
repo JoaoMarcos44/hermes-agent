@@ -456,7 +456,9 @@ def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
     for line in lines:
         if line.strip():
             try:
-                out.append(json.loads(line))
+                entry = json.loads(line)
+                if isinstance(entry, dict):
+                    out.append(entry)
             except json.JSONDecodeError:
                 pass
     return out[-limit:]

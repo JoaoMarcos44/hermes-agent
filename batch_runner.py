@@ -490,7 +490,7 @@ class BatchRunner:
 
                 try:
                     entry = json.loads(line)
-                    if 'prompt' not in entry:
+                    if not isinstance(entry, dict) or 'prompt' not in entry:
                         print(f"⚠️  Warning: Line {line_num} missing 'prompt' field, skipping")
                         continue
                     dataset.append(entry)
@@ -552,6 +552,8 @@ class BatchRunner:
                     for line in f:
                         try:
                             entry = json.loads(line.strip())
+                            if not isinstance(entry, dict):
+                                continue
                             if entry.get("failed", False):
                                 continue
                             prompt_text = _entry_prompt_text(entry)
@@ -721,6 +723,10 @@ class BatchRunner:
                         total_entries += 1
                         try:
                             data = json.loads(line)
+                            if not isinstance(data, dict):
+                                filtered_entries += 1
+                                print(f"   ⚠️  Filtering invalid entry shape (batch {batch_num})")
+                                continue
 
                             if data.get("discarded"):
                                 tombstone_entries += 1

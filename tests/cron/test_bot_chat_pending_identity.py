@@ -80,3 +80,33 @@ def test_corrupt_record_is_retained_without_blocking_other_admissions(tmp_path, 
     queue.drain()
     assert seen == ["first", "second"]
     assert broken.read_text(encoding="utf-8") == "{"
+
+
+@pytest.mark.parametrize("payload", ["[]", '"just a string"', "123", "true", "null"])
+def test_parseable_non_dict_record_is_retained_without_wedging_drain(tmp_path, monkeypatch, caplog, payload):
+    """A receipt that is valid JSON but not a JSON object must degrade to an unreadable skip,
+    never raise TypeError during admission sequence calculation or drain sorting."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    queue.defer("a" * 64, {"id": "job"}, "first", "", tmp_path)
+    broken = tmp_path / "cron" / "bot_chat_pending" / "broken.json"
+    broken.write_text(payload, encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(delivery, "_deliver_to_bot_chat", lambda j, c, p, **kw: seen.append(c))
+    with caplog.at_level("ERROR", logger=queue.logger.name):
+        queue.drain()
+    queue.defer("b" * 64, {"id": "next"}, "second", "", tmp_path)
+    queue.drain()
+    assert seen == ["first", "second"]
+    assert broken.read_text(encoding="utf-8") == payload
+    assert any("Unreadable deferred Bot Chat receipt" in r.message and "expected JSON object" in r.message
+               for r in caplog.records)
+
+
+def test_read_pending_refuses_non_dict_receipt(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    broken = tmp_path / "cron" / "bot_chat_pending" / f"{'c' * 64}.json"
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="expected JSON object"):
+        queue.read_pending("c" * 64)
+
