@@ -42,6 +42,20 @@ def _tuple_agent(entry: Any) -> Any:
     return entry[0] if isinstance(entry, tuple) and entry else None
 
 
+def _parked_internal_event(adapter: Any, session_key: str) -> bool:
+    """Peek the adapter pending slot without consuming it.
+
+    Internal wakes (async-delegation completion notices) share the same
+    single-slot queue as human follow-ups. ``get_pending_message`` pops;
+    callers that only need to know *whether* a wake is parked must look.
+    """
+    pending = getattr(adapter, "_pending_messages", None)
+    if not isinstance(pending, dict):
+        return False
+    parked = pending.get(session_key)
+    return parked is not None and bool(getattr(parked, "internal", False))
+
+
 class GatewayAgentCacheMixin:
     """Agent cache, session model overrides, turn leases, run generations and conversation-scope reset for GatewayRunner."""
 
@@ -504,7 +518,16 @@ class GatewayAgentCacheMixin:
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            # Every stop_command* path must leave an admitted internal wake parked
+            # so the adapter's post-command drain can restart it. Peek, don't pop.
+            # /new and /reset still discard so stale text cannot replay (#2170);
+            # human follow-ups on /stop stay discarded (the original #3104 deal).
+            keep_internal_wake = (
+                str(invalidation_reason or "").startswith("stop_command")
+                and _parked_internal_event(adapter, session_key)
+            )
+            if not keep_internal_wake:
+                adapter.get_pending_message(session_key)  # consume and discard
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:
