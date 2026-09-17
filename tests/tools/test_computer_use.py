@@ -594,6 +594,55 @@ class TestAnthropicAdapterMultimodal:
         ):
             assert image_count(n) <= _OUTBOUND_IMAGE_LIMIT, (n, image_count(n))
 
+    def test_parallel_batch_retires_the_oldest_siblings_first(self):
+        """Parallel tool calls merge into ONE user message as sibling tool_results (oldest first).
+
+        The retire helper takes newest-first input, so the inner walk must also run
+        newest -> oldest; otherwise the first batch over the limit strips the newest
+        frames and keeps the stale ones (#103217 composed into the limit-triggered path).
+        """
+        from agent.anthropic_message_convert import convert_messages_to_anthropic
+        from agent.context_compressor import _IMAGE_EVICTION_BATCH, _OUTBOUND_IMAGE_LIMIT
+
+        fake_png = "iVBORw0KGgo="
+        total = _OUTBOUND_IMAGE_LIMIT + 1
+        messages: List[Dict[str, Any]] = [
+            {"role": "user", "content": "start"},
+            {
+                "role": "assistant", "content": "",
+                "tool_calls": [
+                    {"id": f"call_{i}", "type": "function",
+                     "function": {"name": "computer_use", "arguments": "{}"}}
+                    for i in range(total)
+                ],
+            },
+        ]
+        for i in range(total):
+            messages.append({
+                "role": "tool", "tool_call_id": f"call_{i}",
+                "content": {
+                    "_multimodal": True,
+                    "content": [
+                        {"type": "text", "text": f"cap {i}"},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{fake_png}"}},
+                    ],
+                    "text_summary": f"cap {i}",
+                },
+            })
+        _, out = convert_messages_to_anthropic(messages)
+        survivors = [
+            b["tool_use_id"]
+            for m in out
+            if isinstance(m.get("content"), list)
+            for b in m["content"]
+            if b.get("type") == "tool_result"
+            and isinstance(b.get("content"), list)
+            and any(x.get("type") == "image" for x in b["content"])
+        ]
+        expected = [f"call_{i}" for i in range(_IMAGE_EVICTION_BATCH, total)]
+        assert survivors == expected, survivors
+
 
 # ---------------------------------------------------------------------------
 # Context compressor: screenshot-aware pruning

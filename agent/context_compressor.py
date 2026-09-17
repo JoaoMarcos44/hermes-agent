@@ -1322,14 +1322,32 @@ def _outbound_image_retire_count(
     retire = 0
     while retire < count and not _fits(retire):
         nxt = retire + min(batch, count - retire)
-        # Reserved uploads may already exceed the ceiling; do not strip the
-        # newest screenshots for that. Continue past the floor only when the
-        # surviving *tool* payloads themselves still overflow the byte budget.
-        if nxt > max_retire and sum(sizes_newest_first[: count - max_retire]) <= budget:
+        if nxt > max_retire and _floor_holds(
+            weights[: count - max_retire],
+            sizes_newest_first[: count - max_retire],
+            limit=limit,
+            budget=budget,
+            reserved_bytes=reserved_bytes,
+        ):
             retire = max_retire
             break
         retire = nxt
     return retire
+
+
+def _floor_holds(kept_weights: List[int], kept_sizes: List[int], *, limit: int, budget: int, reserved_bytes: int) -> bool:
+    """Whether the ``keep_newest`` floor may override the limit for the surviving tool items.
+
+    The floor exists so reserved user uploads cannot strip the newest screenshots. It must
+    not shelter a residual violation that retiring tool content would fix: over the block
+    limit the API only tightens the per-image dimension cap (soft), so the floor wins
+    unless the surviving tool blocks alone exceed it; over the byte budget the request is
+    rejected outright (hard), so the floor wins only when reserved bytes alone already make
+    the budget unreachable.
+    """
+    if sum(kept_weights) > limit:
+        return False
+    return sum(kept_sizes) + reserved_bytes <= budget or reserved_bytes > budget
 
 
 def evict_stale_outbound_tool_images(api_messages: List[Dict[str, Any]]) -> int:

@@ -626,7 +626,10 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
         content = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(content, list):
             continue
-        for block in content:
+        # Parallel tool calls land as sibling tool_result blocks inside ONE user message
+        # (oldest first), so the inner walk must also run newest -> oldest or the helper's
+        # newest-first contract is violated and a batch retires the newest frames (#103217).
+        for block in reversed(content):
             if _block_type(block) == "tool_result":
                 weight, size = _tool_result_image_stats(block)
                 if weight:

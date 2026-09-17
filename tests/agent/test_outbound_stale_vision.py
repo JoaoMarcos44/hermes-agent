@@ -135,6 +135,16 @@ class TestOutboundImageRetireCount:
         assert kept == _MAX_KEEP_TOOL_IMAGES
         assert retire == 1
 
+    def test_floor_does_not_shelter_a_violation_tool_content_can_fix(self):
+        """The keep floor only overrides the limit when reserved uploads make it unreachable."""
+        # Surviving tool blocks alone exceed the block limit: one 25-block tool_result must go.
+        assert _outbound_image_retire_count([10], weights_newest_first=[25]) == 1
+        # Tool bytes + reserved bytes over budget while reserved alone fits: retire past the floor.
+        mb = 1_000_000
+        assert _outbound_image_retire_count([5 * mb] * 4, reserved_bytes=20 * mb) == 4
+        # Reserved bytes alone already blow the budget: no retirement can fix it, floor wins.
+        assert _outbound_image_retire_count([5 * mb] * 4, reserved_bytes=_OUTBOUND_IMAGE_BUDGET_BYTES + 1) == 1
+
 
 class TestOutboundStaleVisionEviction:
     def test_sanitize_alone_keeps_every_screenshot(self):
