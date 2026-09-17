@@ -20,6 +20,7 @@ import type {
 } from "@/lib/api";
 import {
   buildCronJobPayload,
+  classifyCronNextRun,
   cronJobHasExecutionContent,
   cronJobFormFromJob,
   cronLastResult,
@@ -60,6 +61,27 @@ function formatTime(iso?: string | null): string {
   if (!iso) return "—";
   const d = new Date(iso);
   return d.toLocaleString();
+}
+
+function NextRunLabel({
+  iso,
+  nextLabel,
+  overdueLabel,
+}: {
+  iso?: string | null;
+  nextLabel: string;
+  overdueLabel: string;
+}) {
+  const slot = classifyCronNextRun(iso);
+  const overdue = slot.kind === "overdue";
+  return (
+    <span
+      className={overdue ? "text-warning font-medium" : undefined}
+      data-testid={overdue ? "cron-next-run-overdue" : "cron-next-run"}
+    >
+      {overdue ? overdueLabel : nextLabel}: {formatTime(iso)}
+    </span>
+  );
 }
 
 function asText(value: unknown): string {
@@ -1181,9 +1203,11 @@ export default function CronPage() {
                     <span>
                       {t.cron.last}: {formatTime(job.last_run_at)}
                     </span>
-                    <span>
-                      {t.cron.next}: {formatTime(job.next_run_at)}
-                    </span>
+                    <NextRunLabel
+                      iso={job.next_run_at}
+                      nextLabel={t.cron.next}
+                      overdueLabel={t.cron.overdueSince ?? "Overdue since"}
+                    />
                   </div>
                   {job.last_delivery_error && (
                     <p className="text-xs text-destructive mt-1">

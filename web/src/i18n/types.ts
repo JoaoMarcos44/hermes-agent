@@ -320,6 +320,8 @@ export interface Translations {
     noJobs: string;
     last: string;
     next: string;
+    /** Optional — English fallback until translated. */
+    overdueSince?: string;
     pause: string;
     resume: string;
     triggerNow: string;

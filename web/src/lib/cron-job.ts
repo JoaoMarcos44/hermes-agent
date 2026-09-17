@@ -148,3 +148,31 @@ export function cronLastResult(
       : asString(job.last_error).trim() || asString(job.last_delivery_error).trim();
   return { status, tone, detail: detail || null };
 }
+
+/** Matches hermes_cli/cron.py `_OVERDUE_GRACE_SECONDS` (busy-tick lag, not outage). */
+export const CRON_NEXT_RUN_OVERDUE_GRACE_MS = 15 * 60 * 1000;
+
+export type CronNextRunSlot =
+  | { kind: "missing" }
+  | { kind: "invalid"; raw: string }
+  | { kind: "upcoming"; iso: string }
+  | { kind: "overdue"; iso: string; overdueMs: number };
+
+/**
+ * Classify a stored next_run_at for dashboard display.
+ * Past the shared doctor grace → overdue; within grace or future → upcoming.
+ */
+export function classifyCronNextRun(
+  iso: string | null | undefined,
+  nowMs: number = Date.now(),
+): CronNextRunSlot {
+  const raw = typeof iso === "string" ? iso.trim() : "";
+  if (!raw) return { kind: "missing" };
+  const parsed = Date.parse(raw);
+  if (Number.isNaN(parsed)) return { kind: "invalid", raw };
+  const overdueMs = nowMs - parsed;
+  if (overdueMs > CRON_NEXT_RUN_OVERDUE_GRACE_MS) {
+    return { kind: "overdue", iso: raw, overdueMs };
+  }
+  return { kind: "upcoming", iso: raw };
+}

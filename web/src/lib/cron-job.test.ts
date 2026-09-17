@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildCronJobPayload,
+  classifyCronNextRun,
   cronJobHasExecutionContent,
   cronJobFormFromJob,
   cronLastResult,
@@ -198,5 +199,37 @@ describe("cronLastResult", () => {
     expect(
       cronLastResult({ last_status: "blocked_config", last_error: "missing API key" }),
     ).toEqual({ status: "blocked_config", tone: "warning", detail: "missing API key" });
+  });
+});
+
+describe("classifyCronNextRun", () => {
+  const now = Date.parse("2026-09-17T20:00:00.000Z");
+
+  it("marks a seven-hour-past stamp overdue", () => {
+    const slot = classifyCronNextRun("2026-09-17T13:00:00.000Z", now);
+    expect(slot).toEqual({
+      kind: "overdue",
+      iso: "2026-09-17T13:00:00.000Z",
+      overdueMs: 7 * 60 * 60 * 1000,
+    });
+  });
+
+  it("keeps a five-minute lag as upcoming (doctor grace)", () => {
+    expect(classifyCronNextRun("2026-09-17T19:55:00.000Z", now)).toEqual({
+      kind: "upcoming",
+      iso: "2026-09-17T19:55:00.000Z",
+    });
+  });
+
+  it("keeps a future stamp upcoming", () => {
+    expect(classifyCronNextRun("2026-09-17T21:00:00.000Z", now).kind).toBe("upcoming");
+  });
+
+  it("handles missing and invalid values without throwing", () => {
+    expect(classifyCronNextRun(null, now)).toEqual({ kind: "missing" });
+    expect(classifyCronNextRun("not-a-date", now)).toEqual({
+      kind: "invalid",
+      raw: "not-a-date",
+    });
   });
 });

@@ -306,6 +306,8 @@ export const en: Translations = {
     noJobs: "No cron jobs configured. Create one above.",
     last: "Last",
     next: "Next",
+    /** Label when next_run_at is already past the shared doctor grace window. */
+    overdueSince: "Overdue since",
     pause: "Pause",
     resume: "Resume",
     triggerNow: "Trigger now",
