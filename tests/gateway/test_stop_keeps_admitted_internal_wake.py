@@ -65,11 +65,11 @@ class _SlotAdapter:
         return True
 
 
-def _runner(adapter):
+def _runner(adapter, state=None):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
-    runner._peek_session_state = lambda _key: None
+    runner._peek_session_state = lambda _key: state
     runner._interrupt_running_turn = lambda *a, **k: 0
     runner._drop_turn_slot = lambda *a, **k: None
     runner._adapter_for_source = lambda _src: adapter
@@ -168,3 +168,40 @@ async def test_drain_after_stop_starts_preserved_wake():
         adapter, session_key, guard,
     )
     assert adapter.started == [(notice, session_key)]
+
+
+@pytest.mark.asyncio
+async def test_stop_preserves_internal_overflow_wake_when_slot_held_human():
+    """P0 regression (ehz0ah review on #114540): human follow-up in pending slot
+    and accepted internal wake in SessionState.conversation.queued_events.
+    /stop must discard the human head, promote the internal wake from overflow,
+    and post-command drain must start the notice.
+    """
+    from gateway.session_state import SessionState
+
+    session_key = "agent:main:telegram:dm:12345"
+    human_event = _notice(internal=False)
+    internal_wake = _notice(internal=True)
+
+    state = SessionState()
+    state.conversation.queued_events = [internal_wake]
+
+    adapter = _SlotAdapter(session_key, human_event)
+    await _runner(adapter, state=state)._interrupt_and_clear_session(
+        session_key,
+        _source(),
+        interrupt_reason=_INTERRUPT_REASON_STOP,
+        invalidation_reason="stop_command",
+    )
+
+    # Human follow-up was discarded; internal wake promoted to the primary slot
+    assert adapter._pending_messages.get(session_key) is internal_wake
+    assert len(state.conversation.queued_events) == 0
+
+    guard = asyncio.Event()
+    adapter._active_sessions[session_key] = guard
+    await BasePlatformAdapter._drain_pending_after_session_command(
+        adapter, session_key, guard,
+    )
+    assert adapter.started == [(internal_wake, session_key)]
+

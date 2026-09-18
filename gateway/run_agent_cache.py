@@ -503,19 +503,35 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        keep_internal = interrupt_reason == _INTERRUPT_REASON_STOP
         if adapter and hasattr(adapter, "get_pending_message"):
             # Slot ownership lives on the adapter. /stop uses the existing
             # interrupt_reason taxonomy (not invalidation_reason prefixes) so
             # busy, pending-sentinel, handler, and thread-sibling stops all
             # keep an admitted internal wake for the post-command drain.
-            keep_internal = interrupt_reason == _INTERRUPT_REASON_STOP
             clearer = getattr(adapter, "clear_pending_followup", None)
             if callable(clearer):
                 clearer(session_key, keep_internal=keep_internal)
             elif not keep_internal:
                 adapter.get_pending_message(session_key)  # consume and discard
+            else:
+                pending_slot = getattr(adapter, "_pending_messages", None)
+                if isinstance(pending_slot, dict):
+                    parked = pending_slot.get(session_key)
+                    if parked is not None and not bool(getattr(parked, "internal", False)):
+                        pending_slot.pop(session_key, None)
         if state is not None:
             state.persistent.pending_command_text = None
+            queued = getattr(state.conversation, "queued_events", None)
+            if isinstance(queued, list):
+                if keep_internal:
+                    kept_wakes = [e for e in queued if bool(getattr(e, "internal", False))]
+                    pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+                    if isinstance(pending_slot, dict) and not pending_slot.get(session_key) and kept_wakes:
+                        pending_slot[session_key] = kept_wakes.pop(0)
+                    queued[:] = kept_wakes
+                else:
+                    queued.clear()
         if release_running_state:
             # Guarded release: a message that arrived during the awaits above may already run as
             # the successor generation — the displaced /stop tail must not wipe its slot.
