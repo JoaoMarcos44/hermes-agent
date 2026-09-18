@@ -477,7 +477,7 @@ class GatewayAgentCacheMixin:
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
-        from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             # Plugins holding a per-turn external resource (an outbound RPC blocked on a tool result
             # the loop will never consume) learn the turn is gone. Fires for /stop and the /new
@@ -504,7 +504,16 @@ class GatewayAgentCacheMixin:
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            # Slot ownership lives on the adapter. /stop uses the existing
+            # interrupt_reason taxonomy (not invalidation_reason prefixes) so
+            # busy, pending-sentinel, handler, and thread-sibling stops all
+            # keep an admitted internal wake for the post-command drain.
+            keep_internal = interrupt_reason == _INTERRUPT_REASON_STOP
+            clearer = getattr(adapter, "clear_pending_followup", None)
+            if callable(clearer):
+                clearer(session_key, keep_internal=keep_internal)
+            elif not keep_internal:
+                adapter.get_pending_message(session_key)  # consume and discard
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:

@@ -4396,6 +4396,18 @@ class BasePlatformAdapter(ABC):
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
 
+    def clear_pending_followup(self, session_key: str, *, keep_internal: bool = False) -> None:
+        """Drop a parked follow-up without consuming an admitted internal wake.
+
+        Internal completion notices share this single slot with human text.
+        ``/stop`` must leave those wakes parked so the post-command drain can
+        start them; ``/new`` and ``/reset`` still discard (#2170).
+        """
+        parked = self._pending_messages.get(session_key)
+        if keep_internal and parked is not None and bool(getattr(parked, "internal", False)):
+            return
+        self._pending_messages.pop(session_key, None)
+
     def build_source(
         self, chat_id: str, chat_name: Optional[str] = None, chat_type: str = "dm",
         user_id: Optional[str] = None, user_name: Optional[str] = None,
