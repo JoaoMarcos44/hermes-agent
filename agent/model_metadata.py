@@ -1958,8 +1958,26 @@ def _resolve_bedrock_context_length(model: str, base_url: str) -> Optional[int]:
     return get_bedrock_context_length(model, probe=False)  # static table / default: answers this call only
 
 
-def _resolve_custom_endpoint_context_length(model: str, base_url: str, api_key: str, provider: str) -> int:
+def _resolve_custom_endpoint_context_length(
+    model: str,
+    base_url: str,
+    api_key: str,
+    provider: str,
+    custom_providers: list | None,
+) -> int:
     """Steps 2-3 for a truly custom endpoint: /models, local probes, Ollama /api/show, catalog, default."""
+    try:
+        from hermes_cli.config import get_custom_provider_api_mode
+        route_api_mode = get_custom_provider_api_mode(base_url, custom_providers)
+    except Exception:
+        route_api_mode = ""
+    native_codex = (provider or "").strip().lower() == "openai-codex"
+    if route_api_mode == "codex_responses" and not native_codex:
+        model_bare = _strip_provider_prefix(model).strip()
+        lookup_bare = _bare_codex_slug(strip_codex_context_variant_suffix(model_bare))
+        hit = _longest_key_match(_CODEX_OAUTH_CONTEXT_FALLBACK, lookup_bare.lower())
+        if hit:
+            return hit[1]
     context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
     if context_length is not None:
         return context_length
@@ -2161,7 +2179,7 @@ def get_model_context_length(
     # 2. Live /models for truly custom endpoints. Known providers skip this: their /models may
     # report a provider-imposed limit (Copilot: 128k) rather than the window.
     if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
-        return _resolve_custom_endpoint_context_length(model, base_url, api_key, provider)
+        return _resolve_custom_endpoint_context_length(model, base_url, api_key, provider, custom_providers)
     # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
     if provider == "anthropic" or (base_url and base_url_hostname(base_url) == "api.anthropic.com"):
         ctx = _query_anthropic_context_length(model, base_url or "https://api.anthropic.com", api_key)

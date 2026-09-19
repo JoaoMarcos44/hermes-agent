@@ -129,6 +129,10 @@ That distinction is especially important for:
 - switching providers without re-running setup
 - config-saved custom endpoints that should keep working even when `OPENAI_BASE_URL` is not exported in the current shell
 
+### Custom route context windows
+
+A custom provider's declared `transport` or `api_mode` selects its context-window family during model metadata resolution. A route using `codex_responses` uses Codex context values for catalogued Codex slugs, even when its base URL points to a generic proxy. Explicit `context_length` values at model or route level remain authoritative and are evaluated first. Models absent from the Codex table continue through endpoint metadata and local probing.
+
 ## Native Anthropic path
 
 Anthropic is not just "via OpenRouter" anymore.

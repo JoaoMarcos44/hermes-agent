@@ -1245,6 +1245,126 @@ class TestGetModelContextLength:
                 f"Expected {DEFAULT_FALLBACK_CONTEXT}, got {ctx3}"
             )
 
+    def test_custom_codex_route_uses_codex_context_fallback(self):
+        from agent import model_metadata as mm
+
+        custom = [
+            {
+                "name": "codex-proxy",
+                "base_url": "http://127.0.0.1:8317/v1",
+                "transport": "codex_responses",
+            }
+        ]
+        with (
+            patch.object(mm, "get_cached_context_length", return_value=None),
+            patch.object(mm, "_resolve_endpoint_context_length", return_value=None) as endpoint,
+            patch.object(mm, "_query_ollama_api_show", return_value=None),
+            patch.object(mm, "is_local_endpoint", return_value=False),
+        ):
+            ctx = get_model_context_length(
+                "gpt-6-astra",
+                base_url=custom[0]["base_url"],
+                provider="custom:codex-proxy",
+                custom_providers=custom,
+            )
+
+        assert ctx == mm._CODEX_OAUTH_CONTEXT_FALLBACK["gpt-6-astra"]
+        endpoint.assert_not_called()
+
+    def test_non_codex_route_keeps_direct_catalog_context(self):
+        from agent import model_metadata as mm
+
+        custom = [
+            {
+                "name": "chat-proxy",
+                "base_url": "http://127.0.0.1:8317/v1",
+                "transport": "chat_completions",
+            }
+        ]
+        with (
+            patch.object(mm, "get_cached_context_length", return_value=None),
+            patch.object(mm, "_resolve_endpoint_context_length", return_value=None),
+            patch.object(mm, "_query_ollama_api_show", return_value=None),
+            patch.object(mm, "is_local_endpoint", return_value=False),
+        ):
+            ctx = get_model_context_length(
+                "gpt-6-astra",
+                base_url=custom[0]["base_url"],
+                provider="custom:chat-proxy",
+                custom_providers=custom,
+            )
+
+        from agent.model_metadata import _longest_key_match
+        assert ctx == _longest_key_match(DEFAULT_CONTEXT_LENGTHS, "gpt-6-astra")[1]
+
+    @pytest.mark.parametrize(
+        "route_config, expected",
+        [
+            ({"models": {"gpt-6-astra": {"context_length": 321_000}}}, 321_000),
+            ({"context_length": 654_000}, 654_000),
+        ],
+    )
+    def test_explicit_custom_route_context_wins_over_codex_family(self, route_config, expected):
+        custom = [
+            {
+                "name": "codex-proxy",
+                "base_url": "http://127.0.0.1:8317/v1",
+                "api_mode": "codex_responses",
+                **route_config,
+            }
+        ]
+
+        assert get_model_context_length(
+            "gpt-6-astra",
+            base_url=custom[0]["base_url"],
+            provider="custom:codex-proxy",
+            custom_providers=custom,
+        ) == expected
+
+    def test_uncatalogued_codex_route_uses_endpoint_metadata(self):
+        from agent import model_metadata as mm
+
+        custom = [
+            {
+                "name": "codex-proxy",
+                "base_url": "http://127.0.0.1:8317/v1",
+                "api_mode": "codex_responses",
+            }
+        ]
+        with patch.object(mm, "_resolve_endpoint_context_length", return_value=777_000) as endpoint:
+            ctx = get_model_context_length(
+                "future-proxy-model",
+                base_url=custom[0]["base_url"],
+                provider="custom:codex-proxy",
+                custom_providers=custom,
+            )
+
+        assert ctx == 777_000
+        endpoint.assert_called_once()
+
+    def test_native_openai_codex_keeps_oauth_resolution(self):
+        from agent import model_metadata as mm
+
+        with (
+            patch.object(mm, "_resolve_codex_oauth_context_length_with_source", return_value=(272_000, "fallback")),
+            patch.object(mm, "_resolve_custom_endpoint_context_length") as custom_endpoint,
+        ):
+            ctx = get_model_context_length(
+                "gpt-6-astra",
+                base_url="https://chatgpt.com/backend-api/codex",
+                provider="openai-codex",
+                custom_providers=[
+                    {
+                        "name": "codex-proxy",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "api_mode": "codex_responses",
+                    }
+                ],
+            )
+
+        assert ctx == 272_000
+        custom_endpoint.assert_not_called()
+
     # ── Local vs non-local Ollama context resolution (#63122) ──────────
 
     @patch("agent.model_metadata.get_cached_context_length", return_value=None)

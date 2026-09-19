@@ -387,6 +387,20 @@ def _entries_for_route(
             yield entry
 
 
+def get_custom_provider_api_mode(
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return canonical transport/api mode for the first matching custom route."""
+    for entry in _entries_for_route(base_url, custom_providers, config):
+        for field in ("api_mode", "transport"):
+            value = entry.get(field)
+            if isinstance(value, str) and value.strip():
+                return _canonical_api_mode(value)
+    return ""
+
+
 def _route_model_cfg(entry: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
     """Return ``entry.models[model]`` when both are mappings, else None."""
     models = entry.get("models")

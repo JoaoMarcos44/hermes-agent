@@ -11,7 +11,31 @@ from unittest.mock import patch
 from hermes_cli.config import (
     get_custom_provider_context_length,
     get_custom_provider_model_capability,
+    get_custom_provider_api_mode,
 )
+
+
+class TestGetCustomProviderApiMode:
+
+    def test_route_transport_is_canonicalized(self):
+        custom = [
+            {
+                "base_url": "http://127.0.0.1:8317/v1/",
+                "transport": "responses",
+            }
+        ]
+
+        assert (
+            get_custom_provider_api_mode(
+                "http://127.0.0.1:8317/v1", custom
+            )
+            == "codex_responses"
+        )
+
+    def test_unmatched_route_returns_empty(self):
+        custom = [{"base_url": "https://other.example.invalid/v1", "api_mode": "codex_responses"}]
+
+        assert get_custom_provider_api_mode("https://example.invalid/v1", custom) == ""
 
 
 class TestGetCustomProviderContextLength:
