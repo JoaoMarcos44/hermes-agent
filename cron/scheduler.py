@@ -473,7 +473,7 @@ from cron.jobs import (
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions)
+    recover_interrupted_executions, record_execution_progress)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -1698,7 +1698,7 @@ def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
 
 def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
-    worker_state: Optional[dict] = None,
+    worker_state: Optional[dict] = None, execution_id: Optional[str] = None,
 ) -> dict:
     """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
     watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
@@ -1747,12 +1747,33 @@ def _run_agent_with_watchdog(
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
     _watch_stop = threading.Event()
+    _last_observed_activity = None
+    _last_progress_write = 0.0
 
     def _idle_seconds() -> float:
+        nonlocal _last_observed_activity, _last_progress_write
         if not hasattr(agent, "get_activity_summary"):
             return 0.0
         try:
             _act = agent.get_activity_summary()
+            _activity_at = _act.get("last_activity_at")
+            if (
+                execution_id
+                and _activity_at is not None
+                and _activity_at != _last_observed_activity
+                and time.monotonic() - _last_progress_write >= _RUN_CLAIM_HEARTBEAT_SECONDS
+            ):
+                _last_observed_activity = _activity_at
+                try:
+                    record_execution_progress(execution_id)
+                except Exception:
+                    # Progress is advisory; an unavailable ledger must not stop the inactivity watchdog.
+                    logger.debug(
+                        "Could not record cron execution progress for %s",
+                        execution_id,
+                        exc_info=True,
+                    )
+                _last_progress_write = time.monotonic()
             return float(_act.get("seconds_since_activity", 0.0) or 0.0)
         except Exception:
             return 0.0
@@ -2332,7 +2353,7 @@ def run_job(
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
-            worker_state=_worker_state)
+            worker_state=_worker_state, execution_id=job.get("execution_id"))
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"

@@ -7,6 +7,8 @@ immutable.
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 import sqlite3
 import threading
@@ -25,9 +27,12 @@ from hermes_time import now as _hermes_now
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
+EXECUTION_PROGRESS_STALE_MULTIPLIER = 3.0
+EXECUTION_TERMINATION_GRACE_SECONDS = 5.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+logger = logging.getLogger(__name__)
 
 
 # --- executions ledger --------------------------------------------------------------------------
@@ -61,6 +66,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
              started_at TEXT,
+             progress_at REAL,
              finished_at TEXT,
              error TEXT
            )"""
@@ -71,6 +77,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
+    )
+    add_column_if_missing(conn, "executions", "progress_at", "progress_at REAL")
+    conn.execute(
+        """UPDATE executions
+           SET progress_at=CAST(strftime('%s', COALESCE(started_at, claimed_at)) AS REAL)
+           WHERE progress_at IS NULL"""
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
@@ -89,11 +101,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
-        yield conn
+    with _lock:
+        conn = _connect()
+        if immediate and conn.in_transaction:
+            conn.commit()
+        with transaction(conn, immediate=immediate) as conn:
+            yield conn
 
 
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[Dict[str, Any]]:
@@ -158,10 +174,10 @@ def create_execution(
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                status, claimed_at, progress_at, scheduled_instant)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             _process_start_time(pid), now, time.time(), canonical_instant(scheduled_instant)),
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
@@ -213,10 +229,10 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
         cur = conn.execute(
             """UPDATE executions
                SET process_id=?, pid=?, process_started_at=?,
-                   status='running', started_at=?, handoff_pending=0,
+                   status='running', started_at=?, progress_at=?, handoff_pending=0,
                    handoff_started_at=NULL
                WHERE id=? AND status='claimed' AND handoff_pending=1""",
-            (_PROCESS_ID, pid, process_started_at, now, execution_id),
+            (_PROCESS_ID, pid, process_started_at, now, time.time(), execution_id),
         )
         if cur.rowcount != 1:
             return None
@@ -231,17 +247,33 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
-               SET status='running', started_at=?, handoff_pending=0,
+               SET status='running', started_at=?, progress_at=?, handoff_pending=0,
                    handoff_started_at=NULL
                WHERE id=? AND status='claimed' AND handoff_pending=0
                  AND process_id=? AND pid=?""",
-            (now, execution_id, _PROCESS_ID, os.getpid()),
+            (now, time.time(), execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
+
+
+def record_execution_progress(execution_id: str) -> bool:
+    """Record progress for the exact running owner; stale workers cannot refresh a replacement."""
+    process_started_at = _process_start_time(os.getpid())
+    if process_started_at is None:
+        return False
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions
+               SET progress_at=?
+               WHERE id=? AND status='running'
+                 AND process_id=? AND pid=? AND process_started_at=?""",
+            (time.time(), execution_id, _PROCESS_ID, os.getpid(), process_started_at),
+        )
+    return cur.rowcount == 1
 
 
 def finish_execution(
@@ -269,50 +301,205 @@ def finish_execution(
     return record
 
 
+def _progress_stale_after_seconds() -> Optional[float]:
+    """Return the conservative progress-lease bound; unlimited mode fails closed."""
+    try:
+        from cron.env_settings import cron_env_setting
+
+        raw = cron_env_setting("HERMES_CRON_TIMEOUT").strip()
+    except Exception:
+        raw = ""
+    if not raw:
+        timeout = 600.0
+    else:
+        try:
+            timeout = float(raw)
+        except (TypeError, ValueError):
+            timeout = 600.0
+    if not math.isfinite(timeout) or timeout <= 0:
+        return None
+    return timeout * EXECUTION_PROGRESS_STALE_MULTIPLIER
+
+
+def _progress_lease_expired(
+    progress_at: Any, *, now_epoch: float, stale_after: float,
+) -> bool:
+    try:
+        progress_epoch = float(progress_at)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(progress_epoch) and now_epoch - progress_epoch >= stale_after
+
+
+def _is_exact_external_worker(pid: int, execution_id: str) -> bool:
+    """Require command-line proof before terminating a live execution owner."""
+    try:
+        from gateway.status import _read_process_cmdline
+
+        command = _read_process_cmdline(pid)
+    except Exception:
+        return False
+    if not command:
+        return False
+    lowered = command.lower()
+    return (
+        "cron.scheduler" in lowered
+        and "--external-worker-file" in lowered
+        and str(execution_id).lower() in lowered
+    )
+
+
+def _terminate_stale_external_owner(
+    pid: int, process_started_at: Optional[int], execution_id: str,
+) -> bool:
+    """Stop one exact stale external worker and prove it exited before reclaim."""
+    if process_started_at is None or not _is_exact_external_worker(pid, execution_id):
+        return False
+    if not _owner_is_live(pid, process_started_at):
+        return True
+    try:
+        from gateway.status import terminate_pid
+
+        # The force path re-checks the start-time fingerprint inside the
+        # termination primitive; the graceful path does not provide that guard.
+        terminate_pid(pid, force=True, expected_start_time=process_started_at)
+    except Exception as exc:
+        logger.warning(
+            "Could not terminate stale cron worker %s (pid %s): %s",
+            execution_id, pid, exc,
+        )
+        return False
+
+    deadline = time.monotonic() + EXECUTION_TERMINATION_GRACE_SECONDS
+    while _owner_is_live(pid, process_started_at):
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Stale cron worker %s (pid %s) remained live after termination",
+                execution_id, pid,
+            )
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def _reclaim_live_owner(
+    row: sqlite3.Row, *, now: str, stale_after: float,
+) -> Optional[Dict[str, Any]]:
+    """Reserve a stale row before terminating its worker, closing the progress race."""
+    with _transaction(immediate=True) as conn:
+        current = conn.execute(
+            """SELECT status, process_id, pid, process_started_at,
+                      handoff_pending, handoff_started_at, progress_at
+               FROM executions WHERE id=?""",
+            (row["id"],),
+        ).fetchone()
+        if current is None:
+            return None
+        if any(
+            current[name] != row[name]
+            for name in (
+                "status", "process_id", "pid", "process_started_at",
+                "handoff_pending", "handoff_started_at", "progress_at",
+            )
+        ):
+            return None
+        if not _progress_lease_expired(
+            current["progress_at"], now_epoch=time.time(), stale_after=stale_after
+        ):
+            return None
+        if not _terminate_stale_external_owner(
+            int(current["pid"]), current["process_started_at"], str(row["id"])
+        ):
+            return None
+        cur = conn.execute(
+            """UPDATE executions
+               SET status='unknown', finished_at=?, error=?,
+                   handoff_pending=0, handoff_started_at=NULL
+               WHERE id=? AND status=? AND process_id=? AND pid=?
+                 AND process_started_at IS ?
+                 AND handoff_pending=?
+                 AND handoff_started_at IS ?
+                 AND progress_at IS ?""",
+            (
+                now,
+                "Scheduler terminated a live cron worker after its progress lease expired; "
+                "whether side effects ran is unknown.",
+                row["id"], row["status"], row["process_id"], row["pid"],
+                row["process_started_at"], row["handoff_pending"],
+                row["handoff_started_at"], row["progress_at"],
+            ),
+        )
+        if cur.rowcount != 1:
+            return None
+        return _fetch(conn, row["id"])
+
+
 def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
+    """Reclaim dead owners and exact external workers whose progress lease expired."""
     now = _hermes_now().isoformat()
+    now_epoch = time.time()
+    stale_after = _progress_stale_after_seconds()
     changed = 0
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at
+                      handoff_pending, handoff_started_at, progress_at
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
-        for row in rows:
-            if row["process_id"] == _PROCESS_ID:
+
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        handoff_started_at = row["handoff_started_at"]
+        if (
+            row["handoff_pending"]
+            and handoff_started_at is not None
+            and now_epoch - float(handoff_started_at) < HANDOFF_ADOPTION_GRACE_SECONDS
+        ):
+            continue
+
+        owner_live = _owner_is_live(int(row["pid"]), row["process_started_at"])
+        if owner_live:
+            if stale_after is None or row["progress_at"] is None:
                 continue
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-                continue
-            handoff_started_at = row["handoff_started_at"]
-            if (
-                row["handoff_pending"]
-                and handoff_started_at is not None
-                and time.time() - float(handoff_started_at)
-                < HANDOFF_ADOPTION_GRACE_SECONDS
+            if not _progress_lease_expired(
+                row["progress_at"], now_epoch=now_epoch, stale_after=stale_after
             ):
                 continue
+            record = _reclaim_live_owner(row, now=now, stale_after=stale_after)
+            if record is not None:
+                changed += 1
+                recovered.append(record)
+            continue
+
+        error = (
+            "Scheduler restarted after this execution's owner exited before a durable "
+            "terminal state; whether side effects ran is unknown."
+        )
+        with _transaction() as conn:
             cur = conn.execute(
                 """UPDATE executions
                    SET status='unknown', finished_at=?, error=?,
                        handoff_pending=0, handoff_started_at=NULL
                    WHERE id=? AND status=? AND process_id=? AND pid=?
+                     AND process_started_at IS ?
                      AND handoff_pending=?
-                     AND handoff_started_at IS ?""",
-                (now,
-                 "Scheduler restarted after this execution's owner exited before a durable "
-                 "terminal state; whether side effects ran is unknown.",
-                 row["id"], row["status"], row["process_id"], row["pid"],
-                 row["handoff_pending"], row["handoff_started_at"]),
+                     AND handoff_started_at IS ?
+                     AND progress_at IS ?""",
+                (now, error, row["id"], row["status"], row["process_id"], row["pid"],
+                 row["process_started_at"], row["handoff_pending"],
+                 row["handoff_started_at"], row["progress_at"]),
             )
-            changed += cur.rowcount
             if cur.rowcount:
+                changed += cur.rowcount
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
-        if changed:
+
+    if changed:
+        with _transaction() as conn:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
