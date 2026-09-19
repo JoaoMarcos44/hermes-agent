@@ -139,8 +139,14 @@ def _looks_like_hermes(argv: Sequence[str]) -> bool:
 
 
 def canonical_sqlite_path(path: str) -> str:
-    """Normalize a /proc fd target, stripping the Linux `` (deleted)`` suffix."""
-    return os.path.normcase(os.path.abspath(path.removesuffix(" (deleted)")))
+    """Normalize a /proc fd target, stripping the Linux `` (deleted)`` suffix.
+
+    The kernel reports the resolved pathname for an open descriptor, so the
+    comparison must resolve symlinked parent directories before matching it
+    against a caller-supplied database path.
+    """
+    path_without_deleted_suffix = path.removesuffix(" (deleted)")
+    return os.path.normcase(os.path.realpath(os.path.abspath(path_without_deleted_suffix)))
 
 
 def _argv_scoped_to_other_home(argv: Sequence[str], db_path: Path) -> bool:

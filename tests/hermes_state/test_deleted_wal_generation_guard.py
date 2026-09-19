@@ -134,6 +134,27 @@ def test_second_sessiondb_open_refuses_and_does_not_mint_wal(tmp_path, force_wal
     writer.close()
 
 
+@pytest.mark.linux_only
+def test_second_sessiondb_open_refuses_through_symlinked_parent(tmp_path, force_wal):
+    """A symlinked database parent must not hide a held deleted WAL generation."""
+    real_home = tmp_path / "hermes-real"
+    real_home.mkdir()
+    alias_home = tmp_path / "hermes-link"
+    alias_home.symlink_to(real_home, target_is_directory=True)
+    alias_path = alias_home / "state.db"
+
+    writer = make_db(alias_path, "s", "before-unlink")
+    wal = require_wal(writer)
+    lose_sidecars(alias_path, rename=False)
+    try:
+        assert iter_deleted_sqlite_sidecar_holders(alias_path)
+        with pytest.raises(DeletedWalGenerationError, match="deleted state.db-wal"):
+            SessionDB(db_path=alias_path)
+        assert not wal.exists(), "open must refuse before sqlite3.connect mints a WAL"
+    finally:
+        writer.close()
+
+
 @pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="deleted-WAL /proc scan is Linux-only",
