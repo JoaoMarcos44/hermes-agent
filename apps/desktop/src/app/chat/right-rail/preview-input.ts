@@ -12,9 +12,11 @@
  * webContents does not reach a guest (electron/electron#20333), which is why
  * this is a per-pane registry rather than something main could do.
  *
- * Coordinates are relative to the webview, and the webview IS the guest
- * viewport — so a rect the act engine measured inside the page needs no
- * conversion on the way back out.
+ * Coordinates are relative to the webview. The guest page reports target
+ * positions in CSS pixels, while Chromium's input router can apply the page's
+ * persisted zoom before dispatching the real event. The pane therefore supplies
+ * a measured correction at the input funnel; this module only owns the event
+ * shape and the pure coordinate transform.
  */
 
 import { $rightRailActiveTabId } from '@/store/layout'
@@ -27,9 +29,42 @@ export type PreviewInputEvent =
   | { keyCode: string; modifiers?: string[]; type: 'char' | 'keyDown' | 'keyUp' }
   | { type: 'mouseMove'; x: number; y: number }
 
+export interface PreviewInputScale {
+  x: number
+  y: number
+}
+
+/**
+ * Convert guest CSS-pixel coordinates into the units expected by Chromium's
+ * real-input router. The scale is measured by the pane from a trusted pointer
+ * event, rather than inferred from devicePixelRatio: display scaling and page
+ * zoom are independent factors on the way through a webview.
+ */
+export function scalePreviewInput(event: PreviewInputEvent, scale: PreviewInputScale): PreviewInputEvent {
+  if (!('x' in event) || (scale.x === 1 && scale.y === 1)) {
+    return event
+  }
+
+  return { ...event, x: Math.round(event.x * scale.x), y: Math.round(event.y * scale.y) }
+}
+
+/** Derive CSS-to-input correction from one probe sent at a known input point. */
+export function previewInputScale(sent: PreviewInputScale, received: PreviewInputScale): PreviewInputScale | null {
+  const x = sent.x / received.x
+  const y = sent.y / received.y
+
+  if (![x, y].every(value => Number.isFinite(value) && value > 0 && value >= 0.1 && value <= 10)) {
+    return null
+  }
+
+  return { x, y }
+}
+
 export interface PreviewInputHandle {
   /** Give the guest keyboard focus, so key events reach its active element. */
   focus: () => void
+  /** Establish the current page's input-coordinate mapping before pointer input. */
+  prepare?: () => Promise<boolean>
   send: (event: PreviewInputEvent) => void
 }
 

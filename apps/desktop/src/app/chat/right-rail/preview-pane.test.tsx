@@ -2,9 +2,12 @@ import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { onComposerAttachImagesRequest } from '@/app/chat/composer/focus'
+import { $rightRailActiveTabId, type RightRailTabId } from '@/store/layout'
+import { $previewTabs } from '@/store/preview'
 import { $connection, $selectedStoredSessionId } from '@/store/session'
 
 import { forgetPreviewConsole, previewConsoleState } from './preview-console-store'
+import { activePreviewInput } from './preview-input'
 import { PreviewPane } from './preview-pane'
 
 // The consent dialog has its own test file and needs a QueryClientProvider;
@@ -731,5 +734,79 @@ describe('PreviewPane guest external handoff', () => {
     guestMessage(webview, 'https://example.com', 'something-else')
 
     expect(openExternal).not.toHaveBeenCalled()
+  })
+})
+
+describe('PreviewPane input calibration', () => {
+  const target = {
+    kind: 'url' as const,
+    label: 'Preview',
+    source: 'http://localhost:5174',
+    url: 'http://localhost:5174'
+  }
+
+  afterEach(() => {
+    cleanup()
+    $previewTabs.set([])
+    $rightRailActiveTabId.set(null)
+  })
+
+  async function renderCalibratedPane(received: { x: number; y: number } | null) {
+    const tabId = `url:${target.url}` as RightRailTabId
+    $previewTabs.set([{ id: tabId, target }])
+    $rightRailActiveTabId.set(tabId)
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(<PreviewPane tabId={tabId} target={target} />)
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement & {
+      executeJavaScript?: (code: string) => Promise<unknown>
+      sendInputEvent?: (event: unknown) => void
+    }
+
+    const sendInputEvent = vi.fn()
+
+    const executeJavaScript = vi.fn(async (code: string) =>
+      code.includes('delete window.__hermesInputCalibration') ? received : true
+    )
+
+    Object.assign(webview, { executeJavaScript, sendInputEvent })
+
+    return { executeJavaScript, sendInputEvent, tabId, webview }
+  }
+
+  it('measures the guest mapping before scaling pointer input', async () => {
+    const { executeJavaScript, sendInputEvent } = await renderCalibratedPane({ x: 35.555, y: 35.555 })
+    const input = activePreviewInput()!
+
+    expect(await input.prepare?.()).toBe(true)
+    input.send({ type: 'mouseMove', x: 500, y: 310 })
+
+    expect(executeJavaScript).toHaveBeenCalledTimes(2)
+    expect(sendInputEvent).toHaveBeenNthCalledWith(1, { type: 'mouseMove', x: 32, y: 32 })
+    expect(sendInputEvent).toHaveBeenNthCalledWith(2, { type: 'mouseMove', x: 450, y: 279 })
+  })
+
+  it('rejects a calibration with no guest witness', async () => {
+    const { sendInputEvent } = await renderCalibratedPane(null)
+
+    expect(await activePreviewInput()!.prepare?.()).toBe(false)
+    expect(sendInputEvent).toHaveBeenCalledTimes(1)
+  })
+
+  it('refreshes the measured mapping after navigation', async () => {
+    const { executeJavaScript, sendInputEvent, webview } = await renderCalibratedPane({ x: 35.555, y: 35.555 })
+    const input = activePreviewInput()!
+
+    expect(await input.prepare?.()).toBe(true)
+    act(() => {
+      webview.dispatchEvent(Object.assign(new Event('did-navigate'), { url: target.url }))
+    })
+    expect(await input.prepare?.()).toBe(true)
+
+    expect(executeJavaScript).toHaveBeenCalledTimes(4)
+    expect(sendInputEvent).toHaveBeenCalledTimes(2)
   })
 })

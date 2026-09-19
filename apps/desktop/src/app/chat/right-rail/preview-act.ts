@@ -361,6 +361,13 @@ async function driveAction(
     return { error: 'Could not work out where that element is on screen.', success: false }
   }
 
+  if (action.kind !== 'press' && input.prepare && !(await input.prepare())) {
+    return {
+      error: 'Could not calibrate the preview input coordinates, so the action was not sent.',
+      success: false
+    }
+  }
+
   await glideTo(input, found.point)
 
   if (action.kind === 'click') {
@@ -465,6 +472,13 @@ async function driveScroll(
 
   if (!anchor.span) {
     return { ...anchor, acted: 'scrolled the page', note: 'The page has nothing to scroll — it all fits already.' }
+  }
+
+  if (input.prepare && !(await input.prepare())) {
+    return {
+      error: 'Could not calibrate the preview input coordinates, so the scroll was not sent.',
+      success: false
+    }
   }
 
   // A person does not move the mouse to scroll; the wheel turns wherever their

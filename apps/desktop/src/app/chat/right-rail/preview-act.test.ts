@@ -188,6 +188,45 @@ describe('actOnActivePreview (drive_preview tool)', () => {
 
   const sentTypes = (send: ReturnType<typeof vi.fn>) => send.mock.calls.map(([event]) => event.type)
 
+  it('does not send a real click when coordinate calibration fails', async () => {
+    const tabId = openBrowserTab()
+    const send = vi.fn()
+
+    cleanups.push(
+      registerPreviewScriptRunner(tabId, async code =>
+        code.includes('"kind":"locate"')
+          ? JSON.stringify({ acted: 'looking at button "Save"', point: { x: 120, y: 80 }, success: true })
+          : JSON.stringify({ elements: [], hit: null, success: true })
+      )
+    )
+    cleanups.push(registerPreviewInput(tabId, { focus: vi.fn(), prepare: async () => false, send }))
+
+    const result = await actOnActivePreview({ kind: 'click', ref: '@e1' })
+
+    expect(result).toMatchObject({ success: false })
+    expect(result.error).toContain('calibrate')
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('does not calibrate focus-only key presses', async () => {
+    const tabId = openBrowserTab()
+    const send = vi.fn()
+
+    cleanups.push(
+      registerPreviewScriptRunner(tabId, async code =>
+        code.includes('"kind":"locate"')
+          ? JSON.stringify({ acted: 'looking at button "Save"', point: { x: 120, y: 80 }, success: true })
+          : JSON.stringify({ elements: [], hit: null, success: true })
+      )
+    )
+    cleanups.push(registerPreviewInput(tabId, { focus: vi.fn(), prepare: async () => false, send }))
+
+    const result = await actOnActivePreview({ kind: 'press', key: 'Enter', ref: '@e1' })
+
+    expect(result.success).toBe(true)
+    expect(send.mock.calls.some(([event]) => event.type === 'keyDown')).toBe(true)
+  })
+
   it('clicks with real input, walking the pointer to where the page said', async () => {
     const send = withDrivenPane()
 

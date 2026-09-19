@@ -67,7 +67,13 @@ import {
 import { type ConsoleEntry } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
-import { type PreviewInputEvent, registerPreviewInput } from './preview-input'
+import {
+  type PreviewInputEvent,
+  type PreviewInputScale,
+  previewInputScale,
+  registerPreviewInput,
+  scalePreviewInput
+} from './preview-input'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
 import { registerPreviewScriptRunner } from './preview-script-runner'
@@ -259,6 +265,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const lastRestartEventRef = useRef('')
   const previewContentRef = useRef<HTMLDivElement | null>(null)
   const webviewRef = useRef<PreviewWebview | null>(null)
+  const inputScaleRef = useRef<PreviewInputScale>({ x: 1, y: 1 })
+  const inputCalibrationGenerationRef = useRef(0)
+  const inputCalibrationReadyGenerationRef = useRef(-1)
+  const inputCalibrationPromiseRef = useRef<Promise<boolean> | null>(null)
+  const inputCalibrationTokenRef = useRef(0)
   const previewServerRestart = useStore($previewServerRestart)
   const consoleHeight = useStore(consoleState.$height)
   const consoleOpen = useStore(consoleState.$open)
@@ -791,13 +802,115 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     })
   }, [isWebPreview, tabId])
 
+  const invalidateInputCalibration = useCallback(() => {
+    inputCalibrationGenerationRef.current += 1
+    inputCalibrationReadyGenerationRef.current = -1
+    inputScaleRef.current = { x: 1, y: 1 }
+    inputCalibrationPromiseRef.current = null
+  }, [])
+
   // Publish the INPUT channel for this tab. Same idea as the script runner, but
   // it carries real Chromium input rather than script — the agent's clicks and
   // keystrokes arrive as trusted events, so the page hovers, focuses and reacts
   // exactly as it would under a human hand.
+  // eslint-disable-next-line no-restricted-syntax -- calibration state is per live webview, not reactive UI state
   useEffect(() => {
     if (!isWebPreview || isRemoteHtml || !tabId) {
       return
+    }
+
+    const sendRaw = (event: PreviewInputEvent): boolean => {
+      const webview = webviewRef.current
+
+      // Never optional-chain this call away: a missing method would make every
+      // agent click a silent no-op that still reports success, because the
+      // overlay and the read-back both run on the separate script channel.
+      if (typeof webview?.sendInputEvent !== 'function') {
+        return false
+      }
+
+      webview.sendInputEvent(event)
+
+      return true
+    }
+
+    const prepare = async (): Promise<boolean> => {
+      const webview = webviewRef.current
+
+      if (!webview?.executeJavaScript || typeof webview.sendInputEvent !== 'function') {
+        return false
+      }
+
+      const execute = webview.executeJavaScript.bind(webview)
+
+      if (inputCalibrationPromiseRef.current) {
+        return inputCalibrationPromiseRef.current
+      }
+
+      const generation = inputCalibrationGenerationRef.current
+
+      if (inputCalibrationReadyGenerationRef.current === generation) {
+        return true
+      }
+
+      const token = `hermes-input-${++inputCalibrationTokenRef.current}`
+      const probe: PreviewInputScale = { x: 32, y: 32 }
+
+      const pending = (async () => {
+        try {
+          // Install the witness before sending the probe. This measures the
+          // actual guest mapping, including persisted page zoom and host display
+          // scaling, instead of assuming either factor from devicePixelRatio.
+          await execute(`(() => {
+            const token = ${JSON.stringify(token)};
+            const state = { token, x: null, y: null };
+            const onMove = event => {
+              if (window.__hermesInputCalibration?.token !== token) return;
+              state.x = event.clientX;
+              state.y = event.clientY;
+              document.removeEventListener('pointermove', onMove, true);
+              window.__hermesInputCalibration = state;
+            };
+            window.__hermesInputCalibration = state;
+            document.addEventListener('pointermove', onMove, true);
+            return true;
+          })()`)
+
+          if (generation !== inputCalibrationGenerationRef.current || !sendRaw({ type: 'mouseMove', ...probe })) {
+            return false
+          }
+
+          const received = (await execute(`(async () => {
+            await new Promise(resolve => setTimeout(resolve, 0));
+            const state = window.__hermesInputCalibration;
+            if (!state || state.token !== ${JSON.stringify(token)}) return null;
+            delete window.__hermesInputCalibration;
+            return { x: state.x, y: state.y };
+          })()`)) as Partial<PreviewInputScale> | null
+
+          const scale = received && previewInputScale(probe, { x: Number(received.x), y: Number(received.y) })
+
+          if (!scale || generation !== inputCalibrationGenerationRef.current) {
+            return false
+          }
+
+          inputScaleRef.current = scale
+          inputCalibrationReadyGenerationRef.current = generation
+
+          return true
+        } catch {
+          return false
+        }
+      })()
+
+      inputCalibrationPromiseRef.current = pending
+      const ready = await pending
+
+      if (inputCalibrationPromiseRef.current === pending) {
+        inputCalibrationPromiseRef.current = null
+      }
+
+      return ready
     }
 
     return registerPreviewInput(tabId, {
@@ -810,17 +923,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           webview.focus?.()
         }
       },
+      prepare,
       send: event => {
-        const webview = webviewRef.current
-
-        // Never optional-chain this call away: a missing method would make every
-        // agent click a silent no-op that still reports success, because the
-        // overlay and the read-back both run on the separate script channel.
-        if (typeof webview?.sendInputEvent !== 'function') {
+        if (!sendRaw(scalePreviewInput(event, inputScaleRef.current))) {
           throw new Error('preview webview cannot take input events')
         }
-
-        webview.sendInputEvent(event)
       }
     })
   }, [isRemoteHtml, isWebPreview, tabId])
@@ -1015,6 +1122,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       return
     }
 
+    invalidateInputCalibration()
     host.replaceChildren()
     webviewRef.current = null
     setCurrentUrl(target.url)
@@ -1102,6 +1210,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     }
 
     const onNavigate = (event: Event) => {
+      invalidateInputCalibration()
       const detail = event as Event & { url?: string }
 
       if (detail.url) {
@@ -1251,6 +1360,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     webviewRef.current = webview
 
     return () => {
+      invalidateInputCalibration()
       annotateLoopRef.current += 1
       webview.removeEventListener('console-message', onConsole)
       webview.removeEventListener('ipc-message', onGuestExternal)
@@ -1266,7 +1376,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       webview.remove()
       setAnnotate(session => (session.mode ? { ...endAnnotateMode(session), stack: emptyAnnotateStack() } : session))
     }
-  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, tabId, target.kind, target.url])
+  }, [appendConsoleEntry, consoleState, copy, invalidateInputCalibration, isRemoteHtml, isWebPreview, tabId, target.kind, target.url])
 
   return (
     <aside
