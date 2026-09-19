@@ -37,10 +37,17 @@ logger = logging.getLogger(__name__)
 _SCHTASKS_TIMEOUT_S = 15
 # Patterns in schtasks stderr that mean "fall back to the Startup folder".
 _FALLBACK_PATTERNS = re.compile(
-    r"(access is denied|acceso denegado|přístup byl odepřen|schtasks timed out|schtasks produced no output)",
+    r"(access is denied|acceso denegado|přístup byl odepřen|"
+    r"错误\s*:\s*拒绝访问|拒绝访问|アクセスが拒否されました|"
+    r"액세스가 거부되었습니다|schtasks timed out|schtasks produced no output)",
     re.IGNORECASE,
 )
-_ACCESS_DENIED_PATTERN = re.compile(r"(access is denied|acceso denegado)", re.IGNORECASE)
+_ACCESS_DENIED_PATTERN = re.compile(
+    r"(access is denied|acceso denegado|přístup byl odepřen|"
+    r"错误\s*:\s*拒绝访问|拒绝访问|アクセスが拒否されました|"
+    r"액세스가 거부되었습니다)",
+    re.IGNORECASE,
+)
 
 # Set by _spawn_detached() when the breakaway spawn failed and it retried WITHOUT
 # CREATE_BREAKAWAY_FROM_JOB — the child stays in the parent's Job Object and may be killed when this
@@ -64,6 +71,29 @@ def _schtasks_encoding() -> str:
         return locale.getpreferredencoding(False) or "utf-8"
     except Exception:
         return "utf-8"
+
+
+def _windows_ansi_encoding() -> str:
+    """Return the Windows ANSI code page without Python UTF-8 Mode influencing it."""
+    try:
+        code_page = int(ctypes.windll.kernel32.GetACP())
+        if code_page <= 0:
+            raise ValueError("Windows returned an invalid ANSI code page")
+        return f"cp{code_page}"
+    except (AttributeError, OSError, ValueError):
+        return _schtasks_encoding()
+
+
+def _decode_schtasks_output(data: bytes | str) -> str:
+    """Decode captured ``schtasks.exe`` bytes while preserving localized paths and messages."""
+    if isinstance(data, str):
+        return data
+    for encoding in (_windows_ansi_encoding(), "utf-8"):
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _assert_windows() -> None:
@@ -155,10 +185,14 @@ def _exec_schtasks(args: list[str]) -> tuple[int, str, str]:
         # Locale encoding + replace: a non-UTF-8 status line must never surface a UnicodeDecodeError
         # from subprocess' reader threads. CREATE_NO_WINDOW: no flashing console under a TUI.
         proc = subprocess.run(
-            [schtasks, *args], capture_output=True, text=True, encoding=_schtasks_encoding(), errors="replace",
+            [schtasks, *args], capture_output=True, text=False,
             timeout=_SCHTASKS_TIMEOUT_S, creationflags=windows_hide_flags(),
         )
-        return (proc.returncode, proc.stdout or "", proc.stderr or "")
+        return (
+            proc.returncode,
+            _decode_schtasks_output(proc.stdout or b""),
+            _decode_schtasks_output(proc.stderr or b""),
+        )
     except subprocess.TimeoutExpired:
         return (124, "", f"schtasks timed out after {_SCHTASKS_TIMEOUT_S}s")
     except OSError as e:

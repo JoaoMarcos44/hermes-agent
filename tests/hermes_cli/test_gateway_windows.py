@@ -15,6 +15,20 @@ import hermes_cli.setup as setup
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
 
 
+def test_decode_schtasks_output_preserves_non_ascii_windows_path(monkeypatch):
+    """Scheduled Task XML keeps an ANSI-encoded account path intact under UTF-8 mode."""
+    monkeypatch.setattr(gateway_windows, "_windows_ansi_encoding", lambda: "gbk")
+    raw = r"<Arguments>C:\\Users\\方舟\\AppData\\Local\\hermes\\gateway.vbs</Arguments>".encode("gbk")
+
+    assert "方舟" in gateway_windows._decode_schtasks_output(raw)
+
+
+def test_localized_access_denied_uses_existing_fallback_paths():
+    """Localized schtasks denial still reaches elevation/startup fallback handling."""
+    detail = "错误: 拒绝访问。"
+
+    assert gateway_windows._should_fall_back(1, detail)
+    assert gateway_windows._is_access_denied(detail)
 
 
 def test_schtasks_encoding_falls_back_to_utf8(monkeypatch):
