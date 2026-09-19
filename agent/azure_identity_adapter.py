@@ -11,6 +11,7 @@ Reference: https://learn.microsoft.com/azure/ai-foundry/foundry-models/how-to/co
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import logging
 import os
@@ -104,20 +105,33 @@ def _default_chain_credential(config: EntraIdentityConfig) -> Any:
 
 # Routed multiplex profiles: (home key, config) -> credential. DefaultAzureCredential reads AZURE_* from the
 # process env, which under an override belongs to the LAUNCH profile, so a served profile's service principal
-# is built explicitly from its own secret scope (client secret first, then workload identity), falling back
-# to the default chain only when the profile sets no AZURE_* of its own.
+# is built explicitly from its own secret scope (client secret first, then workload identity). Under multiplex
+# the ambient chain is refused when the profile does not provide an explicit credential of its own.
 _credentials_by_home: Dict[tuple, Any] = {}
+
+_AMBIENT_CHAIN_REFUSAL = (
+    "Entra ID auth is refused for this profile: it provides no AZURE_* credential of its own, and "
+    "the ambient DefaultAzureCredential chain would use the launch profile's identity. Configure "
+    "AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET, AZURE_FEDERATED_TOKEN_FILE, or "
+    "AZURE_CLIENT_ID for an explicit managed identity."
+)
 
 
 def _scoped_credential(ai: Any, config: EntraIdentityConfig) -> Any:
-    from agent.secret_scope import current_secret_scope
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
     scope = current_secret_scope() or {}
     read = lambda name: (scope.get(name) or "").strip()  # noqa: E731
     tenant, client = read("AZURE_TENANT_ID"), read("AZURE_CLIENT_ID")
     if tenant and client and read("AZURE_CLIENT_SECRET"):
         return ai.ClientSecretCredential(tenant, client, read("AZURE_CLIENT_SECRET"))
     if tenant and client and read("AZURE_FEDERATED_TOKEN_FILE"):
-        return ai.WorkloadIdentityCredential(tenant_id=tenant, client_id=client, token_file_path=read("AZURE_FEDERATED_TOKEN_FILE"))
+        return ai.WorkloadIdentityCredential(
+            tenant_id=tenant, client_id=client, token_file_path=read("AZURE_FEDERATED_TOKEN_FILE")
+        )
+    if client and not tenant and not read("AZURE_CLIENT_SECRET") and not read("AZURE_FEDERATED_TOKEN_FILE"):
+        return ai.ManagedIdentityCredential(client_id=client)
+    if is_multiplex_active():
+        raise RuntimeError(_AMBIENT_CHAIN_REFUSAL)
     kwargs = {} if config.exclude_interactive_browser else {"exclude_interactive_browser_credential": False}
     return ai.DefaultAzureCredential(**kwargs)
 
@@ -167,6 +181,7 @@ def build_token_provider(scope: Optional[str] = None, *, config: Optional[EntraI
 def _probe_token(config: EntraIdentityConfig, timeout_seconds: float) -> Optional[Dict[str, Any]]:
     """``get_token`` on a daemon thread under a hard deadline → ``{"token"}`` / ``{"error"}`` / None on timeout."""
     result: Dict[str, Any] = {}
+    context = contextvars.copy_context()
 
     def _probe() -> None:
         try:
@@ -174,7 +189,7 @@ def _probe_token(config: EntraIdentityConfig, timeout_seconds: float) -> Optiona
         except Exception as exc:
             result["error"] = str(exc)
 
-    thread = threading.Thread(target=_probe, daemon=True)
+    thread = threading.Thread(target=lambda: context.run(_probe), daemon=True)
     thread.start()
     thread.join(timeout=max(0.01, timeout_seconds))
     return None if thread.is_alive() else result
@@ -218,8 +233,8 @@ def _scoped_env(name: str) -> str:
 _ENV_SOURCE_CHECKS = (
     ("WorkloadIdentityCredential (AZURE_FEDERATED_TOKEN_FILE)", lambda: _scoped_env("AZURE_FEDERATED_TOKEN_FILE")),
     ("EnvironmentCredential (client secret)",
-     lambda: _env("AZURE_CLIENT_ID") and _scoped_env("AZURE_CLIENT_SECRET") and _env("AZURE_TENANT_ID")),
-    ("ManagedIdentityCredential (IDENTITY_ENDPOINT)", lambda: _env("IDENTITY_ENDPOINT") or _env("MSI_ENDPOINT")),
+     lambda: _scoped_env("AZURE_CLIENT_ID") and _scoped_env("AZURE_CLIENT_SECRET") and _scoped_env("AZURE_TENANT_ID")),
+    ("ManagedIdentityCredential (IDENTITY_ENDPOINT)", lambda: _scoped_env("IDENTITY_ENDPOINT") or _scoped_env("MSI_ENDPOINT")),
 )
 
 
@@ -236,7 +251,7 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None, *, 
         return info
     config = _resolve_config(config, scope, **overrides)
     info["scope"] = config.scope
-    if tenant := _env("AZURE_TENANT_ID"):
+    if tenant := _scoped_env("AZURE_TENANT_ID"):
         info["tenant_id_env"] = tenant
     info["env_sources"] = [label for label, present in _ENV_SOURCE_CHECKS if present()]
     result = _probe_token(config, timeout_seconds)

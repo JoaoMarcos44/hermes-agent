@@ -251,6 +251,7 @@ class _FakeAzureIdentity:
         self.last_credential_kwargs = None
         self.last_scope = None
         self.credential_count = 0
+        self.scoped_calls = []
 
     def DefaultAzureCredential(self, **kwargs):  # noqa: N802 — match SDK
         self.last_credential_kwargs = kwargs
@@ -259,6 +260,21 @@ class _FakeAzureIdentity:
             get_token=lambda scope: SimpleNamespace(token="fake-jwt", expires_on=9999999999),
             kwargs=kwargs,
         )
+
+    def ClientSecretCredential(self, tenant_id, client_id, client_secret):  # noqa: N802
+        self.scoped_calls.append(("client_secret", tenant_id, client_id, client_secret))
+        return SimpleNamespace(
+            kind="client_secret",
+            get_token=lambda scope: SimpleNamespace(token="scoped-token", expires_on=1),
+        )
+
+    def WorkloadIdentityCredential(self, **kwargs):  # noqa: N802
+        self.scoped_calls.append(("workload_identity", kwargs))
+        return SimpleNamespace(kind="workload_identity")
+
+    def ManagedIdentityCredential(self, **kwargs):  # noqa: N802
+        self.scoped_calls.append(("managed_identity", kwargs))
+        return SimpleNamespace(kind="managed_identity")
 
     def get_bearer_token_provider(self, credential, scope):
         self.last_scope = scope
@@ -274,6 +290,9 @@ def fake_azure_identity(monkeypatch):
 
     fake_module = SimpleNamespace(
         DefaultAzureCredential=fake.DefaultAzureCredential,
+        ClientSecretCredential=fake.ClientSecretCredential,
+        WorkloadIdentityCredential=fake.WorkloadIdentityCredential,
+        ManagedIdentityCredential=fake.ManagedIdentityCredential,
         get_bearer_token_provider=fake.get_bearer_token_provider,
     )
     monkeypatch.setitem(sys.modules, "azure", SimpleNamespace(identity=fake_module))
@@ -319,6 +338,55 @@ class TestBuildCredential:
         assert c1 is not c2
         assert fake_azure_identity.credential_count == 2
 
+    def test_multiplexed_override_rejects_launch_ambient_chain(
+        self, fake_azure_identity, monkeypatch, tmp_path,
+    ):
+        from agent import secret_scope
+        from agent.azure_identity_adapter import EntraIdentityConfig, build_credential
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        monkeypatch.setenv("AZURE_TENANT_ID", "launch-tenant")
+        monkeypatch.setenv("AZURE_CLIENT_ID", "launch-client")
+        monkeypatch.setenv("AZURE_CLIENT_SECRET", "launch-secret")
+        home_token = set_hermes_home_override(str(tmp_path / "served"))
+        secret_scope.set_multiplex_active(True)
+        scope_token = secret_scope.set_secret_scope({})
+        try:
+            with pytest.raises(RuntimeError, match="ambient DefaultAzureCredential"):
+                build_credential(EntraIdentityConfig())
+            assert fake_azure_identity.credential_count == 0
+        finally:
+            secret_scope.reset_secret_scope(scope_token)
+            secret_scope.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
+
+    def test_probe_preserves_profile_scope_and_explicit_routes(
+        self, fake_azure_identity, tmp_path,
+    ):
+        from agent import secret_scope
+        from agent.azure_identity_adapter import (
+            EntraIdentityConfig,
+            _probe_token,
+            build_credential,
+        )
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        home_token = set_hermes_home_override(str(tmp_path / "served"))
+        secret_scope.set_multiplex_active(True)
+        scope_token = secret_scope.set_secret_scope({
+            "AZURE_TENANT_ID": "tenant",
+            "AZURE_CLIENT_ID": "client",
+            "AZURE_CLIENT_SECRET": "secret",
+        })
+        try:
+            assert build_credential(EntraIdentityConfig()).kind == "client_secret"
+            result = _probe_token(EntraIdentityConfig(), timeout_seconds=1)
+            assert result["token"].token == "scoped-token"
+            assert fake_azure_identity.scoped_calls == [("client_secret", "tenant", "client", "secret")]
+        finally:
+            secret_scope.reset_secret_scope(scope_token)
+            secret_scope.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
 
 
 class TestBuildTokenProvider:

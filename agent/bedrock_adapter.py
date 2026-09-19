@@ -49,17 +49,32 @@ _AWS_SCOPED_CREDENTIAL_VARS: Tuple[Tuple[str, str], ...] = (
 
 
 def scoped_aws_session_kwargs() -> Dict[str, str]:
-    """``boto3.session.Session`` kwargs from the routed profile's secret scope, ``{}`` when unscoped.
+    """Return AWS SDK arguments from the active profile's secret scope.
 
-    Under a HERMES_HOME override the process env holds the LAUNCH profile's ``AWS_*`` (or nothing), so
-    every Bedrock client for a served profile must be built from that profile's own ``.env`` values.
+    In a routed profile an empty or partial result must not be passed to boto3:
+    boto3 would fill missing values from the launch process's ambient chain.
     """
     from hermes_constants import get_hermes_home_override
     if get_hermes_home_override() is None:
         return {}
-    from agent.secret_scope import current_secret_scope
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
     scope = current_secret_scope() or {}
-    return {kw: scope[var].strip() for kw, var in _AWS_SCOPED_CREDENTIAL_VARS if (scope.get(var) or "").strip()}
+    kwargs = {
+        kw: scope[var].strip()
+        for kw, var in _AWS_SCOPED_CREDENTIAL_VARS
+        if (scope.get(var) or "").strip()
+    }
+    complete = (
+        {"aws_access_key_id", "aws_secret_access_key"}.issubset(kwargs)
+        or "profile_name" in kwargs
+    )
+    if not complete and is_multiplex_active():
+        raise RuntimeError(
+            "Bedrock auth is refused for this profile: it provides no complete AWS credential of its own, "
+            "and the ambient default chain would use the launch profile's identity. Configure an AWS "
+            "access-key pair or an explicit AWS_PROFILE in this profile."
+        )
+    return kwargs
 
 # Bedrock-hosted GPT-5.x models are served from the Bedrock Mantle OpenAI-compatible endpoint, not
 # Converse. Narrow allowlist so GPT-OSS models stay on the native path.
@@ -108,8 +123,8 @@ def _cached_client(cache: Dict[str, Any], service: str, region: str):
     key = (hermes_home_key(), service, region)
     client = _bedrock_clients_by_home.get(key)
     if client is None:
-        boto3 = _require_boto3()
-        client = boto3.Session(**scoped_aws_session_kwargs()).client(service, region_name=region)
+        kwargs = scoped_aws_session_kwargs()
+        client = _require_boto3().Session(**kwargs).client(service, region_name=region)
         _bedrock_clients_by_home[key] = client
     return client
 
@@ -178,9 +193,14 @@ def is_bedrock_openai_base_url(base_url: str) -> bool:
 
 
 def resolve_bedrock_bearer_token(env: Optional[Dict[str, str]] = None) -> str:
-    """Return AWS_BEARER_TOKEN_BEDROCK when Bedrock API-key auth is configured."""
-    env = env if env is not None else os.environ
-    return (env.get("AWS_BEARER_TOKEN_BEDROCK", "") or "").strip()
+    """Return the configured Bedrock bearer token without crossing profile boundaries."""
+    if env is not None:
+        return (env.get("AWS_BEARER_TOKEN_BEDROCK", "") or "").strip()
+    from hermes_constants import get_hermes_home_override
+    if get_hermes_home_override() is not None:
+        from agent.secret_scope import get_secret
+        return (get_secret("AWS_BEARER_TOKEN_BEDROCK", "") or "").strip()
+    return (os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "") or "").strip()
 
 
 class BedrockOpenAISigV4Auth(httpx.Auth):
@@ -195,7 +215,8 @@ class BedrockOpenAISigV4Auth(httpx.Auth):
     def auth_flow(self, request):  # pragma: no cover - exercised by live call
         from botocore.auth import SigV4Auth
         from botocore.awsrequest import AWSRequest
-        credentials = _require_boto3().Session(**scoped_aws_session_kwargs()).get_credentials()
+        kwargs = scoped_aws_session_kwargs()
+        credentials = _require_boto3().Session(**kwargs).get_credentials()
         if credentials is None:
             raise RuntimeError(
                 "No AWS credentials available for Bedrock OpenAI Responses. "

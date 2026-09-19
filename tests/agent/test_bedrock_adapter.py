@@ -123,7 +123,65 @@ class TestHasAwsCredentials:
             assert has_aws_credentials({}) is False
 
 
-class TestResolveBedrocRegion:
+class TestScopedAwsCredentials:
+    def test_multiplexed_profile_rejects_launch_ambient_chain(self, monkeypatch, tmp_path):
+        from agent import secret_scope
+        from agent.bedrock_adapter import scoped_aws_session_kwargs
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "launch-key")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "launch-secret")
+        home_token = set_hermes_home_override(str(tmp_path / "served"))
+        secret_scope.set_multiplex_active(True)
+        scope_token = secret_scope.set_secret_scope({})
+        try:
+            with pytest.raises(RuntimeError, match="ambient default chain"):
+                scoped_aws_session_kwargs()
+        finally:
+            secret_scope.reset_secret_scope(scope_token)
+            secret_scope.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
+
+    def test_explicit_profile_values_and_bearer_do_not_use_process_env(self, monkeypatch, tmp_path):
+        from agent import secret_scope
+        from agent.bedrock_adapter import resolve_bedrock_bearer_token, scoped_aws_session_kwargs
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "launch-token")
+        home_token = set_hermes_home_override(str(tmp_path / "served"))
+        secret_scope.set_multiplex_active(True)
+        scope_token = secret_scope.set_secret_scope({
+            "AWS_ACCESS_KEY_ID": "profile-key",
+            "AWS_SECRET_ACCESS_KEY": "profile-secret",
+            "AWS_BEARER_TOKEN_BEDROCK": "profile-token",
+        })
+        try:
+            assert scoped_aws_session_kwargs() == {
+                "aws_access_key_id": "profile-key",
+                "aws_secret_access_key": "profile-secret",
+            }
+            assert resolve_bedrock_bearer_token() == "profile-token"
+            secret_scope.reset_secret_scope(scope_token)
+            scope_token = secret_scope.set_secret_scope({"AWS_PROFILE": "shared-profile"})
+            assert scoped_aws_session_kwargs() == {"profile_name": "shared-profile"}
+        finally:
+            secret_scope.reset_secret_scope(scope_token)
+            secret_scope.set_multiplex_active(False)
+            reset_hermes_home_override(home_token)
+
+    def test_non_multiplex_override_keeps_ambient_chain_compatibility(self, tmp_path):
+        from agent import secret_scope
+        from agent.bedrock_adapter import scoped_aws_session_kwargs
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        home_token = set_hermes_home_override(str(tmp_path / "profile"))
+        try:
+            assert scoped_aws_session_kwargs() == {}
+        finally:
+            reset_hermes_home_override(home_token)
+            secret_scope.set_multiplex_active(False)
+
+
     def test_prefers_aws_region(self):
         from agent.bedrock_adapter import resolve_bedrock_region
         env = {"AWS_REGION": "eu-west-1", "AWS_DEFAULT_REGION": "us-west-2"}
