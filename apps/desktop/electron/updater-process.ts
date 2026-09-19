@@ -139,12 +139,12 @@ export function resolvePosixScriptHandoff(
  * the launch side). The same spawn with a visible console, or non-detached,
  * runs fine — so unit tests and foreground use hide the bug.
  *
- * `cmd /c start "" /min powershell ...` was the variant that survived the
- * full detached+hidden production shape in testing: `start` allocates the
- * child its own (minimized) console and fully detaches it from cmd.exe,
- * which exits immediately. The spawned pid is therefore the WRAPPER's —
- * callers must not use it as a marker owner (the script claims the marker
- * itself with its own $PID).
+ * `cmd /c start "" /b powershell ...` is the production shape: `start /b`
+ * keeps the child in the wrapper's hidden console while still returning
+ * immediately, so the script outlives cmd.exe without creating a visible
+ * console window. The spawned pid is therefore the WRAPPER's — callers must
+ * not use it as a marker owner (the script claims the marker itself with its
+ * own $PID).
  */
 export function wrapHandoffForDetachedConsole(
   handoff: UpdateScriptHandoff,
@@ -155,7 +155,7 @@ export function wrapHandoffForDetachedConsole(
 } {
   return {
     command: 'cmd.exe',
-    args: ['/d', '/s', '/c', 'start', '', '/min', handoff.command, ...handoff.args, ...extraArgs]
+    args: ['/d', '/s', '/c', 'start', '', '/b', handoff.command, ...handoff.args, ...extraArgs]
   }
 }
 
