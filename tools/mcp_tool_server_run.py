@@ -113,7 +113,12 @@ class MCPServerRunMixin:
                     # transports — clear the rapid-drop budget without pinging (#62212). An
                     # earlier wake (a hidden-then-missed recycle deadline) is not that proof.
                     if (not self._session_proven and proof_at is not None
-                            and time.monotonic() >= proof_at and not self._stdio_children_dead()):
+                            and time.monotonic() >= proof_at):
+                        if self._stdio_children_dead():
+                            logger.warning(
+                                "MCP server '%s' stdio subprocess exited before session proved healthy; "
+                                "triggering reconnect (state: connected → degraded)", self.name)
+                            break
                         self._mark_session_proven()
                     continue
                 # Timeout: probe for a stale session — NEVER while an RPC is in flight (a
