@@ -95,6 +95,16 @@ _SENSITIVE_HOME_FILES = tuple(Path(p) for p in (
     ".profile", ".bash_profile", ".zprofile", ".netrc", ".pgpass", ".npmrc", ".pypirc",
 ))
 _TEXT_EXTENSIONS = (".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".js", ".ts")
+# Resource bound for @-reference expansion (#116562): every expander gates on
+# bytes BEFORE materializing content, so a short remote message cannot force
+# GB-scale transient allocations. The single budget below feeds all branches —
+# file reads, subprocess output, and fetched/plugin text — instead of one ad
+# hoc check per call site.
+_SNIFF_BYTES = 4096
+_INLINE_BYTES_SLACK = 512  # fence/header overhead on top of tokens * chars-per-token
+_MAX_REFS_PER_MESSAGE = 32  # bounds asyncio.gather fan-out for hostile messages
+_FOLDER_METADATA_BYTES = 256 * 1024  # larger files report size only, never line-counted
+_READ_CHUNK_CHARS = 64 * 1024
 _FENCE_LANGUAGES = {
     ".py": "python", ".js": "javascript", ".ts": "typescript", ".tsx": "tsx", ".jsx": "jsx",
     ".json": "json", ".md": "markdown", ".sh": "bash", ".yml": "yaml", ".yaml": "yaml", ".toml": "toml",
@@ -192,6 +202,15 @@ async def preprocess_context_references_async(
     refs = parse_context_references(message)
     if not refs:
         return ContextReferenceResult(message=message, original_message=message)
+    if len(refs) > _MAX_REFS_PER_MESSAGE:
+        dropped = len(refs) - _MAX_REFS_PER_MESSAGE
+        refs = refs[:_MAX_REFS_PER_MESSAGE]
+        truncated_refs_warning = (
+            f"@ context refs truncated: {dropped} reference(s) ignored "
+            f"(limit {_MAX_REFS_PER_MESSAGE} per message)."
+        )
+    else:
+        truncated_refs_warning = None
     cwd_path = Path(cwd).expanduser().resolve()
     # Default root = cwd so @ references cannot escape the workspace unless a caller widens it.
     allowed_root_path = Path(allowed_root).expanduser().resolve() if allowed_root is not None else cwd_path
@@ -208,6 +227,8 @@ async def preprocess_context_references_async(
     expanded = await asyncio.gather(*tasks)
     warnings = [warning for warning, _ in expanded if warning]
     blocks = [block for _, block in expanded if block]
+    if truncated_refs_warning is not None:
+        warnings.append(truncated_refs_warning)
     injected_tokens = sum(estimate_tokens_rough(block) for block in blocks)
     result = ContextReferenceResult(
         message=message, original_message=message, references=refs, warnings=warnings, injected_tokens=injected_tokens
@@ -241,6 +262,46 @@ _GIT_REFERENCE_ARGS: dict[str, Callable[[ContextReference], list[str]]] = {
 }
 
 
+def _byte_budget_for_tokens(max_inline_tokens: int | None) -> int | None:
+    """Single byte budget behind every @-reference size gate.
+
+    Token estimates run ~4 bytes/token, so the budget is checked with cheap
+    ``st_size`` / ``len()`` comparisons BEFORE any content is materialized.
+    """
+    if max_inline_tokens is None:
+        return None
+    from agent.model_metadata import CHARS_PER_TOKEN
+    return max_inline_tokens * CHARS_PER_TOKEN + _INLINE_BYTES_SLACK
+
+
+def _oversized_inline_reference_block(ref: ContextReference, label: str, approx_tokens: int,
+                                      guidance: str) -> str:
+    """Shared 📎 stub for refs with no on-disk path (diff / url / plugin).
+
+    The content is not inlined; the model gets guidance for fetching a
+    narrower slice with its own tools. One helper serves all branches.
+    """
+    return (
+        f"📎 {ref.raw} (approximately {approx_tokens} tokens) — too large to inline safely. "
+        f"{label} {guidance}"
+    )
+
+
+def _inline_over_budget(text: str, max_inline_tokens: int | None) -> int | None:
+    """Return approx tokens when *text* exceeds the inline budget, else None.
+
+    Length is checked first so oversized payloads never pay a full token scan.
+    """
+    if max_inline_tokens is None:
+        return None
+    budget = _byte_budget_for_tokens(max_inline_tokens)
+    assert budget is not None
+    if len(text) <= budget:
+        tokens = estimate_tokens_rough(text)
+        return tokens if tokens > max_inline_tokens else None
+    return max(estimate_tokens_rough(text[:_SNIFF_BYTES]), (len(text) + 3) // 4)
+
+
 async def _expand_reference(
     ref: ContextReference, cwd: Path, *, url_fetcher: UrlFetcher = None, allowed_root: Path | None = None,
     max_inline_tokens: int | None = None,
@@ -250,11 +311,17 @@ async def _expand_reference(
             return _expand_path_reference(ref, cwd, allowed_root=allowed_root, max_inline_tokens=max_inline_tokens)
         if ref.kind in _GIT_REFERENCE_ARGS:
             git_args = _GIT_REFERENCE_ARGS[ref.kind](ref)
-            return _expand_git_reference(ref, cwd, git_args, "git " + " ".join(git_args))
+            return _expand_git_reference(ref, cwd, git_args, "git " + " ".join(git_args),
+                                         max_inline_tokens=max_inline_tokens)
         if ref.kind == "url":
             content = await _fetch_url_content(ref.target, url_fetcher=url_fetcher)
             if not content:
                 return f"{ref.raw}: no content extracted", None
+            over = _inline_over_budget(content, max_inline_tokens)
+            if over is not None:
+                return None, _oversized_inline_reference_block(
+                    ref, "Web content not inlined.",
+                    over, "Use web_search or web_extract with a narrower query to fetch only the relevant section.")
             return None, f"🌐 {ref.raw} ({estimate_tokens_rough(content)} tokens)\n{content}"
     except Exception as exc:
         return f"{ref.raw}: {exc}", None
@@ -263,10 +330,62 @@ async def _expand_reference(
         try:
             plugin_content = await provider.expand(ref.target)
             if plugin_content is not None:
+                over = _inline_over_budget(plugin_content, max_inline_tokens)
+                if over is not None:
+                    return None, _oversized_inline_reference_block(
+                        ref, "Plugin content not inlined.",
+                        over, "Query the provider with a narrower target instead of loading the full result.")
                 return None, f"📌 {ref.raw} ({estimate_tokens_rough(plugin_content)} tokens)\n{plugin_content}"
         except Exception as exc:
             return f"{ref.raw}: plugin expansion error: {exc}", None
     return f"{ref.raw}: unsupported reference type", None
+
+
+def _read_text_bounded(path: Path, byte_budget: int | None) -> str | None:
+    """Read a text file without ever holding more than the budget in memory.
+
+    Returns None when the content exceeds *byte_budget* (caller emits the
+    oversized stub). The pre-stat size check in the caller handles the common
+    case; this streaming read closes the stat-to-read race where the file grows
+    between the two.
+    """
+    if byte_budget is None:
+        return path.read_text(encoding="utf-8", errors="replace")
+    chunks: list[str] = []
+    total = 0
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        while True:
+            chunk = handle.read(_READ_CHUNK_CHARS)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > byte_budget:
+                return None
+            chunks.append(chunk)
+    return "".join(chunks)
+
+
+def _read_text_range_bounded(path: Path, start: int, end: int,
+                             byte_budget: int | None) -> str | None:
+    """Serve ``@file:x:start-end`` by streaming to the last needed line only.
+
+    The rest of the file is never read, so a 500MB log with ``:1-5`` costs
+    five lines of I/O instead of a full load plus slice.
+    """
+    lines: list[str] = []
+    total = 0
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for lineno, line in enumerate(handle, 1):
+            if lineno < start:
+                continue
+            if lineno > end:
+                break
+            stripped = line.rstrip("\n")
+            total += len(stripped) + 1
+            if byte_budget is not None and total > byte_budget + _INLINE_BYTES_SLACK:
+                return None
+            lines.append(stripped)
+    return "\n".join(lines)
 
 
 def _expand_path_reference(ref: ContextReference, cwd: Path, *, allowed_root: Path | None = None,
@@ -286,9 +405,31 @@ def _expand_path_reference(ref: ContextReference, cwd: Path, *, allowed_root: Pa
         # A bare "not supported" warning was a dead end (the model gave up); the file IS
         # on disk where the agent's tools run, so hand it an actionable block instead.
         return None, _binary_reference_block(ref, path)
-    text = path.read_text(encoding="utf-8")
+    budget = _byte_budget_for_tokens(max_inline_tokens)
     if ref.line_start is not None:
-        text = "\n".join(text.splitlines()[max(ref.line_start - 1, 0):ref.line_end or ref.line_start])
+        start = max(ref.line_start, 1)
+        end = ref.line_end or ref.line_start
+        text = _read_text_range_bounded(path, start, end, budget)
+        if text is None:
+            over = max(max_inline_tokens or 0, (end - start + 1) * 8)
+            return None, _oversized_text_reference_block(ref, path, over)
+    else:
+        # Size-gate BEFORE the read: an oversized file produces the stub without
+        # ever being loaded and token-scanned into memory.
+        try:
+            if budget is not None and path.stat().st_size > budget:
+                over = max(max_inline_tokens or 0, (path.stat().st_size + 3) // 4)
+                return None, _oversized_text_reference_block(ref, path, over)
+        except OSError:
+            pass
+        text = _read_text_bounded(path, budget)
+        if text is None:
+            over = max_inline_tokens or 0
+            try:
+                over = max(over, (path.stat().st_size + 3) // 4)
+            except OSError:
+                pass
+            return None, _oversized_text_reference_block(ref, path, over)
     lang = _FENCE_LANGUAGES.get(path.suffix.lower(), "")
     text_tokens = estimate_tokens_rough(text)
     # Check BEFORE building the fenced block: an oversized file is not going to be
@@ -302,22 +443,97 @@ def _expand_path_reference(ref: ContextReference, cwd: Path, *, allowed_root: Pa
     return None, f"📄 {ref.raw} ({text_tokens} tokens)\n```{lang}\n{text}\n```"
 
 
-def _run_quiet(cmd: list[str], cwd: Path, timeout: int, env: dict | None = None) -> subprocess.CompletedProcess:
-    """subprocess.run with captured text output, no stdin, and no console flash on Windows."""
+def _run_quiet(cmd: list[str], cwd: Path, timeout: int, env: dict | None = None,
+               max_output_bytes: int | None = None) -> subprocess.CompletedProcess:
+    """Captured subprocess output with an optional streaming byte cap.
+
+    Without a cap this behaves exactly as before. With a cap, stdout/stderr are
+    streamed in chunks and the child is killed once the cap is passed, so
+    ``git diff`` on a huge tree never buffers GBs before the token gate runs.
+    Callers detect truncation via ``len(result.stdout) > max_output_bytes``.
+    """
     popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding='utf-8', errors='replace',
-                          timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs, **({} if env is None else {"env": env}))
+    if max_output_bytes is None:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                              timeout=timeout, stdin=subprocess.DEVNULL, **popen_kwargs, **({} if env is None else {"env": env}))
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, text=True, encoding='utf-8', errors='replace',
+                            **popen_kwargs, **({} if env is None else {"env": env}))
+    try:
+        import threading as _threading
+        import time as _time
+        chunks: dict[str, list[str]] = {"out": [], "err": []}
+        sizes = {"out": 0, "err": 0}
+        # Thread-per-pipe drain: portable across Windows and POSIX (select(2)
+        # cannot wait on pipes on Windows). Each reader stops appending once
+        # its cap is passed; stdout additionally kills the child so a huge
+        # diff never finishes buffering GBs.
+        stop = _threading.Event()
+
+        def _drain(stream_name: str, cap: int) -> None:
+            stream = proc.stdout if stream_name == "out" else proc.stderr
+            assert stream is not None
+            while not stop.is_set():
+                data = stream.read(_READ_CHUNK_CHARS)
+                if not data:
+                    break
+                if sizes[stream_name] <= cap:
+                    chunks[stream_name].append(data)
+                    sizes[stream_name] += len(data)
+                if stream_name == "out" and sizes["out"] > max_output_bytes + _INLINE_BYTES_SLACK:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    break
+
+        readers = [
+            _threading.Thread(target=_drain, args=("out", max_output_bytes), daemon=True),
+            _threading.Thread(target=_drain, args=("err", _SNIFF_BYTES), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            stop.set()
+            proc.kill()
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        deadline = _time.monotonic() + 5
+        for reader in readers:
+            remaining = deadline - _time.monotonic()
+            reader.join(timeout=max(0.1, remaining))
+        return subprocess.CompletedProcess(cmd, returncode, "".join(chunks["out"]), "".join(chunks["err"]))
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
 
-def _expand_git_reference(ref: ContextReference, cwd: Path, args: list[str], label: str) -> Expansion:
+def _expand_git_reference(ref: ContextReference, cwd: Path, args: list[str], label: str,
+                          max_inline_tokens: int | None = None) -> Expansion:
+    budget = _byte_budget_for_tokens(max_inline_tokens)
     try:
         # Repo-supplied config/attributes must never execute code (GHSA-7x36-8jrh-v4pw).
-        result = _run_quiet(["git", *harden_git_argv(args)], cwd, 30, env=noninteractive_git_env())
+        result = _run_quiet(["git", *harden_git_argv(args)], cwd, 30, env=noninteractive_git_env(),
+                            max_output_bytes=budget)
     except subprocess.TimeoutExpired:
         return f"{ref.raw}: git command timed out (30s)", None
     if result.returncode != 0:
         return f"{ref.raw}: {(result.stderr or '').strip() or 'git command failed'}", None
+    if budget is not None and len(result.stdout) > budget:
+        over = max(max_inline_tokens or 0, (len(result.stdout) + 3) // 4)
+        return None, _oversized_inline_reference_block(
+            ref, f"{label} not inlined.",
+            over, "Use git with a narrower scope (git diff --stat, git diff -- <path>) to inspect only the relevant part.")
     content = result.stdout.strip() or "(no output)"
+    over = _inline_over_budget(content, max_inline_tokens)
+    if over is not None:
+        return None, _oversized_inline_reference_block(
+            ref, f"{label} not inlined.",
+            over, "Use git with a narrower scope (git diff --stat, git diff -- <path>) to inspect only the relevant part.")
     return None, f"🧾 {label} ({estimate_tokens_rough(content)} tokens)\n```diff\n{content}\n```"
 
 
@@ -400,9 +616,15 @@ def _parse_file_reference_value(value: str) -> tuple[str, int | None, int | None
 
 def _is_binary_file(path: Path) -> bool:
     mime = mimetypes.guess_type(path.name)[0]
-    return bool(mime and not mime.startswith("text/") and not path.name.endswith(_TEXT_EXTENSIONS)) or (
-        b"\x00" in path.read_bytes()[:4096]
-    )
+    if bool(mime and not mime.startswith("text/") and not path.name.endswith(_TEXT_EXTENSIONS)):
+        return True
+    # Sniff only the head: the old ``path.read_bytes()[:4096]`` loaded the
+    # whole file to inspect the first 4KB.
+    try:
+        with path.open("rb") as handle:
+            return b"\x00" in handle.read(_SNIFF_BYTES)
+    except OSError:
+        return True
 
 
 def _build_folder_listing(path: Path, cwd: Path, limit: int = 200) -> str:
@@ -420,7 +642,10 @@ def _build_folder_listing(path: Path, cwd: Path, limit: int = 200) -> str:
 def _iter_visible_entries(path: Path, cwd: Path, limit: int) -> list[Path]:
     """Files under ``path`` via ``rg --files`` (honours ignore files), else an os.walk fallback."""
     try:
-        rg = _run_quiet(["rg", "--files", str(path.relative_to(cwd))], cwd, 10)
+        # Cap rg output: only ``limit`` lines are consumed, so a huge tree
+        # never buffers its full file list before the slice below runs.
+        rg = _run_quiet(["rg", "--files", str(path.relative_to(cwd))], cwd, 10,
+                        max_output_bytes=limit * 512)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         rg = None
     if rg is not None and rg.returncode == 0:
@@ -495,9 +720,21 @@ def _oversized_text_reference_block(ref: ContextReference, path: Path, text_toke
 
 
 def _file_metadata(path: Path) -> str:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "unknown size"
+    # A folder listing touches up to 200 entries: line-counting each file with
+    # a full read_text multiplied the issue's 2x cost per file. Large files
+    # report size only; small ones stay within a fixed bound.
+    if size > _FOLDER_METADATA_BYTES:
+        return f"{size} bytes"
     if not _is_binary_file(path):
         try:
-            return f"{path.read_text(encoding='utf-8').count(chr(10)) + 1} lines"
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                text = handle.read(_FOLDER_METADATA_BYTES + 1)
+            if len(text) <= _FOLDER_METADATA_BYTES:
+                return f"{text.count(chr(10)) + 1} lines"
         except Exception:
             pass
-    return f"{path.stat().st_size} bytes"
+    return f"{size} bytes"
