@@ -601,3 +601,41 @@ def test_hermes_owns_windows_service_requires_name_or_binary_under_a_hermes_root
     assert owns("Hermes_Gateway_derek", "", roots)
     assert owns("gw", r'"C:\Users\KAIZE\AppData\Local\hermes\hermes-agent\venv\Scripts\hermes.exe" gateway run', roots)
     assert owns("gw", r"C:\Users\kaize\AppData\Local\hermes\gateway-service\Hermes_Gateway.cmd", roots)
+
+
+def test_wizard_install_service_asks_once_and_never_starts_after_windows_install(monkeypatch):
+    """The wizard asks start-now/start-on-login once, forwards both answers, and returns
+    without a second start: the Windows installer owns start and the elevated child
+    starts itself, so a parent-side start would re-ask the install questions and re-offer
+    UAC while the child is still waiting on consent (#116550)."""
+    answers = iter([True, True])
+    monkeypatch.setattr(gateway, "prompt_yes_no", lambda *a, **k: next(answers))
+    monkeypatch.setattr(gateway, "is_wsl", lambda: False)
+    installs, starts = [], []
+    monkeypatch.setattr(gateway, "_gw_windows", lambda: SimpleNamespace(
+        install=lambda **kw: installs.append(kw) or True,
+    ))
+    monkeypatch.setattr(gateway, "_setup_service_action", lambda *a, **k: starts.append((a, k)))
+
+    gateway._wizard_install_service("windows")
+
+    assert installs == [{"force": False, "start_now": True, "start_on_login": True}]
+    assert starts == []
+
+
+def test_windows_install_reports_uac_handoff_without_installing(monkeypatch, tmp_path):
+    """A UAC hand-off installs nothing in this process: install() returns False so the
+    wizard parent stops instead of starting an unregistered service (#116550)."""
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway_windows, "_prompt_install_choices", lambda sn=None, sl=None: (True, True),
+    )
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway")
+    script = tmp_path / "Hermes_Gateway.cmd"
+    script.write_text("@echo off\r\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script)
+    monkeypatch.setattr(gateway_windows, "_startup_staging_path", lambda: tmp_path / "x.tmp")
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: False)
+    monkeypatch.setattr(gateway_windows, "_offer_elevated_install", lambda *a, **k: True)
+
+    assert gateway_windows.install(force=False, start_now=True, start_on_login=True) is False

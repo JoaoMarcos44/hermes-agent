@@ -194,9 +194,12 @@ class WindowsServiceManager(_HostServiceManager):
         start_now: bool | None = None,
         start_on_login: bool | None = None,
         elevated_handoff: bool = False,
-    ) -> None:
-        self._backend_module().install(
-            force=force, start_now=start_now, start_on_login=start_on_login, elevated_handoff=elevated_handoff
+    ) -> bool:
+        return bool(
+            self._backend_module().install(
+                force=force, start_now=start_now, start_on_login=start_on_login,
+                elevated_handoff=elevated_handoff,
+            )
         )
 
     def is_running(self, name: str) -> bool:

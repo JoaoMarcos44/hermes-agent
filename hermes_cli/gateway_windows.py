@@ -812,9 +812,15 @@ def _offer_elevated_install(headline: str, force: bool, start_now: bool, start_o
 def install(
     force: bool = False, *, start_now: bool | None = None, start_on_login: bool | None = None,
     elevated_handoff: bool = False,
-) -> None:
+) -> bool:
     """Install the gateway as a Windows Scheduled Task (with Startup fallback). Idempotent — we
-    always reconcile; ``force`` exists for API parity with launchd/systemd."""
+    always reconcile; ``force`` exists for API parity with launchd/systemd.
+
+    Single owner of the start decision: both the Scheduled Task and the Startup-folder
+    paths start the gateway themselves when ``start_now`` is true, so callers must not
+    start again afterwards. Returns True when login persistence was installed in this
+    process, False when nothing was installed here (auto-start skipped or the work was
+    handed to an elevated UAC child that installs and starts itself)."""
     _assert_windows()
     start_now, start_on_login = _prompt_install_choices(start_now, start_on_login)
 
@@ -825,7 +831,7 @@ def install(
         else:
             print("ℹ Gateway not started and no auto-start service installed.")
             print("  Run in the foreground later with: hermes gateway run")
-        return
+        return False
 
     task_name = get_task_name()
     script_path = _write_task_script()
@@ -843,9 +849,9 @@ def install(
             "↻ Scheduled Task install may need administrator approval on this Windows account.",
             force, start_now, start_on_login,
         ):
-            return
+            return False
         _install_startup_fallback(script_path, start_now, "administrator approval was not used")
-        return
+        return True
 
     ok, detail = _install_scheduled_task(task_name, script_path)
     if ok:
@@ -858,18 +864,18 @@ def install(
             print("ℹ Gateway not started now.")
             print("  Start manually with: hermes gateway start")
         _print_next_steps()
-        return
+        return True
 
     # Prefer a real Scheduled Task over the Startup fallback when elevation is the only blocker.
     if _is_access_denied(detail) and not _is_running_as_admin() and _offer_elevated_install(
         f"↻ Scheduled Task install needs administrator approval ({detail.splitlines()[0]})",
         force, start_now, start_on_login,
     ):
-        return
+        return False
 
     if _should_fall_back(1, detail):
         _install_startup_fallback(script_path, start_now, detail)
-        return
+        return True
 
     raise RuntimeError(f"Windows gateway install failed: {detail}")
 
