@@ -858,6 +858,112 @@ async def test_warmup_disabled_by_nonpositive_timeout(monkeypatch):
     assert runner._startup_restore_in_progress is False
 
 
+@pytest.mark.asyncio
+async def test_raising_restore_replay_releases_gate_and_drains_rest(monkeypatch):
+    """A raising adapter replay must not abort drain or leave the inbound latch closed."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+    monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0")
+    runner._start_startup_warmup()
+
+    handled: list[str] = []
+
+    async def fake_handle_message(event: MessageEvent) -> None:
+        if event.source.chat_id == "bad-chat":
+            raise RuntimeError("adapter exploded mid-drain")
+        handled.append(event.text)
+
+    adapter.handle_message = fake_handle_message
+    runner._queue_startup_restore_event(
+        MessageEvent(text="first", message_type=MessageType.TEXT, source=make_restart_source(chat_id="bad-chat"))
+    )
+    runner._queue_startup_restore_event(
+        MessageEvent(text="second", message_type=MessageType.TEXT, source=make_restart_source(chat_id="good-chat"))
+    )
+
+    await asyncio.wait_for(runner._finish_startup_restore(), timeout=5)
+
+    assert runner._startup_restore_in_progress is False
+    assert handled == ["second"]
+    assert runner._startup_restore_queue == []
+
+
+@pytest.mark.asyncio
+async def test_inbound_after_failed_restore_replay_dispatches(monkeypatch):
+    """Once the latch is released, a later inbound must dispatch instead of re-queueing."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+    monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0")
+    runner._start_startup_warmup()
+
+    async def exploding_handle_message(event: MessageEvent) -> None:
+        raise RuntimeError("boom")
+
+    adapter.handle_message = exploding_handle_message
+    runner._queue_startup_restore_event(
+        MessageEvent(
+            text="doomed",
+            message_type=MessageType.TEXT,
+            source=make_restart_source(chat_id="bad-chat"),
+        )
+    )
+
+    await asyncio.wait_for(runner._finish_startup_restore(), timeout=5)
+    assert runner._startup_restore_in_progress is False
+
+    late = MessageEvent(
+        text="late",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="late-chat"),
+    )
+    await runner._handle_message(late)
+    assert runner._startup_restore_queue == []
+
+
+@pytest.mark.asyncio
+async def test_warmup_raise_still_releases_startup_restore_gate(monkeypatch):
+    """Warm-up is inside the restore finish path; a raise there must still open inbound."""
+    runner, _adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+    monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0")
+    runner._start_startup_warmup()
+
+    async def exploding_warmup() -> None:
+        raise RuntimeError("warmup exploded")
+
+    runner._await_startup_warmup = exploding_warmup
+
+    with pytest.raises(RuntimeError, match="warmup exploded"):
+        await asyncio.wait_for(runner._finish_startup_restore(), timeout=5)
+
+    assert runner._startup_restore_in_progress is False
+
+
+@pytest.mark.asyncio
+async def test_finish_wiring_raise_before_restore_releases_gate():
+    """A raise in post-connect wiring before finish must not leave the latch closed while running."""
+    runner, _adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_tasks = []
+
+    async def exploding_services(_connected_count: int) -> None:
+        raise RuntimeError("post-connect services exploded")
+
+    runner._start_post_connect_services = exploding_services
+
+    with pytest.raises(RuntimeError, match="post-connect services exploded"):
+        await asyncio.wait_for(runner._start_finish_wiring(0), timeout=5)
+
+    assert runner._startup_restore_in_progress is False
+
+
 # ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------

@@ -65,6 +65,10 @@ class GatewayStartupMixin:
             if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(session_key)
 
+    def _release_startup_restore_gate(self) -> None:
+        """Open the inbound restore latch. Idempotent; the only success-path writer used to live after drain."""
+        self._startup_restore_in_progress = False
+
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
@@ -78,12 +82,13 @@ class GatewayStartupMixin:
                 source.chat_id if source else "unknown",
             )
 
-    async def _drain_startup_restore_queue(self) -> int:
-        """Replay inbound messages queued while startup auto-resume ran."""
-        drained = 0
-        queue = getattr(self, "_startup_restore_queue", None) or []
-        while queue:
-            event = queue.pop(0)
+    async def _replay_startup_restore_event(self, event: MessageEvent) -> bool:
+        """Replay one queued inbound. False on drop or adapter failure; never aborts the drain."""
+        with _log_suppressed(
+            logging.WARNING,
+            "Startup-restore queued inbound failed to replay; continuing drain",
+            exc_info=True,
+        ):
             source = getattr(event, "source", None)
             adapter = self._intake_adapter_for(source)
             if adapter is None:
@@ -91,12 +96,22 @@ class GatewayStartupMixin:
                     "Dropping startup-restore queued message: adapter unavailable for %s",
                     getattr(getattr(source, "platform", None), "value", None),
                 )
-                continue
+                return False
             # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
             with suppress(Exception):
                 setattr(event, "_hermes_startup_restore_replay", True)
             await adapter.handle_message(event)
-            drained += 1
+            return True
+        return False
+
+    async def _drain_startup_restore_queue(self) -> int:
+        """Replay inbound messages queued while startup auto-resume ran."""
+        drained = 0
+        queue = getattr(self, "_startup_restore_queue", None) or []
+        while queue:
+            event = queue.pop(0)
+            if await self._replay_startup_restore_event(event):
+                drained += 1
         return drained
 
     @staticmethod
@@ -198,28 +213,35 @@ class GatewayStartupMixin:
         """Wait (BOUNDED by ``_startup_restore_drain_timeout_secs``) for startup auto-resume, then
         release + drain inbound. On timeout the gate opens and resume turns finish in the background
         (NOT cancelled) — safe because ``_schedule_resume_pending_sessions`` claims each
-        ``_running_agents`` slot SYNCHRONOUSLY first, so drained inbound queues behind."""
-        from gateway.run import _startup_restore_drain_timeout_secs
-        tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
-        if tasks:
-            # Tasks outliving the gate get a late-failure callback (their done-callback only discards them).
-            done = await self._wait_bounded_or_release(
-                set(tasks), _startup_restore_drain_timeout_secs(),
-                "Startup-restore gate released after %.0fs with %d boot auto-resume turn(s) "
-                "still running; draining inbound queue now (resume slots already claimed, so no "
-                "duplicate agents). Slow turn(s) continue in the background.",
-                "background startup auto-resume task failed after gate release", level=logging.DEBUG,
-            )
-            report = self._late_failure_callback("startup auto-resume task failed", level=logging.DEBUG)
-            for task in done:
-                report(task)
-        self._startup_restore_tasks = []
-        # Warm the turn machinery BEFORE the queue drains: inbound turns must not build skeleton prompts.
-        await self._await_startup_warmup()
-        drained = await self._drain_startup_restore_queue()
-        self._startup_restore_in_progress = False
-        if drained:
-            logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+        ``_running_agents`` slot SYNCHRONOUSLY first, so drained inbound queues behind.
+
+        Gate release is in ``finally`` so a raise from the resume wait, warm-up, or drain cannot
+        leave ``_startup_restore_in_progress`` stuck True (inbound would queue forever).
+        """
+        drained = 0
+        try:
+            from gateway.run import _startup_restore_drain_timeout_secs
+            tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
+            if tasks:
+                # Tasks outliving the gate get a late-failure callback (their done-callback only discards them).
+                done = await self._wait_bounded_or_release(
+                    set(tasks), _startup_restore_drain_timeout_secs(),
+                    "Startup-restore gate released after %.0fs with %d boot auto-resume turn(s) "
+                    "still running; draining inbound queue now (resume slots already claimed, so no "
+                    "duplicate agents). Slow turn(s) continue in the background.",
+                    "background startup auto-resume task failed after gate release", level=logging.DEBUG,
+                )
+                report = self._late_failure_callback("startup auto-resume task failed", level=logging.DEBUG)
+                for task in done:
+                    report(task)
+            self._startup_restore_tasks = []
+            # Warm the turn machinery BEFORE the queue drains: inbound turns must not build skeleton prompts.
+            await self._await_startup_warmup()
+            drained = await self._drain_startup_restore_queue()
+            if drained:
+                logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+        finally:
+            self._release_startup_restore_gate()
 
     @staticmethod
     def _late_failure_callback(message: str, *, level: int = logging.WARNING):
@@ -1194,7 +1216,7 @@ class GatewayStartupMixin:
         _write_runtime_status_quiet(gateway_state="startup_failed", exit_reason=reason)
         self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
         self._request_clean_exit(reason)
-        self._startup_restore_in_progress = False
+        self._release_startup_restore_gate()
 
     async def _start_secondary_profiles(
         self, connected_count: int, _multiplex_skipped_platforms: list
@@ -1339,42 +1361,48 @@ class GatewayStartupMixin:
     async def _start_finish_wiring(self, connected_count: int) -> None:
         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
-        await self._start_post_connect_services(connected_count)
-        # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
-        if connected_count > 0:
-            await asyncio.sleep(1.0)
-        # Before _send_restart_notification() unlinks the marker: did we boot from a chat /restart?
-        # One-shot signal for _is_stale_restart_redelivery.
-        if _restart_notification_pending():
-            self._booted_from_restart = True
-        # Boot-path adapter.send() calls must not pin the inbound restore gate (a Telegram flood-
-        # control sleep here once froze every platform).
-        # Restart notification, home-channel startup notice, and obligation redelivery all call
-        # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
-        await self._await_startup_boot_sends(
-            planned_restart_notification_pending=_planned_restart_notification_pending(),
-        )
-        # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
-        # auto-resume stays visible on the next user message.
-        self._schedule_resume_pending_sessions()
-        await self._finish_startup_restore()
-        # Surface state.db init failures to messaging platforms before the user loses data.
-        # See #88235.
-        await self._send_session_db_warning_notifications()
-        # Resume recovered process watchers. Detach the batch atomically (fresh list, not clear(): a
-        # concurrent append during the yield must not be lost); yield every 100 to keep the loop live.
-        with _log_suppressed(logging.ERROR, "Recovered watcher setup error: %s"):
-            from tools.process_registry import process_registry
-            watchers = process_registry.pending_watchers
-            process_registry.pending_watchers = []
-            for i, watcher in enumerate(watchers):
-                self._spawn_supervised(
-                    lambda w=watcher: self._run_process_watcher(w),
-                    f"process_watcher:{watcher.get('session_id')}", restart=False,
-                )
-                logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
-                if i % 100 == 99:
-                    await asyncio.sleep(0)
+        try:
+            await self._start_post_connect_services(connected_count)
+            # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
+            if connected_count > 0:
+                await asyncio.sleep(1.0)
+            # Before _send_restart_notification() unlinks the marker: did we boot from a chat /restart?
+            # One-shot signal for _is_stale_restart_redelivery.
+            if _restart_notification_pending():
+                self._booted_from_restart = True
+            # Boot-path adapter.send() calls must not pin the inbound restore gate (a Telegram flood-
+            # control sleep here once froze every platform).
+            # Restart notification, home-channel startup notice, and obligation redelivery all call
+            # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
+            await self._await_startup_boot_sends(
+                planned_restart_notification_pending=_planned_restart_notification_pending(),
+            )
+            # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
+            # auto-resume stays visible on the next user message.
+            self._schedule_resume_pending_sessions()
+            await self._finish_startup_restore()
+            # Surface state.db init failures to messaging platforms before the user loses data.
+            # See #88235.
+            await self._send_session_db_warning_notifications()
+            # Resume recovered process watchers. Detach the batch atomically (fresh list, not clear(): a
+            # concurrent append during the yield must not be lost); yield every 100 to keep the loop live.
+            with _log_suppressed(logging.ERROR, "Recovered watcher setup error: %s"):
+                from tools.process_registry import process_registry
+                watchers = process_registry.pending_watchers
+                process_registry.pending_watchers = []
+                for i, watcher in enumerate(watchers):
+                    self._spawn_supervised(
+                        lambda w=watcher: self._run_process_watcher(w),
+                        f"process_watcher:{watcher.get('session_id')}", restart=False,
+                    )
+                    logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
+                    if i % 100 == 99:
+                        await asyncio.sleep(0)
+        finally:
+            # start() sets the latch before connect; a raise here after `_running = True` would
+            # otherwise leave every non-internal inbound queued with nobody left to drain it.
+            if getattr(self, "_startup_restore_in_progress", False):
+                self._release_startup_restore_gate()
 
     # Long-lived supervised watchers spawned at the end of start(), in order; supervised name = method
     # name minus the leading underscore.
