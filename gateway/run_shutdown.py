@@ -210,9 +210,16 @@ class GatewayShutdownMixin:
         return max(0, int(helper(*args))) if callable(helper) else 0
 
     def _active_api_run_count(self) -> int:
-        """API-server work that is outside ``_running_agents``."""
+        """API-server work that is outside ``_running_agents``.
+
+        Handler count plus the worker-owned lease: cancelling the awaiting handler
+        task releases ``active_agent_work_count`` while the executor worker behind
+        ``run_in_executor`` keeps running, so the lease term keeps this positive
+        until the thread that can still touch ``state.db`` has exited (#116535).
+        """
         try:
-            return self._api_server_hook("active_agent_work_count")
+            return (self._api_server_hook("active_agent_work_count")
+                    + self._api_server_hook("active_api_worker_count"))
         except Exception:
             return 0
 
@@ -1915,8 +1922,8 @@ class GatewayShutdownMixin:
         # default executor) never touch self._executor, so the join above cannot see them. A writer that
         # outlived the drain is mid-write for the same #101093 reasons; the drain already spent its
         # budget, so no second wait — leave the handles open (#102198). The API count is the snapshot
-        # taken before the adapters were released; a run whose handler task was cancelled at disconnect
-        # has already left it, so this term under-counts rather than over-counts.
+        # taken before the adapters were released; it folds in the worker-owned lease, so a run whose
+        # handler task was cancelled at disconnect still counts until its worker thread exits (#116535).
         _cron_live, _api_live, _deferred_live = self._active_cron_job_count(), ctx.api_live, ctx.deferred_count()
         if _cron_live or _api_live or _deferred_live:
             logger.warning(

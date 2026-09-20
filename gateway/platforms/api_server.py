@@ -1217,15 +1217,93 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self.gateway_runner: Optional[Any] = None  # set by gateway/run.py
         # Admitted requests not yet in agent bookkeeping, so shutdown drain counts them.
         self._pending_agent_requests: int = 0
+        # Executor workers actually running an agent turn. Cancelling the awaiting
+        # handler task runs the handler ``finally`` at once while the worker thread
+        # behind ``run_in_executor`` keeps writing, so only a counter owned by the
+        # worker thread itself can gate the SessionDB close (#116535).
+        self._active_api_workers: int = 0
+        self._api_worker_lock = threading.Lock()
         # Shared broker; this adapter maps HTTP registration + controller WS onto it.
         self._browser_control_broker = get_browser_control_broker()
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
 
+    def _enter_api_worker(self) -> None:
+        """Mark one executor worker as running an agent turn (thread-safe)."""
+        lock = getattr(self, "_api_worker_lock", None)
+        if lock is None:
+            lock = self._api_worker_lock = threading.Lock()
+        with lock:
+            self._active_api_workers = int(getattr(self, "_active_api_workers", 0)) + 1
+
+    def _exit_api_worker(self) -> None:
+        """Unmark one executor worker (thread-safe, never below zero)."""
+        lock = getattr(self, "_api_worker_lock", None)
+        if lock is None:
+            self._active_api_workers = 0
+            return
+        with lock:
+            self._active_api_workers = max(0, int(getattr(self, "_active_api_workers", 0)) - 1)
+
+    @contextmanager
+    def _track_api_worker(self):
+        """Lease covering the worker thread's own lifetime, not the handler task's."""
+        self._enter_api_worker()
+        try:
+            yield
+        finally:
+            self._exit_api_worker()
+
+    @contextmanager
+    def _adopt_api_worker(self, turn_lease: dict):
+        """Worker lease that takes over the handler's count, so a live turn counts once.
+
+        The handler increments ``_inflight_agent_runs`` when it submits the worker;
+        the worker atomically enters its own lease and releases the handler count
+        under one lock. Whichever side runs first wins consistently: a handler
+        cancelled before the worker starts still owns (and releases) the count,
+        while a worker that started owns it past the handler's cancellation
+        (#116535). The lock acquisition order (lease before release) means a
+        concurrent reader never observes zero for a live turn.
+        """
+        self._enter_api_worker()
+        with self._api_worker_lock:
+            if turn_lease.get("handler_holds"):
+                turn_lease["handler_holds"] = False
+                self._inflight_agent_runs = max(0, self._inflight_agent_runs - 1)
+        try:
+            yield
+        finally:
+            self._exit_api_worker()
+
+    def _release_api_turn(self, turn_lease: dict) -> None:
+        """Release the handler count unless the worker already adopted it."""
+        with self._api_worker_lock:
+            if turn_lease.get("handler_holds"):
+                turn_lease["handler_holds"] = False
+                self._inflight_agent_runs = max(0, self._inflight_agent_runs - 1)
+
+    def active_api_worker_count(self) -> int:
+        """Executor workers still running an agent turn past handler cancellation."""
+        try:
+            lock = getattr(self, "_api_worker_lock", None)
+            if lock is None:
+                return int(getattr(self, "_active_api_workers", 0) or 0)
+            with lock:
+                return int(self._active_api_workers)
+        except Exception:
+            return 0
+
     def active_agent_work_count(self) -> int:
         """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
-        (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
+        (task-based, since ``_active_run_agents`` has a queued-before-agent gap).
+
+        Handler-lifetime only: cancelling the awaiting handler task releases this count
+        while the executor worker may still run. Shutdown gates on
+        ``active_agent_work_count() + active_api_worker_count()`` instead (#116535);
+        anything else (concurrency cap, drain assertions) keeps the exact count here.
+        """
         try:
             return (int(getattr(self, "_pending_agent_requests", 0))
                     + int(self._inflight_agent_runs)
@@ -3792,7 +3870,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars
-            with self._profile_scope(request_profile):
+            # Adopt the handler count: cancelling the awaiting handler task must not
+            # release the shutdown count while this thread still runs (#116535).
+            with self._adopt_api_worker(turn_lease), self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "", profile=request_profile or "",
@@ -3888,11 +3968,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
         self._activate_admitted_request()
-        self._inflight_agent_runs += 1
+        # Ownership record shared with the worker thread: exactly one side releases
+        # the handler count, so a live turn counts once in every phase (#116535).
+        turn_lease = {"handler_holds": True}
+        with self._api_worker_lock:
+            self._inflight_agent_runs += 1
         try:
             return await loop.run_in_executor(None, _run)
         finally:
-            self._inflight_agent_runs -= 1
+            self._release_api_turn(turn_lease)
 
     # -- /v1/runs, room grants, room dispatch: thin delegators (real methods: tests assert
     # __dict__ membership and patch the module-level implementations) ---------------------
