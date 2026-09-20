@@ -1460,7 +1460,61 @@ class TestEnvWriteDenylist:
         with pytest.raises(ValueError, match="denylist"):
             save_env_value(protected_key, "1")
 
+    @pytest.mark.parametrize(
+        "protected_key",
+        [
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_KEY_17",
+            "GIT_CONFIG_VALUE_17",
+            "BASH_ENV",
+            "ENV",
+            "GIT_SSH",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "PERL5OPT",
+            "JAVA_TOOL_OPTIONS",
+            "PYTHONBREAKPOINT",
+            "CUSTOM_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+        ],
+    )
+    def test_subprocess_execution_class_is_not_writable(self, protected_key):
+        """Prefix, suffix, and named members of the exec-influence class are refused."""
+        with pytest.raises(ValueError, match="denylist"):
+            save_env_value(protected_key, "1")
+        assert protected_key not in load_env()
 
+    @pytest.mark.parametrize(
+        "allowed_key",
+        [
+            "GIT_AUTHOR_NAME",
+            "GIT_COMMITTER_NAME",
+            "GIT_TERMINAL_PROMPT",
+            "CUSTOM_ASKPASSWORD",
+        ],
+    )
+    def test_non_exec_near_misses_remain_writable(self, allowed_key):
+        save_env_value(allowed_key, "test-value-123")
+        env = load_env()
+        assert env[allowed_key] == "test-value-123"
+
+    @pytest.mark.parametrize("allowed_key", ["git_config_parameters", "ld_preload"])
+    def test_posix_lowercase_exec_spellings_remain_writable(self, allowed_key, monkeypatch):
+        """POSIX env names are case-sensitive, so lowercase spellings are distinct variables."""
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(config_mod, "_IS_WINDOWS", False)
+        save_env_value(allowed_key, "test-value-123")
+        env = load_env()
+        assert env[allowed_key] == "test-value-123"
+
+    @pytest.mark.parametrize("protected_key", ["Ld_Preload", "Git_Config_Parameters"])
+    def test_windows_policy_denies_mixed_case_exec_names(self, protected_key, monkeypatch):
+        import hermes_cli.config as config_mod
+
+        monkeypatch.setattr(config_mod, "_IS_WINDOWS", True)
+        with pytest.raises(ValueError, match="denylist"):
+            save_env_value(protected_key, "1")
 
     def test_save_env_value_secure_inherits_denylist(self):
         """The ``_secure`` variant goes through ``save_env_value`` so

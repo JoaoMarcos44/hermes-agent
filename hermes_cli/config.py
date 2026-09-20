@@ -144,21 +144,46 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # implicitly-invoked commands (BROWSER/EDITOR/VISUAL/PAGER = RCE on next $EDITOR), SHELL,
 # and Hermes runtime-location / security-policy flags (config.yaml is the supported surface).
 #
+# Exact names cannot cover unbounded families (GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n) or
+# every askpass helper. Prefix/suffix class matches close those holes; the frozenset still
+# names the rest of the class and the Hermes runtime/security controls.
+#
 # ``HERMES_*`` overall is NOT blocked — many integration credentials use that prefix
-# (HERMES_LANGFUSE_PUBLIC_KEY, HERMES_SPOTIFY_CLIENT_ID, ...). The denylist is name-by-name so
-# it cannot break provider setup wizards. Enforced on *write* only: pre-existing/out-of-band
-# ``.env`` values keep working; the dashboard's writable surface just cannot escalate.
+# (HERMES_LANGFUSE_PUBLIC_KEY, HERMES_SPOTIFY_CLIENT_ID, ...). Enforced on *write* only:
+# pre-existing/out-of-band ``.env`` values keep working; the dashboard's writable surface
+# just cannot escalate.
+_ENV_VAR_EXEC_PREFIXES: tuple[str, ...] = (
+    "LD_",
+    "DYLD_",
+    "GIT_CONFIG_",
+)
+_ENV_VAR_EXEC_SUFFIXES: tuple[str, ...] = (
+    "_ASKPASS",
+    "_ASKPASS_REQUIRE",
+)
 _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
-    # Loader / linker
+    # Loader / linker (LD_/DYLD_ prefixes also cover unnamed family members)
     "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
     "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
     "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_FALLBACK_FRAMEWORK_PATH",
     # Python / Node
     "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
-    "PYTHONEXECUTABLE", "PYTHONNOUSERSITE", "NODE_OPTIONS", "NODE_PATH",
-    # General / git
-    "PATH", "SHELL", "BROWSER", "EDITOR", "VISUAL", "PAGER",
+    "PYTHONEXECUTABLE", "PYTHONNOUSERSITE", "PYTHONBREAKPOINT", "PYTHONCASEOK",
+    "NODE_OPTIONS", "NODE_PATH",
+    # Other interpreter / toolchain injection
+    "PERL5OPT", "PERL5LIB", "PERLLIB", "PERL5DB", "RUBYOPT", "RUBYLIB",
+    "CLASSPATH", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+    "GOFLAGS", "RUSTFLAGS", "DOTNET_STARTUP_HOOKS", "PHPRC", "PHP_INI_SCAN_DIR",
+    # General / git — executed helpers, repo redirection, template hooks
+    "PATH", "SHELL", "BROWSER", "EDITOR", "VISUAL", "PAGER", "MANPAGER",
     "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_SHELL",
+    "GIT_SSH", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "GIT_PAGER",
+    "GIT_EXTERNAL_DIFF", "GIT_PROXY_COMMAND", "GIT_TEMPLATE_DIR",
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_COMMON_DIR",
+    # Shell init / interactive hooks (askpass helpers use the suffix class)
+    "BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "VIMINIT", "EXINIT",
+    "IFS", "SHELLOPTS", "BASHOPTS", "CDPATH", "PS4",
     # Hermes runtime location
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
     "HERMES_CONFIG_PATH", "HERMES_ENV_PATH",
@@ -180,11 +205,20 @@ def _env_var_policy_name(key: str, *, is_windows: Optional[bool] = None) -> str:
     return key.upper() if windows else key
 
 
+def _env_var_name_denied_for_write(policy_name: str) -> bool:
+    """True when a policy-normalized env name must not be persisted through the writer."""
+    return (
+        policy_name in _ENV_VAR_NAME_DENYLIST
+        or policy_name.startswith(_ENV_VAR_EXEC_PREFIXES)
+        or policy_name.endswith(_ENV_VAR_EXEC_SUFFIXES)
+    )
+
+
 def validate_env_var_name_for_write(key: str) -> None:
     """Validate an env name before a generic persistence write (exposed for batch callers)."""
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
-    if _env_var_policy_name(key) in _ENV_VAR_NAME_DENYLIST:
+    if _env_var_name_denied_for_write(_env_var_policy_name(key)):
         raise ValueError(
             f"Environment variable {key!r} is on the writer denylist. "
             "Names that influence subprocess execution (LD_PRELOAD, PYTHONPATH, PATH, EDITOR, ...) "
