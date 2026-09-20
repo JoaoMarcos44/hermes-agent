@@ -86,19 +86,51 @@ async def test_handler_cancellation_keeps_worker_counted_until_worker_exits():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_snapshot_sees_worker_past_handler_cancellation():
-    """The pre-teardown snapshot gates the SessionDB close on the live worker."""
+async def test_shutdown_snapshot_sees_worker_past_handler_cancellation(monkeypatch):
+    """The pre-teardown snapshot gates the SessionDB close on the live worker (#116535)."""
+    import hermes_state_registry
+
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     entered = threading.Event()
     release = threading.Event()
     agent = _make_blocked_agent(entered, release)
 
-    class _Runner:
-        _api_server_hook = GatewayShutdownMixin._api_server_hook
-        _active_api_run_count = GatewayShutdownMixin._active_api_run_count
+    events = []
+
+    class _FakeSessionDB:
+        def __init__(self, name):
+            self._name = name
+
+        def close(self):
+            events.append(f"close:{self._name}")
+
+    class _Runner(GatewayShutdownMixin):
+        def __init__(self):
+            self.adapters = {Platform.API_SERVER: adapter}
+            self._session_db = _FakeSessionDB("session_db")
+            self.session_store = None
+            self._executor = None
+            self._executor_closing = False
+            self._background_tasks = set()
+            self._stop_task = None
+            self._restart_task = None
+            self._running_agents = {}
+            self._running_agents_ts = {}
+            self._pending_messages = {}
+            self._pending_approvals = {}
+            self._shutdown_event = asyncio.Event()
+
+        def _active_cron_job_count(self):
+            return 0
+
+        def _release_running_agent_state(self, session_key, **_kw):
+            pass
+
+    monkeypatch.setattr(
+        hermes_state_registry, "close_all", lambda: events.append("close_all") or 0
+    )
 
     runner = _Runner()
-    runner.adapters = {Platform.API_SERVER: adapter}
 
     with patch.object(adapter, "_create_agent", return_value=agent):
         task = asyncio.create_task(adapter._run_agent(
@@ -111,10 +143,22 @@ async def test_shutdown_snapshot_sees_worker_past_handler_cancellation():
         with suppress(asyncio.CancelledError):
             await task
 
-        # This is the snapshot `_stop_release_runtime_state` takes before
-        # `adapters.clear()`; it must stay positive while the worker is blocked.
-        assert runner._active_api_run_count() >= 1
+        # Snapshot in _stop_release_runtime_state before adapters.clear();
+        # must stay positive while the worker is blocked (#116535).
+        ctx = GatewayShutdownMixin._StopContext(
+            deferred_count=lambda: 0, started_at=time.monotonic(),
+        )
+        runner._stop_release_runtime_state(ctx)
+        assert ctx.api_live >= 1
+
+        # SessionDB close gate must skip close:session_db and close_all
+        # because ctx.api_live sees the worker thread.
+        runner._stop_quiesce_and_close_session_dbs(0.0, ctx)
+        assert "close:session_db" not in events and "close_all" not in events, (
+            f"SessionDB closed despite a live API worker: {events}"
+        )
 
         release.set()
-        assert await _wait_for(lambda: runner._active_api_run_count() == 0), (
-            "shutdown count never drained after the worker exited")
+        assert await _wait_for(lambda: adapter.active_api_worker_count() == 0), (
+            "worker lease was never released")
+        assert runner._active_api_run_count() == 0

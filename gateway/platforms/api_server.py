@@ -1267,8 +1267,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         (#116535). The lock acquisition order (lease before release) means a
         concurrent reader never observes zero for a live turn.
         """
-        self._enter_api_worker()
-        with self._api_worker_lock:
+        lock = getattr(self, "_api_worker_lock", None)
+        if lock is None:
+            lock = self._api_worker_lock = threading.Lock()
+        with lock:
+            self._active_api_workers = int(getattr(self, "_active_api_workers", 0)) + 1
             if turn_lease.get("handler_holds"):
                 turn_lease["handler_holds"] = False
                 self._inflight_agent_runs = max(0, self._inflight_agent_runs - 1)

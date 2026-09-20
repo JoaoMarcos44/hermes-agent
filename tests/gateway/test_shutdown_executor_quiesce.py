@@ -235,13 +235,35 @@ def _arm_api(gw):
     gw._bounded_adapter_teardown = _teardown
 
 
+def _arm_api_worker(gw):
+    # An API turn whose handler task was cancelled while its executor worker is still live (#116535).
+    from gateway.config import Platform
+
+    class _ApiAdapter:
+        def active_agent_work_count(self):
+            return 0
+
+        def active_api_worker_count(self):
+            return 1
+
+    async def _teardown(adapter, platform, *, profile=None):
+        pass
+
+    gw.adapters[Platform.API_SERVER] = _ApiAdapter()
+    gw._bounded_adapter_teardown = _teardown
+
+
 def _arm_deferred(gw):
     # A hygiene worker on the loop's default executor, never finished.
     gw._deferred_agent_workers = {asyncio.get_event_loop().create_future(): object()}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("arm", [_arm_cron, _arm_api, _arm_deferred], ids=["cron", "api", "deferred"])
+@pytest.mark.parametrize(
+    "arm",
+    [_arm_cron, _arm_api, _arm_api_worker, _arm_deferred],
+    ids=["cron", "api", "api_worker", "deferred"],
+)
 async def test_live_writer_outside_the_executor_skips_the_session_db_close(monkeypatch, arm):
     """A cron job, API-server run or deferred worker that outlived the drain must not have state.db
     closed under it (#102198).
