@@ -938,12 +938,12 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
         (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
     ).fetchall()
     for row in rows:
-        outcome = row["outcome"] or ""
+        outcome = _kb._lossy_text(row["outcome"]) or ""
         if outcome == "rate_limited":
             continue
         if outcome == "crashed" and (
-            _kb._json_dict(row["metadata"]).get("protocol_violation")
-            or "protocol violation" in (row["error"] or "")
+            _kb._json_dict(_kb._lossy_text(row["metadata"])).get("protocol_violation")
+            or "protocol violation" in (_kb._lossy_text(row["error"]) or "")
         ):
             streak += 1
             continue
@@ -1524,12 +1524,13 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if latest_run is not None and latest_run["outcome"] == "spawn_failed":
-        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
+    latest_outcome = _kb._lossy_text(latest_run["outcome"]) if latest_run is not None else None
+    if latest_run is not None and latest_outcome == "spawn_failed":
+        if rl_cooldown > 0 and _kb._json_dict(_kb._lossy_text(latest_run["metadata"])).get("infrastructure"):
             ended_at = latest_run["ended_at"]
             if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
                 return "infrastructure_cooldown"
-    if latest_run is not None and latest_run["outcome"] == "rate_limited":
+    if latest_run is not None and latest_outcome == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
             # the stamped rate-limit text doesn't re-trap the task.
@@ -1543,7 +1544,9 @@ def check_respawn_guard(
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
-    err = row["last_failure_error"]
+    # A BLOB-typed cell comes back as bytes; coerce lossily so one corrupt
+    # row degrades instead of raising TypeError and aborting the whole pass.
+    err = _kb._lossy_text(row["last_failure_error"])
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
@@ -1587,7 +1590,8 @@ def check_respawn_guard(
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
-        if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
+        body = _kb._lossy_text(c["body"])
+        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
@@ -1609,10 +1613,11 @@ def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
     --reclaim``), an unassign, or the dispatcher's own
     ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
     the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
-    if kind != "assigned":
+    before it was recorded) are not trusted as handoffs — fail closed. BLOB
+    cells coerce lossily so one corrupt row cannot abort the dispatch pass."""
+    if _kb._lossy_text(kind) != "assigned":
         return True
-    data = _kb._json_or(payload, {})
+    data = _kb._json_or(_kb._lossy_text(payload), {})
     if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
         return False
     to = data.get("assignee")
