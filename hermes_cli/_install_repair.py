@@ -100,16 +100,15 @@ def _delegator_body(source: Path) -> str:
     return "@echo off\r\n" f'"{source}" %*\r\n'
 
 
-def _launcher_present(target: Path, name: str) -> bool:
-    # The canonical launcher is the text delegator. Byte-copies of uv's
-    # unsigned exe trampoline are re-minted on every reinstall and Defender
-    # heuristics flag the fresh PE (Pomal!rfn, #117796) — so a stale .exe
-    # copy without its .cmd counts as missing and is replaced on next heal.
-    return (target / f"{name}.cmd").is_file()
+def _launcher_healthy(target: Path, name: str) -> bool:
+    # A launcher is healthy when its .cmd delegator is present and no stale
+    # .exe copy remains. If a stale .exe sits next to .cmd, Windows PATHEXT
+    # prioritizes .exe over .cmd, causing Defender to quarantine the PE (#117796).
+    return (target / f"{name}.cmd").is_file() and not (target / f"{name}.exe").exists()
 
 
 def _launchers_missing(target: Path) -> bool:
-    return any(not _launcher_present(target, name) for name in _WINDOWS_BIN_LAUNCHERS)
+    return any(not _launcher_healthy(target, name) for name in _WINDOWS_BIN_LAUNCHERS)
 
 
 def _default_hermes_root() -> Path | None:
@@ -214,27 +213,32 @@ def ensure_windows_bin_launchers(
         except OSError:
             continue
         for name, source in sources:
-            if _launcher_present(target, name):
-                continue
             final = target / f"{name}.cmd"
+            exe = target / f"{name}.exe"
             body = _delegator_body(source)
-            staging = target / f"{final.name}.heal.{os.getpid()}"
+            stale_exe_removed = False
+            if exe.exists():
+                with contextlib.suppress(OSError):
+                    exe.unlink()
+                    stale_exe_removed = True
             try:
                 try:
                     existing = final.read_text(encoding="ascii") if final.is_file() else None
                 except OSError:
                     existing = None
                 if existing != body:
-                    staging.write_text(body, encoding="ascii")
-                    os.replace(staging, final)
+                    staging = target / f"{final.name}.heal.{os.getpid()}"
+                    try:
+                        staging.write_text(body, encoding="ascii")
+                        os.replace(staging, final)
+                        restored.append(str(final))
+                    except OSError:
+                        with contextlib.suppress(OSError):
+                            staging.unlink()
+                elif stale_exe_removed:
                     restored.append(str(final))
-                # The delegator is in place: drop the stale exe copy (if any) so no
-                # unsigned trampoline copy remains on PATH for AV to flag (#117796).
-                with contextlib.suppress(OSError):
-                    (target / f"{name}.exe").unlink()
             except OSError:
-                with contextlib.suppress(OSError):
-                    staging.unlink()
+                pass
     if restored:
         # A closed/broken stderr must not turn a successful heal into a crash.
         with contextlib.suppress(OSError, ValueError):

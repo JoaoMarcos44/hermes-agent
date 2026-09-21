@@ -21,7 +21,11 @@ parameters (same pattern as ``hermes_constants.venv_bin_dir``), so these
 tests are host-independent input→output checks, not host fakes.
 """
 
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -111,6 +115,100 @@ def test_healthy_canonical_layout_is_a_noop(managed_install):
         )
 
     assert ensure_windows_bin_launchers(root, windows=True, user_path_entries=[]) == []
+
+
+def test_stale_exe_removed_when_cmd_delegator_already_present(managed_install):
+    """When a .cmd delegator already exists and a stale .exe appears next to it,
+    the stale exe is removed so PATHEXT .exe precedence does not invoke it (#117796)."""
+    home, root = managed_install
+    (home / "bin").mkdir()
+    for name in _WINDOWS_BIN_LAUNCHERS:
+        (home / "bin" / f"{name}.cmd").write_text(
+            "@echo off\r\n"
+            f'"{root / "venv" / "Scripts" / f"{name}.exe"}" %*\r\n',
+            encoding="ascii",
+        )
+        (home / "bin" / f"{name}.exe").write_bytes(b"stale PE copy")
+
+    restored = ensure_windows_bin_launchers(root, windows=True, user_path_entries=[])
+
+    assert {Path(p).suffix for p in restored} == {".cmd"}
+    for name in _WINDOWS_BIN_LAUNCHERS:
+        assert (home / "bin" / f"{name}.cmd").is_file()
+        assert not (home / "bin" / f"{name}.exe").exists()
+
+
+def test_stale_cmd_delegator_body_refreshed_when_healing(managed_install):
+    """When launchers are healed, any existing .cmd delegator pointing to an
+    outdated interpreter/scripts path is rewritten with the active target (#117796)."""
+    home, root = managed_install
+    (home / "bin").mkdir()
+    # hermes.cmd exists but is stale; hermes-acp.cmd is missing, triggering a heal
+    (home / "bin" / "hermes.cmd").write_text(
+        '@echo off\r\n"C:\\stale\\venv\\Scripts\\hermes.exe" %*\r\n',
+        encoding="ascii",
+    )
+
+    restored = ensure_windows_bin_launchers(root, windows=True, user_path_entries=[])
+
+    assert str(home / "bin" / "hermes.cmd") in restored
+    assert str(home / "bin" / "hermes-acp.cmd") in restored
+    body = (home / "bin" / "hermes.cmd").read_text(encoding="ascii")
+    assert str(root / "venv" / "Scripts" / "hermes.exe") in body
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows batch execution required")
+def test_cmd_delegator_execution_argument_forwarding_and_exit_code(tmp_path, monkeypatch):
+    """Integration test: actually invoke the generated hermes.cmd delegator and
+    verify argument forwarding (including spaces and flags) and exit code propagation."""
+    home = tmp_path / "hermes"
+    root = home / "hermes-agent"
+    scripts = root / "venv" / "Scripts"
+    scripts.mkdir(parents=True)
+
+    py_home = os.path.dirname(sys.executable)
+    (root / "venv" / "pyvenv.cfg").write_text(f"home = {py_home}\n", encoding="utf-8")
+
+    # Use sys.executable as the console-script target in the venv
+    shutil.copyfile(sys.executable, scripts / "hermes.exe")
+    shutil.copyfile(sys.executable, scripts / "hermes-acp.exe")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    restored = ensure_windows_bin_launchers(root, windows=True, user_path_entries=[])
+    assert len(restored) == len(_WINDOWS_BIN_LAUNCHERS)
+
+    hermes_cmd = home / "bin" / "hermes.cmd"
+    assert hermes_cmd.is_file()
+
+    # 1. Verify argument forwarding (quotes, spaces, options) and non-zero exit code
+    test_code = (
+        "import sys; "
+        "print('RECEIVED_ARGS:' + repr(sys.argv[1:])); "
+        "sys.exit(42)"
+    )
+    proc = subprocess.run(
+        [str(hermes_cmd), "-c", test_code, "first_arg", "with spaces", "--flag=enabled"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 42, f"Expected exit code 42, got {proc.returncode}. Stderr: {proc.stderr}"
+    assert "RECEIVED_ARGS:['first_arg', 'with spaces', '--flag=enabled']" in proc.stdout
+
+    # 2. Verify exit code 0 propagation
+    proc0 = subprocess.run(
+        [str(hermes_cmd), "-c", "import sys; sys.exit(0)"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc0.returncode == 0
+
+    # 3. Verify execution through cmd.exe /c
+    proc_cmd = subprocess.run(
+        ["cmd.exe", "/c", str(hermes_cmd), "-c", "import sys; sys.exit(17)"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc_cmd.returncode == 17
 
 
 def test_legacy_bin_restaged_only_while_on_user_path(managed_install):

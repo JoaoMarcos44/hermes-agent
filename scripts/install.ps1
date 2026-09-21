@@ -3276,13 +3276,13 @@ function Install-HermesCommandLaunchers {
         if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { continue }
         Remove-Item (Join-Path $Destination "$launcher.exe") -Force -ErrorAction SilentlyContinue
         $destCmd = Join-Path $Destination "$launcher.cmd"
-        $body = "@echo off`r`n`"$src`" %*"
+        $body = "@echo off`r`n`"$src`" %*`r`n"
         $write = $true
         if (Test-Path -LiteralPath $destCmd -PathType Leaf) {
             $write = ([System.IO.File]::ReadAllText($destCmd) -ne $body)
         }
         if ($write) {
-            Set-Content -Path $destCmd -Value $body -Encoding Ascii
+            Set-Content -NoNewline -Path $destCmd -Value $body -Encoding Ascii
         }
     }
 

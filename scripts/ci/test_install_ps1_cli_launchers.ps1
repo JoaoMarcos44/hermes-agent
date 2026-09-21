@@ -105,6 +105,10 @@ try {
     Assert-True ($cmdBody.Contains((Join-Path $scriptsDir 'hermes.exe')) -and $cmdBody.Contains('%*')) `
         'delegator invokes the in-venv exe and forwards args'
 
+    $expectedBody = "@echo off`r`n`"$(Join-Path $scriptsDir 'hermes.exe')`" %*`r`n"
+    Assert-True ($cmdBody -eq $expectedBody) `
+        'delegator body matches expected delegator text with trailing CRLF'
+
     [System.IO.File]::WriteAllBytes((Join-Path $scriptsDir 'hermes.exe'), $hermesV2)
     [System.IO.File]::WriteAllBytes((Join-Path $scriptsDir 'hermes-acp.exe'), $acp)
     Install-HermesCommandLaunchers -Root $installRoot -Destination $binDir | Out-Null
@@ -116,12 +120,15 @@ try {
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $binDir 'hermes-acp.exe'))) `
         'installer stages no ACP exe copy'
 
-    # Stale exe copies from the pre-.cmd layout are removed once the
-    # delegator is in place.
+    # Stale exe copies are removed when the delegator is already in place.
     [System.IO.File]::WriteAllBytes((Join-Path $binDir 'hermes.exe'), $hermesV1)
+    Assert-True (Test-Path -LiteralPath (Join-Path $binDir 'hermes.cmd')) `
+        'delegator is already present before stale exe cleanup'
     Install-HermesCommandLaunchers -Root $installRoot -Destination $binDir | Out-Null
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $binDir 'hermes.exe'))) `
-        'stale exe copy removed'
+        'stale exe copy removed even when delegator already exists'
+    Assert-True (Test-Path -LiteralPath (Join-Path $binDir 'hermes.cmd')) `
+        'delegator preserved after stale exe cleanup'
 } finally {
     if (Test-Path -LiteralPath $caseRoot) {
         $resolvedCase = [System.IO.Path]::GetFullPath($caseRoot)
