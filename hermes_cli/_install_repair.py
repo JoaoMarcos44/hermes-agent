@@ -12,7 +12,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -96,8 +95,17 @@ def _venv_scripts_dir(root: Path) -> Path | None:
 _WINDOWS_BIN_LAUNCHERS = ("hermes", "hermes-acp")
 
 
+def _delegator_body(source: Path) -> str:
+    """Batch text delegating to the in-venv console-script exe, forwarding args."""
+    return "@echo off\r\n" f'"{source}" %*\r\n'
+
+
 def _launcher_present(target: Path, name: str) -> bool:
-    return (target / f"{name}.exe").exists() or (target / f"{name}.cmd").exists()
+    # The canonical launcher is the text delegator. Byte-copies of uv's
+    # unsigned exe trampoline are re-minted on every reinstall and Defender
+    # heuristics flag the fresh PE (Pomal!rfn, #117796) — so a stale .exe
+    # copy without its .cmd counts as missing and is replaced on next heal.
+    return (target / f"{name}.cmd").is_file()
 
 
 def _launchers_missing(target: Path) -> bool:
@@ -114,23 +122,6 @@ def _default_hermes_root() -> Path | None:
         return Path(get_default_hermes_root())
     except Exception:
         return None
-
-
-def _venv_is_relocatable(venv_dir: Path) -> bool:
-    r"""True when the venv's pyvenv.cfg declares ``relocatable = true``.
-
-    A relocatable venv's console-script trampolines embed a RELATIVE interpreter reference, so a
-    copy placed outside ``venv\Scripts`` fails (``uv trampoline failed to canonicalize script
-    path``); non-relocatable venvs survive copying. Decides which launcher form a PATH dir gets.
-    """
-    try:
-        cfg = (Path(venv_dir) / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    return any(
-        key.strip().lower() == "relocatable" and value.strip().lower() == "true"
-        for key, _, value in (line.partition("=") for line in cfg.splitlines())
-    )
 
 
 def _normalize_windows_path(value) -> str:
@@ -171,6 +162,11 @@ def ensure_windows_bin_launchers(
     git operation can ever touch it. It is a per-machine dir shared by every profile: ``get_hermes_home()``
     would point inside ``profiles\\<name>`` under ``hermes -p``, so the anchor here is
     :func:`hermes_constants.get_default_hermes_root`. See #83797.
+
+    Launchers are stable ``.cmd`` text delegators invoking the in-venv exe — never byte-copies
+    of uv's unsigned trampoline: a copy re-mints a fresh low-prevalence PE on every reinstall
+    and Defender heuristics quarantine it (Pomal!rfn, #117796). Stale ``.exe`` copies are
+    removed once their ``.cmd`` is in place.
     """
     if windows is None:
         windows = _is_windows()
@@ -210,7 +206,6 @@ def ensure_windows_bin_launchers(
                if (scripts_dir / f"{name}.exe").is_file()]
     if not sources:
         return []
-    relocatable = _venv_is_relocatable(venv_dir)
 
     restored: list[str] = []
     for target in targets:
@@ -221,15 +216,22 @@ def ensure_windows_bin_launchers(
         for name, source in sources:
             if _launcher_present(target, name):
                 continue
-            final = target / (f"{name}.cmd" if relocatable else f"{name}.exe")
+            final = target / f"{name}.cmd"
+            body = _delegator_body(source)
             staging = target / f"{final.name}.heal.{os.getpid()}"
             try:
-                if relocatable:
-                    staging.write_text("@echo off\r\n" f'"{source}" %*\r\n', encoding="ascii")
-                else:
-                    shutil.copy2(source, staging)
-                os.replace(staging, final)
-                restored.append(str(final))
+                try:
+                    existing = final.read_text(encoding="ascii") if final.is_file() else None
+                except OSError:
+                    existing = None
+                if existing != body:
+                    staging.write_text(body, encoding="ascii")
+                    os.replace(staging, final)
+                    restored.append(str(final))
+                # The delegator is in place: drop the stale exe copy (if any) so no
+                # unsigned trampoline copy remains on PATH for AV to flag (#117796).
+                with contextlib.suppress(OSError):
+                    (target / f"{name}.exe").unlink()
             except OSError:
                 with contextlib.suppress(OSError):
                     staging.unlink()
