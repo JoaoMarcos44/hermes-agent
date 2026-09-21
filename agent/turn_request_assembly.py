@@ -13,7 +13,8 @@ from dataclasses import dataclass
 import logging
 from typing import Any
 
-from agent.message_sanitization import _sanitize_messages_surrogates
+from agent.message_sanitization import _sanitize_messages_surrogates, _strip_images_from_messages
+from agent.turn_recovery import route_rejects_images
 from agent.usage_anchor import anchored_context_tokens
 from agent.prompt_caching import build_prompt_cache_plan, effective_cache_ttl
 from agent.turn_context import build_api_messages
@@ -182,6 +183,13 @@ def assemble_api_request(
         if isinstance(am.get("content"), str):
             am["content"] = am["content"].strip()
     _canonicalize_api_tool_calls(api_messages)
+
+    # A route that refused image input earlier this session goes out text-only on
+    # every attempt — the request copy only, so canonical history and state.db
+    # keep their images for routes that accept them. Runs before provider
+    # conversion so every provider format is covered.
+    if route_rejects_images(agent):
+        _strip_images_from_messages(api_messages)
 
     # Strip lone surrogates (U+D800-U+DFFF) that some Ollama-served models emit;
     # they crash json.dumps() inside the OpenAI SDK and trigger the 3-retry cycle.

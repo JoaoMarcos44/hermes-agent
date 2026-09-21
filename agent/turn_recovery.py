@@ -101,6 +101,36 @@ def _runtime_uses_ascii_encoding() -> bool:
     return encoding in {"ascii", "us-ascii", "ansi-x3.4-1968"}
 
 
+def _image_rejecting_routes(agent: Any) -> set:
+    """Routes that refused image input this session (``provider/model`` keys).
+
+    Canonical history keeps its images; every request copy built for a listed
+    route drops them before provider conversion. Keyed by route — not a bare
+    flag — so switching back to a vision-capable model sees the images again.
+    """
+    routes = getattr(agent, "_image_rejecting_routes", None)
+    if not isinstance(routes, set):
+        routes = set()
+        agent._image_rejecting_routes = routes
+    return routes
+
+
+def route_rejects_images(agent: Any) -> bool:
+    """Whether the active (provider, model) route refused images this session."""
+    provider = (getattr(agent, "provider", "") or "").strip().lower()
+    model = (getattr(agent, "model", "") or "").strip().lower()
+    return f"{provider}/{model}" in _image_rejecting_routes(agent)
+
+
+def note_route_rejects_images(agent: Any) -> str:
+    """Record the active (provider, model) route as image-rejecting; return its key."""
+    provider = (getattr(agent, "provider", "") or "").strip().lower()
+    model = (getattr(agent, "model", "") or "").strip().lower()
+    key = f"{provider}/{model}"
+    _image_rejecting_routes(agent).add(key)
+    return key
+
+
 def _vlines(agent: Any, *lines: str) -> None:
     """Force-``_vprint`` each line prefixed with ``agent.log_prefix``."""
     for line in lines:
@@ -264,7 +294,7 @@ def recover_before_classification(
     api_kwargs: Any, active_system_prompt: Any,
 ) -> Tuple[bool, Any]:
     """Recovery branches that run BEFORE ``classify_api_error``: UnicodeEncodeError
-    sanitization, provider image-content rejection (switch session to text-only), and the
+    sanitization, provider image-content rejection (request-copy-only strip), and the
     Bedrock AnthropicBedrock SDK streaming fallback. Returns ``(retry_now,
     active_system_prompt)``; the prompt may be ASCII-sanitized in place."""
     if isinstance(api_error, UnicodeEncodeError) and getattr(agent, '_unicode_sanitization_passes', 0) < 2:
@@ -274,8 +304,11 @@ def recover_before_classification(
         if _recovered:
             return True, active_system_prompt
 
-    # Some providers 4xx on image_url content: strip images, mark session
-    # vision-unsupported, retry text-only. English phrase match; extend it.
+    # Some providers 4xx on image_url content: remember the (provider, model) route
+    # and strip images from the in-flight request copy only. Canonical history and
+    # state.db keep their images, so a vision-capable route still sees them; every
+    # request built for a rejecting route drops them before provider conversion.
+    # English phrase match; extend it.
     _err_body = ""
     try:
         _err_body = str(getattr(api_error, "body", None) or getattr(api_error, "message", None) or str(api_error))
@@ -284,18 +317,17 @@ def recover_before_classification(
     _err_status = getattr(api_error, "status_code", None)
     # 4xx-only gate: 5xx/timeouts are transient and take the retry path.
     _status_ok = _err_status is None or (400 <= int(_err_status) < 500)
-    if getattr(agent, "_vision_supported", True) and _looks_like_image_content_rejection(_err_body) and _status_ok:
-        agent._vision_supported = False
-        _imgs_removed = _strip_images_from_messages(messages)
-        if _imgs_removed:
-            agent._db_flush_scan_prefix = None
+    if _looks_like_image_content_rejection(_err_body) and _status_ok:
+        _route_key = note_route_rejects_images(agent)
+        _imgs_removed = False
         if isinstance(api_messages, list):
-            _strip_images_from_messages(api_messages)
+            _imgs_removed = _strip_images_from_messages(api_messages)
         _vlines(
             agent,
-            "⚠️  Server rejected image content — switching to text-only mode for this session"
-            + (". Stripped images from history and retrying." if _imgs_removed else "."),
+            f"⚠️  Server rejected image content — sending text-only to {agent.model}"
+            + ("; stripped images from the request and retrying." if _imgs_removed else " and retrying."),
         )
+        logger.info("image-rejection recovery: route %s marked image-rejecting", _route_key)
         return True, active_system_prompt
 
     # AnthropicBedrock SDK raises "Unexpected event order" when Bedrock errors before

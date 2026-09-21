@@ -1,12 +1,21 @@
-"""Tests for the image-rejection fallback in run_agent.
+"""Tests for the image-rejection recovery in run_agent.
 
 When a server rejects image content (e.g. text-only endpoints), the agent
-strips image parts from message history and retries text-only.  These tests
-verify that stripping preserves the role-alternation invariants providers
-require, and that the phrase detector fires on the expected error bodies.
+remembers the rejecting (provider, model) route for the session and strips
+image parts from every request copy built for that route, retrying text-only.
+Canonical history and state.db keep their images, so switching back to a
+vision-capable route sees them again. These tests verify the route memory,
+the request-copy-only strip, and the phrase detector.
 """
 
+import copy
+
 from agent.message_sanitization import _looks_like_image_content_rejection, _strip_images_from_messages
+from agent.turn_recovery import (
+    note_route_rejects_images,
+    recover_before_classification,
+    route_rejects_images,
+)
 
 
 class TestStripImagesPreservesAlternation:
@@ -221,18 +230,15 @@ class TestImageRejectionPhraseIsolation:
 
 
 class TestStripImagesDropsStaleApiContent:
-    """The strip runs on the persistent history, not just the per-call copy.
+    """The request-copy strip drops the stale ``api_content`` sidecar with it.
 
     ``api_content`` is the byte-stability sidecar: it holds the exact bytes
     previously sent for a message, and the next turn substitutes it back into
     ``content``. Leaving it in place on a message this function rewrote would
-    replay the images the strip just removed — and the recovery cannot re-fire,
-    because it sets ``_vision_supported = False`` and gates itself on that. The
-    session would then send rejected images on every subsequent turn.
-
-    Same contract the other content-rewrite paths follow (stale-confirmation
-    redaction in ``replay_cleanup``, compression rewrites, merge-into-tail):
-    "the cost is one cache boundary miss, never wrong content".
+    replay the images the strip just removed. Same contract the other
+    content-rewrite paths follow (stale-confirmation redaction in
+    ``replay_cleanup``, compression rewrites, merge-into-tail): "the cost is
+    one cache boundary miss, never wrong content".
     """
 
     @staticmethod
@@ -297,3 +303,129 @@ class TestStripImagesDropsStaleApiContent:
 
         assert msgs[0]["api_content"] == "no images here<injected ctx>"
         assert "api_content" not in msgs[1]
+
+
+class _FakeAgent:
+    """Minimal double for the image-rejection recovery branch."""
+
+    def __init__(self, provider="p", model="text-model"):
+        self.provider = provider
+        self.model = model
+        self.log_prefix = ""
+        self.notices = []
+
+    def _vprint(self, *args, **kwargs):
+        self.notices.append(args[0] if args else "")
+
+
+def _rejected(status_code=400, body="This model does not support images."):
+    err = Exception(body)
+    err.status_code = status_code
+    err.body = body
+    return err
+
+
+def _history():
+    return [
+        {"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+        ]},
+    ]
+
+
+class TestImageRejectionPreservesSessionHistory:
+    """An image rejection must not delete images from history or state.db."""
+
+    def test_canonical_history_untouched_and_image_only_message_kept(self):
+        agent = _FakeAgent()
+        history = _history()
+        request = copy.deepcopy(history)
+        recovered, _ = recover_before_classification(
+            agent, _rejected(), messages=history, api_messages=request,
+            api_kwargs={}, active_system_prompt="sys",
+        )
+        assert recovered is True
+        # Canonical history keeps every image part; no message is deleted.
+        assert history == _history()
+        # The in-flight request copy goes out text-only.
+        assert request[0]["content"] == [{"type": "text", "text": "what is this?"}]
+
+    def test_rejecting_route_remembered_per_provider_and_model(self):
+        agent = _FakeAgent(provider="acme", model="text-1")
+        assert route_rejects_images(agent) is False
+        note_route_rejects_images(agent)
+        assert route_rejects_images(agent) is True
+        # Another route still gets images.
+        agent.model = "vision-1"
+        assert route_rejects_images(agent) is False
+        agent.provider = "other"
+        agent.model = "text-1"
+        assert route_rejects_images(agent) is False
+
+    def test_recovery_fires_again_per_attempt(self):
+        """The retry loop rebuilds the request copy each iteration, so the
+        recovery may run again on a repeated rejection — history still intact."""
+        agent = _FakeAgent()
+        history = _history()
+        for _ in range(2):
+            request = copy.deepcopy(history)
+            recovered, _ = recover_before_classification(
+                agent, _rejected(), messages=history, api_messages=request,
+                api_kwargs={}, active_system_prompt="sys",
+            )
+            assert recovered is True
+            assert request[0]["content"] == [{"type": "text", "text": "what is this?"}]
+        assert history == _history()
+
+    def test_assembly_strips_images_for_rejecting_route_only(self):
+        from agent.turn_request_assembly import assemble_api_request
+
+        class _AssemblyAgent(_FakeAgent):
+            provider = "acme"
+            model = "text-1"
+            api_mode = "openai_completions"
+            prefill_messages = []
+            ephemeral_system_prompt = ""
+            tools = []
+            _use_prompt_caching = False
+            context_compressor = None
+
+            def _sanitize_api_messages(self, api_messages):
+                return api_messages
+
+            def _drop_thinking_only_and_merge_users(self, api_messages, **kwargs):
+                return api_messages
+
+            def _should_sanitize_tool_calls(self):
+                return False
+
+            def _copy_reasoning_content_for_api(self, msg, api_msg):
+                pass
+
+        agent = _AssemblyAgent()
+        agent._current_turn_timestamp = 9999999999.0
+        note_route_rejects_images(agent)
+        built = assemble_api_request(
+            agent, messages=_history(), current_turn_user_idx=0,
+            _ext_prefetch_cache=None, _plugin_user_context=None, moa_config=None,
+            active_system_prompt="sys", original_user_message="hi",
+            pending_moa_prepared_request=None, request_logger=__import__("logging").getLogger("t"),
+        )
+        assert built.api_messages[1]["content"] == [{"type": "text", "text": "what is this?"}]
+        # A vision-capable route gets the images back.
+        agent.model = "vision-1"
+        built = assemble_api_request(
+            agent, messages=_history(), current_turn_user_idx=0,
+            _ext_prefetch_cache=None, _plugin_user_context=None, moa_config=None,
+            active_system_prompt="sys", original_user_message="hi",
+            pending_moa_prepared_request=None, request_logger=__import__("logging").getLogger("t"),
+        )
+        assert any(
+            isinstance(p, dict) and p.get("type") == "image_url"
+            for m in built.api_messages if isinstance(m.get("content"), list)
+            for p in m["content"]
+        )
