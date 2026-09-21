@@ -31,7 +31,7 @@ import {
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { shouldUseActiveBackend, shouldUseSystemPythonBackend } from './backend-resolution'
+import { shouldIgnoreDiscoveredLocalRuntimes, shouldUseActiveBackend, shouldUseSystemPythonBackend } from './backend-resolution'
 import {
   destroyKeepaliveAgents,
   downloadAgentFor,
@@ -5243,7 +5243,7 @@ async function resolveHermesBackend(backendArgs) {
     shouldUseActiveBackend({
       activeRuntimeUsable: activeRuntime.shouldUseActiveRuntime,
       bootstrapRepairRequested,
-      ignoreExisting: process.env.HERMES_DESKTOP_IGNORE_EXISTING === '1'
+      env: process.env
     })
   ) {
     if (!activeRuntime.hasValidMarker) {
@@ -5265,6 +5265,12 @@ async function resolveHermesBackend(backendArgs) {
   //    don't want to take ownership of an install we didn't perform.
   //    HERMES_DESKTOP_IGNORE_EXISTING=1 skips local discovery and forces the
   //    bootstrap path for testing or desktop-only thin-client launches.
+  if (shouldIgnoreDiscoveredLocalRuntimes(process.env)) {
+    rememberLog(
+      '[bootstrap] HERMES_DESKTOP_IGNORE_EXISTING=1: skipping the active runtime, `hermes` on PATH and the system-python module; no discovered local backend will be started.'
+    )
+  }
+
   let hermesCommand = null
   const hermesOverride = process.env.HERMES_DESKTOP_HERMES
 
@@ -5278,7 +5284,7 @@ async function resolveHermesBackend(backendArgs) {
     } else {
       rememberLog(`Ignoring Windows Hermes override under WSL: ${hermesOverride}`)
     }
-  } else if (process.env.HERMES_DESKTOP_IGNORE_EXISTING !== '1') {
+  } else if (!shouldIgnoreDiscoveredLocalRuntimes(process.env)) {
     hermesCommand = findOnPath('hermes')
   }
 
@@ -5336,10 +5342,25 @@ async function resolveHermesBackend(backendArgs) {
 
   // 5. Last-ditch: pip-installed hermes_cli module via system Python.
   //    Same rationale as #4 -- the user installed this; we use it but don't
-  //    take ownership.
-  const python = shouldUseSystemPythonBackend(process.env.HERMES_DESKTOP_IGNORE_EXISTING === '1')
-    ? await findSystemPython()
-    : null
+  //    take ownership. Skipped under HERMES_DESKTOP_IGNORE_EXISTING=1 like
+  //    every other discovered runtime.
+  if (!shouldUseSystemPythonBackend(process.env)) {
+    return {
+      kind: 'bootstrap-needed',
+      label: 'Local runtimes ignored (HERMES_DESKTOP_IGNORE_EXISTING=1); connect to a gateway or bootstrap a fresh install',
+      command: null,
+      args: backendArgs,
+      bootstrap: true,
+      env: {},
+      shell: false,
+      activeRoot: ACTIVE_HERMES_ROOT,
+      installStamp: INSTALL_STAMP,
+      isPackaged: IS_PACKAGED,
+      platform: process.platform
+    }
+  }
+
+  const python = await findSystemPython()
 
   if (python) {
     // Same smoke-test rationale as step 4: a system Python in the
