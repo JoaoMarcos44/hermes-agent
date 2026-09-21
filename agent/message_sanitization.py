@@ -7,6 +7,7 @@ characters that would crash ``json.dumps`` in the OpenAI SDK or be rejected upst
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -131,7 +132,9 @@ def sanitize_outbound_kwargs(agent: Any, api_kwargs: dict) -> None:
     ASCII-codec rejection.
     """
     _sanitize_structure_surrogates(api_kwargs)
-    if agent._force_ascii_payload:
+    if getattr(agent, "_force_ascii_payload", False):
+        if "tools" in api_kwargs and api_kwargs["tools"]:
+            api_kwargs["tools"] = copy.deepcopy(api_kwargs["tools"])
         _sanitize_structure_non_ascii(api_kwargs)
 
 

@@ -398,7 +398,7 @@ class TestSanitizeMessagesPersistMarker:
 
 class TestUnicodeRecoveryClientState:
     @staticmethod
-    def _agent(client, *, key="ascii-key", tools=None, lock_events=None):
+    def _agent(client, *, key="ascii-key", anthropic_key=None, anthropic_client=None, tools=None, lock_events=None):
         events = lock_events if lock_events is not None else []
 
         @contextmanager
@@ -413,6 +413,8 @@ class TestUnicodeRecoveryClientState:
             "_unicode_sanitization_passes": 0,
             "_force_ascii_payload": False,
             "api_key": key,
+            "_anthropic_api_key": anthropic_key,
+            "_anthropic_client": anthropic_client,
             "_client_kwargs": {"api_key": key, "default_headers": {"X-Relay": "bad ☕"}},
             "client": client,
             "tools": tools if tools is not None else [],
@@ -501,3 +503,42 @@ class TestUnicodeRecoveryClientState:
         assert prompt == "system ☕"
         assert messages[0]["content"] == "olá ☕"
         assert agent._unicode_sanitization_passes == 1
+
+    def test_anthropic_retry_sanitizes_credentials_and_invalidates_cached_client(self, monkeypatch):
+        monkeypatch.setattr("agent.turn_recovery._runtime_uses_ascii_encoding", lambda: False)
+        closed_cached = []
+        rebuilt = []
+        anthropic_client = type("MockAnthropicClient", (), {
+            "close": lambda self: closed_cached.append("closed_client"),
+        })()
+        agent = self._agent(None, key="sk-ant-☕123", anthropic_key="sk-ant-☕123", anthropic_client=anthropic_client)
+        agent._close_cached_request_anthropic_client = lambda reason: closed_cached.append(reason)
+        agent._rebuild_anthropic_client = lambda: rebuilt.append(True)
+
+        recovered, _ = _recover_unicode_encode_error(
+            agent, UnicodeEncodeError("ascii", "☕", 0, 1, "ordinal"),
+            [{"role": "user", "content": "clean"}], [], {}, "system",
+        )
+
+        assert recovered is True
+        assert agent._anthropic_api_key == "sk-ant-123"
+        assert agent.api_key == "sk-ant-123"
+        assert "unicode_recovery" in closed_cached
+        assert "closed_client" in closed_cached
+        assert rebuilt == [True]
+
+    def test_rebuilt_request_with_force_ascii_copies_tools_before_sanitizing(self):
+        from agent.message_sanitization import sanitize_outbound_kwargs
+
+        tools = [{"type": "function", "function": {"name": "read", "description": "desc ☕"}}]
+        agent = type("Agent", (), {
+            "_force_ascii_payload": True,
+            "tools": tools,
+        })()
+        api_kwargs = {"tools": agent.tools}
+
+        sanitize_outbound_kwargs(agent, api_kwargs)
+
+        assert api_kwargs["tools"] is not agent.tools
+        assert "☕" not in api_kwargs["tools"][0]["function"]["description"]
+        assert agent.tools[0]["function"]["description"] == "desc ☕"

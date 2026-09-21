@@ -15,7 +15,7 @@ import locale
 import math
 import re
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,6 +55,44 @@ def _sanitize_client_headers(client: Any) -> bool:
         if isinstance(headers, dict):
             changed |= _sanitize_structure_non_ascii(headers)
     return changed
+
+
+def _sanitize_agent_credentials(agent: Any) -> bool:
+    """Sanitize non-ASCII from credentials and invalidate matching cached clients."""
+    sanitized = False
+    raw_key = getattr(agent, "api_key", None)
+    if isinstance(raw_key, str) and raw_key:
+        clean_key = _strip_non_ascii(raw_key)
+        if clean_key != raw_key:
+            agent.api_key = clean_key
+            client_kwargs = getattr(agent, "_client_kwargs", None)
+            if isinstance(client_kwargs, dict):
+                client_kwargs["api_key"] = clean_key
+            if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
+                agent.client.api_key = clean_key
+            sanitized = True
+
+    ant_key = getattr(agent, "_anthropic_api_key", None)
+    if isinstance(ant_key, str) and ant_key:
+        clean_ant = _strip_non_ascii(ant_key)
+        if clean_ant != ant_key:
+            agent._anthropic_api_key = clean_ant
+            sanitized = True
+    elif sanitized and hasattr(agent, "_anthropic_api_key"):
+        agent._anthropic_api_key = getattr(agent, "api_key", None)
+
+    if sanitized:
+        if callable(getattr(agent, "_close_cached_request_anthropic_client", None)):
+            with suppress(Exception):
+                agent._close_cached_request_anthropic_client(reason="unicode_recovery")
+        if getattr(agent, "_anthropic_client", None) is not None:
+            with suppress(Exception):
+                agent._anthropic_client.close()
+            if callable(getattr(agent, "_rebuild_anthropic_client", None)):
+                with suppress(Exception):
+                    agent._rebuild_anthropic_client()
+
+    return sanitized
 
 
 def _runtime_uses_ascii_encoding() -> bool:
@@ -173,17 +211,7 @@ def _recover_unicode_encode_error(
         with _client_mutation_lock(agent):
             _headers_sanitized = isinstance(_default_headers, dict) and _sanitize_structure_non_ascii(_default_headers)
             _headers_sanitized |= _sanitize_client_headers(getattr(agent, "client", None))
-            _credential_sanitized = False
-            _raw_key = getattr(agent, "api_key", None) or ""
-            if isinstance(_raw_key, str) and _raw_key:
-                _clean_key = _strip_non_ascii(_raw_key)
-                if _clean_key != _raw_key:
-                    agent.api_key = _clean_key
-                    if isinstance(_client_kwargs, dict):
-                        _client_kwargs["api_key"] = _clean_key
-                    if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
-                        agent.client.api_key = _clean_key
-                    _credential_sanitized = True
+            _credential_sanitized = _sanitize_agent_credentials(agent)
         agent._unicode_sanitization_passes += 1
         _vlines(
             agent,
@@ -216,25 +244,7 @@ def _recover_unicode_encode_error(
     with _client_mutation_lock(agent):
         _headers_sanitized = isinstance(_default_headers, dict) and _sanitize_structure_non_ascii(_default_headers)
         _headers_sanitized |= _sanitize_client_headers(getattr(agent, "client", None))
-
-    # Non-ASCII in the API key makes httpx fail encoding the Authorization header — the
-    # usual persistent cause after message/tool sanitization. Entra ID bearer providers
-    # are callables minting ASCII JWTs; skip them (``_strip_non_ascii`` would crash).
-    # Sanitize the API key — non-ASCII characters in credentials (e.g. ʋ instead of v from a bad copy-paste)
-    # cause httpx to fail when encoding the Authorization header as ASCII. This is the most common cause of
-    # persistent UnicodeEncodeError that survives message/tool sanitization (#6843).
-    _credential_sanitized = False
-    _raw_key = getattr(agent, "api_key", None) or ""
-    if _raw_key and isinstance(_raw_key, str):
-        _clean_key = _strip_non_ascii(_raw_key)
-        if _clean_key != _raw_key:
-            with _client_mutation_lock(agent):
-                agent.api_key = _clean_key
-                if isinstance(getattr(agent, "_client_kwargs", None), dict):
-                    agent._client_kwargs["api_key"] = _clean_key
-                if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
-                    agent.client.api_key = _clean_key
-            _credential_sanitized = True
+        _credential_sanitized = _sanitize_agent_credentials(agent)
 
     # Always retry on ASCII codec detection: _force_ascii_payload sanitizes the full
     # api_kwargs next iteration even when the checks above find nothing.
