@@ -15,6 +15,7 @@ import locale
 import math
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,6 +39,22 @@ from hermes_constants import display_hermes_home
 from utils import base_url_host_matches
 
 logger = logging.getLogger("agent.conversation_loop")
+
+
+def _client_mutation_lock(agent: Any):
+    """Use the shared client lock, while tolerating minimal test doubles."""
+    lock_factory = getattr(agent, "_openai_client_lock", None)
+    return lock_factory() if callable(lock_factory) else nullcontext()
+
+
+def _sanitize_client_headers(client: Any) -> bool:
+    """Sanitize configured live-client header values without exposing their contents."""
+    changed = False
+    for attr in ("default_headers", "_custom_headers"):
+        headers = getattr(client, attr, None)
+        if isinstance(headers, dict):
+            changed |= _sanitize_structure_non_ascii(headers)
+    return changed
 
 
 def _runtime_uses_ascii_encoding() -> bool:
@@ -153,18 +170,20 @@ def _recover_unicode_encode_error(
         agent._force_ascii_payload = False
         _client_kwargs = getattr(agent, "_client_kwargs", None)
         _default_headers = _client_kwargs.get("default_headers") if isinstance(_client_kwargs, dict) else None
-        _headers_sanitized = isinstance(_default_headers, dict) and _sanitize_structure_non_ascii(_default_headers)
-        _credential_sanitized = False
-        _raw_key = getattr(agent, "api_key", None) or ""
-        if isinstance(_raw_key, str) and _raw_key:
-            _clean_key = _strip_non_ascii(_raw_key)
-            if _clean_key != _raw_key:
-                agent.api_key = _clean_key
-                if isinstance(_client_kwargs, dict):
-                    _client_kwargs["api_key"] = _clean_key
-                if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
-                    agent.client.api_key = _clean_key
-                _credential_sanitized = True
+        with _client_mutation_lock(agent):
+            _headers_sanitized = isinstance(_default_headers, dict) and _sanitize_structure_non_ascii(_default_headers)
+            _headers_sanitized |= _sanitize_client_headers(getattr(agent, "client", None))
+            _credential_sanitized = False
+            _raw_key = getattr(agent, "api_key", None) or ""
+            if isinstance(_raw_key, str) and _raw_key:
+                _clean_key = _strip_non_ascii(_raw_key)
+                if _clean_key != _raw_key:
+                    agent.api_key = _clean_key
+                    if isinstance(_client_kwargs, dict):
+                        _client_kwargs["api_key"] = _clean_key
+                    if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
+                        agent.client.api_key = _clean_key
+                    _credential_sanitized = True
         agent._unicode_sanitization_passes += 1
         _vlines(
             agent,
@@ -194,7 +213,9 @@ def _recover_unicode_encode_error(
 
     _client_kwargs = getattr(agent, "_client_kwargs", None)
     _default_headers = _client_kwargs.get("default_headers") if isinstance(_client_kwargs, dict) else None
-    _headers_sanitized = isinstance(_default_headers, dict) and _sanitize_structure_non_ascii(_default_headers)
+    with _client_mutation_lock(agent):
+        _headers_sanitized = isinstance(_default_headers, dict) and _sanitize_structure_non_ascii(_default_headers)
+        _headers_sanitized |= _sanitize_client_headers(getattr(agent, "client", None))
 
     # Non-ASCII in the API key makes httpx fail encoding the Authorization header — the
     # usual persistent cause after message/tool sanitization. Entra ID bearer providers
@@ -207,18 +228,13 @@ def _recover_unicode_encode_error(
     if _raw_key and isinstance(_raw_key, str):
         _clean_key = _strip_non_ascii(_raw_key)
         if _clean_key != _raw_key:
-            agent.api_key = _clean_key
-            if isinstance(getattr(agent, "_client_kwargs", None), dict):
-                agent._client_kwargs["api_key"] = _clean_key
-            # The live client reads its own api_key copy on every request.
-            if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
-                agent.client.api_key = _clean_key
+            with _client_mutation_lock(agent):
+                agent.api_key = _clean_key
+                if isinstance(getattr(agent, "_client_kwargs", None), dict):
+                    agent._client_kwargs["api_key"] = _clean_key
+                if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
+                    agent.client.api_key = _clean_key
             _credential_sanitized = True
-            _vlines(
-                agent,
-                "⚠️  API key contained non-ASCII characters (bad copy-paste?) — stripped them. "
-                "If auth fails, re-copy the key from your provider's dashboard.",
-            )
 
     # Always retry on ASCII codec detection: _force_ascii_payload sanitizes the full
     # api_kwargs next iteration even when the checks above find nothing.
