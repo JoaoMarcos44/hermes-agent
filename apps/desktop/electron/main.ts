@@ -31,7 +31,12 @@ import {
 } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { shouldIgnoreDiscoveredLocalRuntimes, shouldUseActiveBackend, shouldUseSystemPythonBackend } from './backend-resolution'
+import {
+  canActiveBackendResolve,
+  shouldIgnoreDiscoveredLocalRuntimes,
+  shouldUseActiveBackend,
+  shouldUseSystemPythonBackend
+} from './backend-resolution'
 import {
   destroyKeepaliveAgents,
   downloadAgentFor,
@@ -5237,26 +5242,26 @@ async function resolveHermesBackend(backendArgs) {
   //    builds could leave a healthy install behind without the marker. If the
   //    active runtime is usable, launch it directly; only fall through to
   //    bootstrap when the runtime itself is unusable.
-  const activeRuntime = await activeRuntimeState()
-
-  if (
-    shouldUseActiveBackend({
-      activeRuntimeUsable: activeRuntime.shouldUseActiveRuntime,
-      bootstrapRepairRequested,
-      env: process.env
-    })
-  ) {
-    if (!activeRuntime.hasValidMarker) {
-      rememberLog(
-        `[bootstrap] Active Hermes runtime at ${ACTIVE_HERMES_ROOT} is usable but the bootstrap marker is missing or stale; skipping first-run bootstrap.`
-      )
-    }
-
-    return createActiveBackend(backendArgs)
-  }
-
   if (bootstrapRepairRequested) {
     rememberLog('[bootstrap] repair requested; bypassing the usable active runtime to re-run the installer')
+  } else if (canActiveBackendResolve({ bootstrapRepairRequested, env: process.env })) {
+    const activeRuntime = await activeRuntimeState()
+
+    if (
+      shouldUseActiveBackend({
+        activeRuntimeUsable: activeRuntime.shouldUseActiveRuntime,
+        bootstrapRepairRequested,
+        env: process.env
+      })
+    ) {
+      if (!activeRuntime.hasValidMarker) {
+        rememberLog(
+          `[bootstrap] Active Hermes runtime at ${ACTIVE_HERMES_ROOT} is usable but the bootstrap marker is missing or stale; skipping first-run bootstrap.`
+        )
+      }
+
+      return createActiveBackend(backendArgs)
+    }
   }
 
   // 4. Existing `hermes` on PATH -- installed via install.ps1 / install.sh from

@@ -15,22 +15,35 @@ export function shouldIgnoreDiscoveredLocalRuntimes(env: NodeJS.ProcessEnv = pro
 }
 
 export interface ActiveBackendResolutionOptions {
-  activeRuntimeUsable: boolean
+  activeRuntimeUsable?: boolean
   bootstrapRepairRequested: boolean
   ignoreExisting?: boolean
   env?: NodeJS.ProcessEnv
 }
 
+/** Whether the managed runtime should even be probed/evaluated. */
+export function canActiveBackendResolve({
+  bootstrapRepairRequested,
+  ignoreExisting,
+  env
+}: Omit<ActiveBackendResolutionOptions, 'activeRuntimeUsable'>): boolean {
+  const isIgnored = ignoreExisting ?? shouldIgnoreDiscoveredLocalRuntimes(env)
+
+  return !bootstrapRepairRequested && !isIgnored
+}
+
 /** Whether the usable managed runtime may win backend resolution. */
 export function shouldUseActiveBackend({
-  activeRuntimeUsable,
+  activeRuntimeUsable = false,
   bootstrapRepairRequested,
   ignoreExisting,
   env
 }: ActiveBackendResolutionOptions): boolean {
-  const isIgnored = ignoreExisting ?? shouldIgnoreDiscoveredLocalRuntimes(env)
+  if (!canActiveBackendResolve({ bootstrapRepairRequested, ignoreExisting, env })) {
+    return false
+  }
 
-  return activeRuntimeUsable && !bootstrapRepairRequested && !isIgnored
+  return Boolean(activeRuntimeUsable)
 }
 
 export type SystemPythonResolutionInput =

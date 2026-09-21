@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
+  canActiveBackendResolve,
   shouldIgnoreDiscoveredLocalRuntimes,
   shouldUseActiveBackend,
   shouldUseSystemPythonBackend
@@ -14,6 +15,20 @@ test('shouldIgnoreDiscoveredLocalRuntimes recognizes exactly "1"', () => {
   assert.equal(shouldIgnoreDiscoveredLocalRuntimes({ HERMES_DESKTOP_IGNORE_EXISTING: '0' }), false)
   assert.equal(shouldIgnoreDiscoveredLocalRuntimes({ HERMES_DESKTOP_IGNORE_EXISTING: '' }), false)
   assert.equal(shouldIgnoreDiscoveredLocalRuntimes({}), false)
+})
+
+test('canActiveBackendResolve short-circuits probing when ignored or repair requested', () => {
+  assert.equal(canActiveBackendResolve({ bootstrapRepairRequested: false, ignoreExisting: true }), false)
+  assert.equal(canActiveBackendResolve({ bootstrapRepairRequested: true, ignoreExisting: false }), false)
+  assert.equal(
+    canActiveBackendResolve({ bootstrapRepairRequested: false, env: { HERMES_DESKTOP_IGNORE_EXISTING: '1' } }),
+    false
+  )
+  assert.equal(
+    canActiveBackendResolve({ bootstrapRepairRequested: false, env: { HERMES_DESKTOP_IGNORE_EXISTING: '0' } }),
+    true
+  )
+  assert.equal(canActiveBackendResolve({ bootstrapRepairRequested: false, env: {} }), true)
 })
 
 test('ignore-existing skips a usable active runtime', () => {
