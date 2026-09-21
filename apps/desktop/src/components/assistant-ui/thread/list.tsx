@@ -37,7 +37,8 @@ import {
   type ThreadScrollState,
   threadScrollStateFromMetrics,
   threadScrollStorageKey,
-  threadScrollTargetTop
+  threadScrollTargetTop,
+  threadScrollTranscriptHeight
 } from '@/store/thread-scroll'
 import { isSecondaryWindow } from '@/store/windows'
 
@@ -836,7 +837,42 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       return
     }
 
+    const metrics = (): ThreadScrollRestoreResizeMetrics => {
+      const clearance = content.querySelector('[data-slot="aui_composer-clearance"]')
+
+      return {
+        clearanceHeight: clearance instanceof HTMLElement ? clearance.clientHeight : 0,
+        clientHeight: el.clientHeight,
+        scrollHeight: el.scrollHeight
+      }
+    }
+
+    let previousMetrics = metrics()
+
     const update = () => {
+      const nextMetrics = metrics()
+
+      const previousState = threadScrollStateFromMetrics({
+        clientHeight: previousMetrics.clientHeight,
+        scrollHeight: previousMetrics.scrollHeight,
+        scrollTop: el.scrollTop
+      })
+
+      // use-stick-to-bottom owns normal following. This synchronous leg only
+      // closes the stale pre-paint frame when a running transcript grows while
+      // the prior reading position was still sticky; composer clearance and
+      // explicit scroll-up remain untouched.
+      if (
+        isRunning &&
+        loadSettledRef.current &&
+        previousState.kind === 'bottom' &&
+        threadScrollTranscriptHeight(nextMetrics) > threadScrollTranscriptHeight(previousMetrics) &&
+        !hasTranscriptTextSelection(content)
+      ) {
+        el.scrollTop = threadScrollTargetTop(THREAD_SCROLL_BOTTOM, nextMetrics)
+      }
+
+      previousMetrics = metrics()
       liveScrollStateRef.current = threadScrollStateFromMetrics(el)
     }
 
@@ -848,7 +884,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       el.removeEventListener('scroll', update)
       observer.disconnect()
     }
-  }, [contentRef, paneVisible, scrollRef])
+  }, [contentRef, isRunning, paneVisible, scrollRef, sessionKey])
 
   // Persist the live position on app close, so a reading position survives a
   // quit without a session switch (the switch cleanup below only runs on

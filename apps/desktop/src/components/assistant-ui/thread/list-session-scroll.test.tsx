@@ -168,14 +168,25 @@ describe('list session-scroll restore', () => {
       await settleScroll(3)
       expect(vp.scrollTop).toBeGreaterThanOrEqual(scrollHeightValue - CLIENT_H - 1)
 
+      // Each streamed layout growth must be followed synchronously, before
+      // use-stick-to-bottom's queued rAF has a chance to run.
+      for (const growth of [120, 240]) {
+        act(() => {
+          scrollHeightValue += growth
+          deliverContentResize(scrollHeightValue)
+          expect(vp.scrollTop).toBe(scrollHeightValue - CLIENT_H)
+        })
+      }
+
       const readingTop = scrollHeightValue - CLIENT_H - 900
 
       act(() => {
         vp.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -160 }))
         vp.scrollTop = readingTop
-        vp.dispatchEvent(new Event('scroll'))
         scrollHeightValue += 120
         deliverContentResize(scrollHeightValue)
+        expect(vp.scrollTop).toBe(readingTop)
+        vp.dispatchEvent(new Event('scroll'))
       })
 
       await settleScroll(10)
