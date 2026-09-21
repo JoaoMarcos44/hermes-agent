@@ -1443,6 +1443,18 @@ class GatewayTurnMixin:
                 if prof and prof != "default" and _lgc().get_home_channel(source.platform):
                     home_env = "set"
         if not home_env:
+            # Home-channel setup is operator infrastructure, not user onboarding. Require the
+            # existing explicit, scope-aware admin signal; do not infer ownership from platform,
+            # chat type, or the sender's ability to message the gateway.
+            from gateway.slash_access import policy_for_source
+            admin_policy = policy_for_source(self.config, source)
+            if not (admin_policy.enabled and admin_policy.is_admin(source.user_id)):
+                logger.info(
+                    "No home channel is configured for %s; suppressing the setup notice for a "
+                    "first-time contact that is not an explicitly configured admin",
+                    platform_name,
+                )
+                return
             # Slack routes every command through the parent `/hermes`; bare `/sethome` would fail.
             sethome_cmd = "/hermes sethome" if source.platform == Platform.SLACK else "/sethome"
             await self._deliver_platform_notice(
