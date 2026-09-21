@@ -118,6 +118,69 @@ function ScrollHarness({
 }
 
 describe('list session-scroll restore', () => {
+  it('keeps a bottom-pinned reader at the live tail while content grows', async () => {
+    const previousObserver = globalThis.ResizeObserver
+    const observers = new Set<{ callback: ResizeObserverCallback; targets: Set<Element> }>()
+
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        targets = new Set<Element>()
+        constructor(public callback: ResizeObserverCallback) {
+          observers.add(this)
+        }
+        observe(target: Element) {
+          this.targets.add(target)
+        }
+        unobserve(target: Element) {
+          this.targets.delete(target)
+        }
+        disconnect() {
+          this.targets.clear()
+        }
+      }
+    )
+
+    const { container, unmount } = render(<ScrollHarness messages={sessionMessages('stream')} sessionKey="stream" />)
+
+    try {
+      const vp = viewportEl(container)
+      await settleScroll(10)
+      expect(vp.scrollTop).toBeGreaterThanOrEqual(scrollHeightValue - CLIENT_H - 1)
+
+      vp.scrollTop = SCROLL_H - CLIENT_H
+
+      scrollHeightValue += 168
+      act(() => {
+        let observerIndex = 0
+
+        for (const observer of observers) {
+          const targets = [...observer.targets].filter(el => el.getAttribute('data-slot') === 'aui_thread-content')
+
+          if (targets.length) {
+            // The library observes contentRect, while the component observes
+            // the viewport's authoritative scrollHeight. Model a growth that
+            // does not produce a library resize entry but does change the
+            // scrollable height seen by the local observer.
+            if (observerIndex > 0) {
+              observer.callback(
+                targets.map(target => ({ target, contentRect: { height: scrollHeightValue } })) as ResizeObserverEntry[],
+                observer as unknown as ResizeObserver
+              )
+            }
+
+            observerIndex += 1
+          }
+        }
+      })
+      await settleScroll(3)
+
+      expect(vp.scrollTop).toBeGreaterThanOrEqual(scrollHeightValue - CLIENT_H - 1)
+    } finally {
+      unmount()
+      vi.stubGlobal('ResizeObserver', previousObserver)
+    }
+  })
   it('lets a reader escape bottom-follow when a running transcript grows during the scroll gesture', async () => {
     // #116273: a pending clarify keeps the turn running while the transcript
     // can still resize. If that resize lands in the same frame as scroll-up,

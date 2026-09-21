@@ -13,6 +13,7 @@ import {
   RUN_START_SNAP_THRESHOLD_PX,
   shouldAnchorBeforePrepend,
   shouldClampTranscriptBudget,
+  shouldFollowThreadContentGrowth,
   shouldRePinOnTranscriptReload,
   shouldSnapOnRunStart,
   subscribeToThreadForeground,
@@ -22,6 +23,17 @@ import {
 
 afterEach(() => {
   vi.restoreAllMocks()
+})
+
+describe('shouldFollowThreadContentGrowth', () => {
+  it('follows growth when the cached state was bottom-pinned', () => {
+    expect(shouldFollowThreadContentGrowth({ kind: 'bottom' }, 1000, 1100)).toBe(true)
+  })
+
+  it('preserves an intentional reader offset during growth', () => {
+    expect(shouldFollowThreadContentGrowth({ kind: 'offset', fromBottom: 240 }, 1000, 1100)).toBe(false)
+    expect(shouldFollowThreadContentGrowth({ kind: 'bottom' }, 1000, 1000)).toBe(false)
+  })
 })
 
 describe('subscribeToThreadForeground', () => {

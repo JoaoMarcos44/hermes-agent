@@ -207,6 +207,20 @@ export function shouldSnapOnRunStart(remainingPx: number, thresholdPx = RUN_STAR
   return remainingPx < thresholdPx
 }
 
+/**
+ * Content growth must follow the live tail immediately, but only when the
+ * viewport was already pinned before the growth. A cached bottom state is
+ * intentionally used so the resize callback cannot mistake a transient gap
+ * for explicit reader intent.
+ */
+export function shouldFollowThreadContentGrowth(
+  previous: ThreadScrollState,
+  previousScrollHeight: number,
+  nextScrollHeight: number
+): boolean {
+  return previous.kind === 'bottom' && nextScrollHeight > previousScrollHeight
+}
+
 // True when the pin-to-bottom settle should re-arm. A same-session refresh
 // (transcript briefly emptied and repopulated under the same key) must keep
 // the reader's position; only a session switch or a cold-load arrival re-pins.
@@ -836,8 +850,19 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       return
     }
 
+    let previousScrollHeight = el.scrollHeight
+
     const update = () => {
-      liveScrollStateRef.current = threadScrollStateFromMetrics(el)
+      const previous = liveScrollStateRef.current
+      const nextScrollHeight = el.scrollHeight
+      const next = threadScrollStateFromMetrics(el)
+
+      if (shouldFollowThreadContentGrowth(previous, previousScrollHeight, nextScrollHeight)) {
+        void scrollToBottomUnlessSelecting('instant')
+      }
+
+      previousScrollHeight = nextScrollHeight
+      liveScrollStateRef.current = next
     }
 
     el.addEventListener('scroll', update, { passive: true })
@@ -848,7 +873,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       el.removeEventListener('scroll', update)
       observer.disconnect()
     }
-  }, [contentRef, paneVisible, scrollRef])
+  }, [contentRef, paneVisible, scrollRef, scrollToBottomUnlessSelecting])
 
   // Persist the live position on app close, so a reading position survives a
   // quit without a session switch (the switch cleanup below only runs on
