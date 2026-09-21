@@ -5,8 +5,10 @@ that can't encode non-ASCII characters in API request payloads.
 """
 
 import pytest
+from contextlib import contextmanager
 
 from agent.message_sanitization import _strip_non_ascii, _sanitize_messages_non_ascii, _sanitize_structure_non_ascii, _sanitize_tools_non_ascii, _sanitize_messages_surrogates
+from agent.turn_recovery import _recover_unicode_encode_error
 
 
 class TestStripNonAscii:
@@ -392,3 +394,110 @@ class TestSanitizeMessagesPersistMarker:
         assert canonical[0]["content"] == "olá ☕"
         assert api_messages[0]["content"] == "olá ☕"
         assert agent._cached_system_prompt == "system ☕"
+
+
+class TestUnicodeRecoveryClientState:
+    @staticmethod
+    def _agent(client, *, key="ascii-key", tools=None, lock_events=None):
+        events = lock_events if lock_events is not None else []
+
+        @contextmanager
+        def client_lock():
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        return type("Agent", (), {
+            "_unicode_sanitization_passes": 0,
+            "_force_ascii_payload": False,
+            "api_key": key,
+            "_client_kwargs": {"api_key": key, "default_headers": {"X-Relay": "bad ☕"}},
+            "client": client,
+            "tools": tools if tools is not None else [],
+            "prefill_messages": None,
+            "_cached_system_prompt": "system ☕",
+            "ephemeral_system_prompt": None,
+            "log_prefix": "",
+            "_openai_client_lock": staticmethod(client_lock),
+            "_buffer_vprint": lambda self, *args, **kwargs: None,
+            "_vprint": lambda self, *args, **kwargs: None,
+        })()
+
+    def test_utf8_recovery_locks_all_client_and_credential_mutations(self, monkeypatch):
+        monkeypatch.setattr("agent.turn_recovery._runtime_uses_ascii_encoding", lambda: False)
+        events = []
+        bad_key = "key-☕-not-for-logs"
+        client = type("Client", (), {
+            "api_key": bad_key,
+            "default_headers": {"X-Live": "value ☕"},
+            "_custom_headers": {"X-Custom": "custom ☕"},
+        })()
+        agent = self._agent(client, key=bad_key, lock_events=events)
+        messages = [{"role": "user", "content": "clean"}]
+        api_kwargs = {"tools": agent.tools}
+
+        recovered, _ = _recover_unicode_encode_error(
+            agent, UnicodeEncodeError("ascii", "☕", 0, 1, "ordinal"),
+            messages, [{"role": "user", "content": "clean"}], api_kwargs, "system ☕",
+        )
+
+        assert recovered is True
+        assert events == ["enter", "exit"]
+        assert "☕" not in agent.api_key
+        assert client.api_key == agent.api_key
+        assert agent._client_kwargs["api_key"] == agent.api_key
+
+    def test_utf8_recovery_sanitizes_all_header_containers_without_logging_secrets(self, monkeypatch, capsys):
+        monkeypatch.setattr("agent.turn_recovery._runtime_uses_ascii_encoding", lambda: False)
+        secret = "header-secret-☕"
+        client = type("Client", (), {
+            "api_key": "ascii-key",
+            "default_headers": {"X-Live": secret},
+            "_custom_headers": {"X-Custom": secret},
+        })()
+        agent = self._agent(client)
+        agent._client_kwargs["default_headers"] = {"X-Request": secret}
+
+        recovered, _ = _recover_unicode_encode_error(
+            agent, UnicodeEncodeError("ascii", "☕", 0, 1, "ordinal"),
+            [{"role": "user", "content": "clean"}], [], {}, "system",
+        )
+
+        assert recovered is True
+        for headers in (agent._client_kwargs["default_headers"], client.default_headers, client._custom_headers):
+            assert all("☕" not in value for value in headers.values())
+        assert secret not in capsys.readouterr().out
+
+    def test_ascii_recovery_keeps_equal_distinct_tools_list_identity(self, monkeypatch):
+        monkeypatch.setattr("agent.turn_recovery._runtime_uses_ascii_encoding", lambda: True)
+        tools = [{"type": "function", "function": {"name": "read", "description": "desc ☕"}}]
+        request_tools = [{"type": "function", "function": {"name": "read", "description": "desc ☕"}}]
+        agent = self._agent(None, tools=tools)
+        api_kwargs = {"tools": request_tools}
+
+        recovered, _ = _recover_unicode_encode_error(
+            agent, UnicodeEncodeError("ascii", "☕", 0, 1, "ordinal"),
+            [{"role": "user", "content": "clean"}], [], api_kwargs, "system",
+        )
+
+        assert recovered is True
+        assert api_kwargs["tools"] is request_tools
+        assert api_kwargs["tools"] is not agent.tools
+        assert "☕" not in api_kwargs["tools"][0]["function"]["description"]
+
+    def test_utf8_runtime_ascii_key_still_recovers_without_payload_repair(self, monkeypatch):
+        monkeypatch.setattr("agent.turn_recovery._runtime_uses_ascii_encoding", lambda: False)
+        agent = self._agent(None, key="already-ascii")
+        messages = [{"role": "user", "content": "olá ☕"}]
+
+        recovered, prompt = _recover_unicode_encode_error(
+            agent, UnicodeEncodeError("ascii", "☕", 0, 1, "ordinal"),
+            messages, messages[:], {}, "system ☕",
+        )
+
+        assert recovered is True
+        assert prompt == "system ☕"
+        assert messages[0]["content"] == "olá ☕"
+        assert agent._unicode_sanitization_passes == 1
