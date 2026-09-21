@@ -23,6 +23,19 @@ def test_inert_heredoc_body_path_not_walked_as_script(tmp_path):
     assert guard(command, cwd=str(tmp_path)) is False
 
 
+def test_executable_python_helper_does_not_walk_inert_log_path(tmp_path):
+    log = tmp_path / "large.log"
+    log.write_bytes(b"x" * (1024 * 1024 + 1))
+    helper = tmp_path / "helper"
+    helper.write_text(
+        "#!/usr/bin/env python3\nimport pathlib\n"
+        f"LOG_PATH = pathlib.Path({str(log)!r})\nprint('status')\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    assert guard(f"{helper} status", cwd=str(tmp_path)) is False
+
+
 def test_prefixed_inert_heredoc_body_path_not_walked_as_script(tmp_path):
     big = _big_file(tmp_path)
     command = (

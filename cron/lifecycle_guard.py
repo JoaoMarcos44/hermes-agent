@@ -879,7 +879,31 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield token[len(prefix):]
 
 
-def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
+def _looks_like_shell_script(path: str, cwd: Optional[str]) -> bool:
+    """Return whether a content-derived bare path is plausibly executable shell text."""
+    candidate = Path(path).expanduser()
+    if cwd and not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    try:
+        metadata = candidate.stat()
+    except (OSError, ValueError):
+        return path.endswith((".sh", ".bash", ".zsh"))
+    if not stat.S_ISREG(metadata.st_mode):
+        return False
+    if metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+        return True
+    if path.endswith((".sh", ".bash", ".zsh")):
+        return True
+    try:
+        with candidate.open("rb") as stream:
+            return stream.read(2) == b"#!"
+    except (OSError, ValueError):
+        return False
+
+
+def _references_at(
+    segment: list[str], index: int, cwd: Optional[str], *, content_derived: bool = False
+) -> Iterator[Path]:
     """Yield the scripts the token at *index* executes, if any."""
     if index >= len(segment):
         return
@@ -915,10 +939,14 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
+        if content_derived and not _looks_like_shell_script(executable, cwd):
+            return
         yield from _resolved_or_nothing(executable, cwd)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
+def _iter_referenced_shell_scripts(
+    command: str, *, cwd: Optional[str] = None, content_derived: bool = False
+) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
     original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
     a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
@@ -926,10 +954,10 @@ def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
+        yield from _references_at(segment, index, cwd, content_derived=content_derived)
         peeled = _peel_transparent_prefixes(segment, index)
         if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+            yield from _references_at(segment, peeled, cwd, content_derived=content_derived)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -1093,6 +1121,7 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+    content_derived: bool = False,
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
@@ -1109,6 +1138,9 @@ def _contains_unsafe_gateway_action(
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script, executed=executed,
+            content_derived=content_derived or (
+                text.lstrip().startswith("#!") and "python" in text.splitlines()[0].lower()
+            ),
         )
 
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
@@ -1126,9 +1158,13 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
+    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(
+        walk_command, cwd=cwd, content_derived=content_derived
+    )]
     if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts(
+            command, cwd=cwd, content_derived=content_derived
+        )]
 
     for script_path, candidate_executed in candidates:
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
