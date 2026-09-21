@@ -10,7 +10,11 @@ the request-copy-only strip, and the phrase detector.
 
 import copy
 
-from agent.message_sanitization import _looks_like_image_content_rejection, _strip_images_from_messages
+from agent.message_sanitization import (
+    _looks_like_corrupt_image_error,
+    _looks_like_image_content_rejection,
+    _strip_images_from_messages,
+)
 from agent.turn_recovery import (
     note_route_rejects_images,
     recover_before_classification,
@@ -182,11 +186,12 @@ class TestImageRejectionPhraseIsolation:
 
     def test_kimi_truncated_image_trips_recovery(self):
         # Kimi/Moonshot reject truncated image bytes with this 400; the
-        # bad bytes are in immutable history so stripping must fire.
+        # bad bytes are corrupt payload, not a route capability rejection.
         body = ("HTTP 400: Invalid request: prepare image failed error, "
                 "status code: 400, message: failed to decode image: invalid "
                 "or unsupported image format")
-        assert self._matches(body) is True
+        assert _looks_like_corrupt_image_error(body) is True
+        assert self._matches(body) is False
 
     def test_anthropic_image_too_large_does_not_trip(self):
         # From agent/error_classifier.py _IMAGE_TOO_LARGE_PATTERNS —
@@ -200,8 +205,16 @@ class TestImageRejectionPhraseIsolation:
         ]
         for body in bodies:
             assert self._matches(body) is False, f"false positive on: {body}"
+            assert _looks_like_corrupt_image_error(body) is False
 
-
+    def test_corrupt_payload_wording_matches_corrupt_detector_only(self):
+        corrupt_bodies = [
+            "The image data you provided does not represent a valid image. Please check your input and try again.",
+            "failed to decode image",
+        ]
+        for body in corrupt_bodies:
+            assert _looks_like_corrupt_image_error(body) is True
+            assert self._matches(body) is False
 
     def test_real_image_rejection_bodies_trip(self):
         """Positive cases — real-world error wordings that should trigger."""
@@ -223,10 +236,10 @@ class TestImageRejectionPhraseIsolation:
             # messages without naming image_url explicitly. The first failed
             # turn should still switch to text-only/aux-vision mode (#57948).
             "The provided messages input is invalid. The error info is [Unexpected item type in content].",
-            "The image data you provided does not represent a valid image. Please check your input and try again.",
         ]
         for body in bodies:
             assert self._matches(body) is True, f"false negative on: {body}"
+            assert _looks_like_corrupt_image_error(body) is False
 
 
 class TestStripImagesDropsStaleApiContent:
@@ -366,20 +379,98 @@ class TestImageRejectionPreservesSessionHistory:
         agent.model = "text-1"
         assert route_rejects_images(agent) is False
 
-    def test_recovery_fires_again_per_attempt(self):
-        """The retry loop rebuilds the request copy each iteration, so the
-        recovery may run again on a repeated rejection — history still intact."""
+    def test_recovery_stops_after_route_is_recorded(self):
+        """Once the route is recorded in _image_rejecting_routes, repeated
+        rejections fall through to normal error classification rather than
+        looping indefinitely (#118300)."""
         agent = _FakeAgent()
         history = _history()
-        for _ in range(2):
-            request = copy.deepcopy(history)
-            recovered, _ = recover_before_classification(
-                agent, _rejected(), messages=history, api_messages=request,
-                api_kwargs={}, active_system_prompt="sys",
-            )
-            assert recovered is True
-            assert request[0]["content"] == [{"type": "text", "text": "what is this?"}]
+        request = copy.deepcopy(history)
+        recovered, _ = recover_before_classification(
+            agent, _rejected(), messages=history, api_messages=request,
+            api_kwargs={}, active_system_prompt="sys",
+        )
+        assert recovered is True
+        assert request[0]["content"] == [{"type": "text", "text": "what is this?"}]
+        assert route_rejects_images(agent) is True
+
+        # Second attempt on the same recorded route must NOT recover again;
+        # let standard retry limits and classification handle repeated 4xx.
+        request2 = copy.deepcopy(history)
+        recovered2, _ = recover_before_classification(
+            agent, _rejected(), messages=history, api_messages=request2,
+            api_kwargs={}, active_system_prompt="sys",
+        )
+        assert recovered2 is False
         assert history == _history()
+
+    def test_corrupt_image_strips_request_without_marking_route(self):
+        """Corrupt-image errors are payload-specific, not capability-specific;
+        strip only the current request copy and leave route capability intact (#118300)."""
+        agent = _FakeAgent(provider="acme", model="vision-1")
+        history = _history()
+        request = copy.deepcopy(history)
+        corrupt_err = _rejected(400, "failed to decode image: invalid or unsupported image format")
+        recovered, _ = recover_before_classification(
+            agent, corrupt_err, messages=history, api_messages=request,
+            api_kwargs={}, active_system_prompt="sys",
+        )
+        assert recovered is True
+        assert history == _history()
+        assert request[0]["content"] == [{"type": "text", "text": "what is this?"}]
+        # Route is NOT marked as rejecting images; capable route still gets images next turn.
+        assert route_rejects_images(agent) is False
+
+    def test_iteration_summary_strips_images_for_rejecting_route(self):
+        """At max iteration limit, iteration summary builder must strip images
+        when the active route previously rejected them (#118300)."""
+        from agent.chat_completion_helpers import _iteration_summary_api_messages
+
+        class _SummaryAgent(_FakeAgent):
+            api_mode = "openai_completions"
+            _cached_system_prompt = "sys"
+            ephemeral_system_prompt = ""
+            prefill_messages = []
+
+            def _should_sanitize_tool_calls(self):
+                return False
+
+            def _copy_reasoning_content_for_api(self, msg, api_msg):
+                pass
+
+            def _sanitize_api_messages(self, msgs):
+                return msgs
+
+            def _drop_thinking_only_and_merge_users(self, msgs, **kwargs):
+                return msgs
+
+        agent = _SummaryAgent(provider="acme", model="text-1")
+        history = _history()
+        note_route_rejects_images(agent)
+
+        summary_msgs = _iteration_summary_api_messages(agent, history)
+        # Summary request copy is text-only.
+        for m in summary_msgs:
+            if isinstance(m.get("content"), list):
+                assert not any(
+                    isinstance(p, dict) and p.get("type") == "image_url"
+                    for p in m["content"]
+                )
+        # Canonical history still has its images.
+        assert any(
+            isinstance(p, dict) and p.get("type") == "image_url"
+            for m in history if isinstance(m.get("content"), list)
+            for p in m["content"]
+        )
+
+        # Vision route still keeps images in summary.
+        vision_agent = _SummaryAgent(provider="acme", model="vision-1")
+        vision_summary = _iteration_summary_api_messages(vision_agent, history)
+        assert any(
+            isinstance(p, dict) and p.get("type") == "image_url"
+            for m in vision_summary if isinstance(m.get("content"), list)
+            for p in m["content"]
+        )
 
     def test_assembly_strips_images_for_rejecting_route_only(self):
         from agent.turn_request_assembly import assemble_api_request

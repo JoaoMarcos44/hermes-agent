@@ -24,8 +24,9 @@ from agent.model_metadata import is_output_cap_error, parse_available_output_tok
 from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_sanitization import (
-    _looks_like_image_content_rejection, _sanitize_messages_non_ascii,
-    _sanitize_messages_surrogates, _sanitize_structure_non_ascii, _sanitize_structure_surrogates,
+    _looks_like_corrupt_image_error, _looks_like_image_content_rejection,
+    _sanitize_messages_non_ascii, _sanitize_messages_surrogates,
+    _sanitize_structure_non_ascii, _sanitize_structure_surrogates,
     _sanitize_tools_non_ascii, _strip_images_from_messages, _strip_non_ascii,
     close_interrupted_tool_sequence,
 )
@@ -317,18 +318,31 @@ def recover_before_classification(
     _err_status = getattr(api_error, "status_code", None)
     # 4xx-only gate: 5xx/timeouts are transient and take the retry path.
     _status_ok = _err_status is None or (400 <= int(_err_status) < 500)
-    if _looks_like_image_content_rejection(_err_body) and _status_ok:
-        _route_key = note_route_rejects_images(agent)
+    if _looks_like_corrupt_image_error(_err_body) and _status_ok:
         _imgs_removed = False
         if isinstance(api_messages, list):
             _imgs_removed = _strip_images_from_messages(api_messages)
-        _vlines(
-            agent,
-            f"⚠️  Server rejected image content — sending text-only to {agent.model}"
-            + ("; stripped images from the request and retrying." if _imgs_removed else " and retrying."),
-        )
-        logger.info("image-rejection recovery: route %s marked image-rejecting", _route_key)
-        return True, active_system_prompt
+        if _imgs_removed:
+            _vlines(
+                agent,
+                "⚠️  Server rejected corrupt image content — stripped images from the request and retrying.",
+            )
+            logger.info("image-corruption recovery: stripped corrupt images from request payload")
+            return True, active_system_prompt
+
+    if _looks_like_image_content_rejection(_err_body) and _status_ok:
+        if not route_rejects_images(agent):
+            _route_key = note_route_rejects_images(agent)
+            _imgs_removed = False
+            if isinstance(api_messages, list):
+                _imgs_removed = _strip_images_from_messages(api_messages)
+            _vlines(
+                agent,
+                f"⚠️  Server rejected image content — sending text-only to {agent.model}"
+                + ("; stripped images from the request and retrying." if _imgs_removed else " and retrying."),
+            )
+            logger.info("image-rejection recovery: route %s marked image-rejecting", _route_key)
+            return True, active_system_prompt
 
     # AnthropicBedrock SDK raises "Unexpected event order" when Bedrock errors before
     # message_start; fall back to native Converse for this session.

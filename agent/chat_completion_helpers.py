@@ -2183,6 +2183,10 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
     # Thinking-only assistant turns 400 on Anthropic-family providers; _thinking_prefill must
     # survive until here so the drop pass recognizes stubs after reasoning is stripped.
     api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
+    from agent.turn_recovery import route_rejects_images
+    if route_rejects_images(agent):
+        from agent.message_sanitization import _strip_images_from_messages
+        _strip_images_from_messages(api_messages)
     for api_msg in api_messages:  # underscore scaffolding: the transport's sweeper is bypassed here
         if isinstance(api_msg, dict):
             for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
