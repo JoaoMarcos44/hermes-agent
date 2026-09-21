@@ -304,6 +304,16 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
+    try:
+        event_days = kb._normalize_retention(
+            getattr(args, "event_retention_days", 30)
+        )
+        log_days = kb._normalize_retention(
+            getattr(args, "log_retention_days", 30)
+        )
+    except (TypeError, ValueError):
+        return _err("kanban gc: retention days must be non-negative integers", 2)
+
     import shutil
     scratch_root = kb.workspaces_root()
     removed_ws = 0
@@ -338,11 +348,16 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             shutil.rmtree(path, ignore_errors=True)
             removed_ws += 1
 
-    event_days = getattr(args, "event_retention_days", 30)
-    log_days = getattr(args, "log_retention_days", 30)
-    with kbc.connect_closing() as conn:
-        removed_events = kb.gc_events(conn, older_than_seconds=event_days * 24 * 3600)
-    removed_logs = kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600)
+    removed_events = 0
+    if event_days:
+        with kbc.connect_closing() as conn:
+            removed_events = kb.gc_events(
+                conn, older_than_seconds=event_days * 24 * 3600
+            )
+    removed_logs = (
+        kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600)
+        if log_days else 0
+    )
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0

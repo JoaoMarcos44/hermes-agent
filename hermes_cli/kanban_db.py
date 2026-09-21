@@ -4271,9 +4271,20 @@ def task_age(task: Task) -> dict:
 
 # --- Retention + garbage collection ---
 
+def _normalize_retention(value: int) -> int:
+    """Normalize a retention value and reject cutoffs that point into the future."""
+    normalized = int(value)
+    if normalized < 0:
+        raise ValueError("retention must be >= 0")
+    return normalized
+
+
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
     """Prune old done/archived events, retaining decomposition identity until task deletion."""
-    cutoff = int(time.time()) - int(older_than_seconds)
+    seconds = _normalize_retention(older_than_seconds)
+    if seconds == 0:
+        return 0
+    cutoff = int(time.time()) - seconds
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
@@ -4284,10 +4295,13 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
 
 def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[str] = None) -> int:
     """Delete worker log files older than the cutoff on one board; returns the count."""
+    seconds = _normalize_retention(older_than_seconds)
+    if seconds == 0:
+        return 0
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0
-    cutoff = time.time() - older_than_seconds
+    cutoff = time.time() - seconds
     removed = 0
     for p in log_dir.iterdir():
         with contextlib.suppress(OSError):
