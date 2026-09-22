@@ -73,3 +73,21 @@ class TestCalledProcessErrorMessage:
         assert "returned non-zero exit status" not in lines[0]
         assert any(line.strip().startswith("Details:") and "returned non-zero exit status 128" in line
                    for line in lines)
+
+
+def test_update_cache_invalidation_drops_plugin_catalog_for_every_profile(tmp_path, monkeypatch):
+    """A checkout update must not leave a pre-update live catalog authoritative for six hours."""
+    root = tmp_path / ".hermes"
+    alpha = root / "profiles" / "alpha"
+    beta = root / "profiles" / "beta"
+    for home in (root, alpha, beta):
+        (home / "cache").mkdir(parents=True, exist_ok=True)
+        (home / ".update_check").write_text("behind", encoding="utf-8")
+        (home / "cache" / "plugin-catalog.json").write_text('{"entries":[]}', encoding="utf-8")
+    monkeypatch.setattr(update_cmd, "get_default_hermes_root", lambda: root)
+
+    update_cmd._invalidate_update_cache()
+
+    for home in (root, alpha, beta):
+        assert not (home / ".update_check").exists()
+        assert not (home / "cache" / "plugin-catalog.json").exists()
