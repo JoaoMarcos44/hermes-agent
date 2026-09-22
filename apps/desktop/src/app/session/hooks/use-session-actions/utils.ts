@@ -601,70 +601,57 @@ function durableFoldCoversLiveResponse(messages: ChatMessage[], live: ChatMessag
 }
 
 
-/** Visible prompt identity used only to locate a persisted user occurrence. */
-const occurrenceUserText = (message: ChatMessage) =>
-  textWithoutReferenceLines(chatMessageText(message)).trim()
+/** User occurrence identity after the renderer has lifted reference lines into chips. */
+function occurrenceUserKey(message: ChatMessage): string {
+  return JSON.stringify([textWithoutReferenceLines(chatMessageText(message)).trim(), message.attachmentRefs ?? []])
+}
+
+/** Zero-based occurrence of this user identity among real user turns. */
+function matchingUserOrdinal(messages: ChatMessage[], owner: ChatMessage): number {
+  const ownerIndex = messages.indexOf(owner)
+
+  if (ownerIndex < 0) {
+    return -1
+  }
+
+  const key = occurrenceUserKey(owner)
+  let ordinal = -1
+
+  for (let index = 0; index <= ownerIndex; index += 1) {
+    const message = messages[index]
+
+    if (message.role === 'user' && !isGatewaySystemMarker(message) && occurrenceUserKey(message) === key) {
+      ordinal += 1
+    }
+  }
+
+  return ordinal
+}
 
 /**
- * Find the committed user row that owns a local settled stream segment.
- *
- * Exact ids win. Optimistic user ids necessarily change when the row is
- * persisted, so fall back only when the visible prompt has ONE authoritative
- * match (or one exact-timestamp match among repeated prompts). Ambiguity fails
- * closed: preserving one extra local row is safer than deleting a reply from a
- * different occurrence.
+ * Identity for one user occurrence across optimistic → persisted id changes.
+ * Exact ids are authoritative. Otherwise require the same visible prompt /
+ * attachment identity AND the same occurrence ordinal, so repeated prompts do
+ * not let an older fold swallow a newer reply.
  */
-function committedOwnerIndex(
+function sameUserOccurrence(
   nextMessages: ChatMessage[],
   previousMessages: ChatMessage[],
-  local: ChatMessage
-): number {
-  const localIndex = previousMessages.indexOf(local)
-  const owner = previousMessages
-    .slice(0, localIndex)
-    .findLast(message => message.role === 'user' && !isGatewaySystemMarker(message))
-
-  if (!owner) {
-    return -1
+  committedOwner: ChatMessage,
+  localOwner: ChatMessage
+): boolean {
+  if (committedOwner.id === localOwner.id) {
+    return true
   }
 
-  const exact = nextMessages.findIndex(message => message.id === owner.id)
-
-  if (exact >= 0) {
-    return exact
+  if (occurrenceUserKey(committedOwner) !== occurrenceUserKey(localOwner)) {
+    return false
   }
 
-  const ownerText = occurrenceUserText(owner)
+  const committedOrdinal = matchingUserOrdinal(nextMessages, committedOwner)
+  const localOrdinal = matchingUserOrdinal(previousMessages, localOwner)
 
-  if (!ownerText) {
-    return -1
-  }
-
-  const candidates = nextMessages
-    .map((message, index) => ({ index, message }))
-    .filter(
-      ({ message }) =>
-        message.role === 'user' &&
-        !isGatewaySystemMarker(message) &&
-        occurrenceUserText(message) === ownerText
-    )
-
-  if (candidates.length === 1) {
-    return candidates[0].index
-  }
-
-  if (typeof owner.timestamp !== 'number' || !Number.isFinite(owner.timestamp) || owner.timestamp <= 0) {
-    return -1
-  }
-
-  const timestampMatches = candidates.filter(
-    ({ message }) =>
-      typeof message.timestamp === 'number' &&
-      Number.isFinite(message.timestamp) &&
-      message.timestamp === owner.timestamp
-  )
-
-  return timestampMatches.length === 1 ? timestampMatches[0].index : -1
+  return committedOrdinal >= 0 && committedOrdinal === localOrdinal
 }
 
 /**
@@ -674,31 +661,30 @@ function committedOwnerIndex(
  * Hydration folds pre-tool commentary, tool calls, later commentary and the
  * final answer into one durable assistant row. The live renderer seals those
  * pieces as separate assistant-stream rows. Whole-row equality therefore
- * cannot prove identity; match the folded row's tool ids or individual text
- * parts, but only after locating the owning persisted user occurrence.
+ * cannot prove identity. First find a durable tool-bearing assistant that
+ * carries this segment (shared tool id or one of its text parts), then prove
+ * that folded row belongs to the same user occurrence.
  */
 function foldedOccurrenceCarriesSettledSegment(
   nextMessages: ChatMessage[],
   previousMessages: ChatMessage[],
   local: ChatMessage
 ): boolean {
-  const ownerIndex = committedOwnerIndex(nextMessages, previousMessages, local)
+  const localIndex = previousMessages.indexOf(local)
+  const localOwner = previousMessages
+    .slice(0, localIndex)
+    .findLast(message => message.role === 'user' && !isGatewaySystemMarker(message))
 
-  if (ownerIndex < 0) {
+  if (!localOwner) {
     return false
   }
 
-  const nextUserIndex = nextMessages.findIndex(
-    (message, index) =>
-      index > ownerIndex && message.role === 'user' && !isGatewaySystemMarker(message)
-  )
-  const occurrence = nextMessages.slice(ownerIndex + 1, nextUserIndex < 0 ? nextMessages.length : nextUserIndex)
   const wantedText = textWithoutReferenceLines(chatMessageText(local)).trim()
   const wantedToolIds = new Set(
     local.parts.flatMap(part => (part.type === 'tool-call' && part.toolCallId ? [part.toolCallId] : []))
   )
 
-  return occurrence.some(message => {
+  return nextMessages.some((message, messageIndex) => {
     if (
       message.role !== 'assistant' ||
       isLiveTailRow(message) ||
@@ -707,26 +693,31 @@ function foldedOccurrenceCarriesSettledSegment(
       return false
     }
 
-    if (
-      wantedToolIds.size &&
-      message.parts.some(part => part.type === 'tool-call' && wantedToolIds.has(part.toolCallId))
-    ) {
-      return true
-    }
+    const carriesSegment =
+      (wantedToolIds.size > 0 &&
+        message.parts.some(part => part.type === 'tool-call' && wantedToolIds.has(part.toolCallId))) ||
+      (Boolean(wantedText) &&
+        message.parts.some(part => {
+          if (part.type !== 'text') {
+            return false
+          }
 
-    if (!wantedText) {
+          const committedText = textWithoutReferenceLines(part.text).trim()
+
+          return committedText === wantedText || isStrictAnswerTextExtension(committedText, wantedText)
+        }))
+
+    if (!carriesSegment) {
       return false
     }
 
-    return message.parts.some(part => {
-      if (part.type !== 'text') {
-        return false
-      }
+    const committedOwner = nextMessages
+      .slice(0, messageIndex)
+      .findLast(candidate => candidate.role === 'user' && !isGatewaySystemMarker(candidate))
 
-      const committedText = textWithoutReferenceLines(part.text).trim()
-
-      return committedText === wantedText || isStrictAnswerTextExtension(committedText, wantedText)
-    })
+    return Boolean(
+      committedOwner && sameUserOccurrence(nextMessages, previousMessages, committedOwner, localOwner)
+    )
   })
 }
 
