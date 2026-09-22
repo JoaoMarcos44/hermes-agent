@@ -1568,7 +1568,12 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
         # SIGUSR1 drain first, SIGTERM fallback if unsupported/over budget — the watcher
         # relaunches either way. The helper announces its choice first because a silent
         # full-budget wait reads as a hung update.
-        if not _drain_or_signal_gateway_for_update(\n            pid, _drain_budget, proc.profile, deferred_self_restart_pids=out.deferred_self_restart_pids\n        ):
+        if not _drain_or_signal_gateway_for_update(
+            pid,
+            _drain_budget,
+            proc.profile,
+            deferred_self_restart_pids=out.deferred_self_restart_pids,
+        ):
             with suppress(ProcessLookupError, PermissionError):
                 os.kill(pid, _signal.SIGTERM)
         # Wait ≤5s for exit: Telegram keeps the old getUpdates session ~30s; a new gateway
@@ -1935,7 +1940,19 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
             _pre_update_plan, _pre_restart, _windows_gateway_resume, restart.restarted_services, _killed,
         )
         _fleet_snapshot = _collect_fleet_snapshot(restart, _fleet_rows_expected)
-        deferred = restart.deferred_self_restart_pids\n        effective_snapshot = [\n            row for row in _fleet_snapshot\n            if not (row.get("pid") in deferred and row.get("state") == "stale")\n        ]\n        if deferred and len(effective_snapshot) != len(_fleet_snapshot):\n            print("  ↻ Gateway restart pending until this update process exits")\n        if print_fleet_version_matrix(effective_snapshot):
+        deferred = restart.deferred_self_restart_pids
+        deferred_rows = [
+            row for row in _fleet_snapshot
+            if row.get("pid") in deferred and row.get("state") == "stale"
+        ]
+        effective_snapshot = [row for row in _fleet_snapshot if row not in deferred_rows]
+        if deferred_rows:
+            for row in deferred_rows:
+                print(
+                    f"  ↻ {row.get('profile')} (pid {row.get('pid')}): restart pending "
+                    "until this update process exits"
+                )
+        if print_fleet_version_matrix(effective_snapshot):
             restart.incomplete = True
             # A proven-stale survivor must not keep running (its ticker yields every tick and
             # nothing else restarts it, #117275): hand it to the drain-first restart path.
