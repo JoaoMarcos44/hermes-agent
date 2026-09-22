@@ -1278,6 +1278,35 @@ describe('preserveLocalPendingTurnMessages', () => {
     expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
   })
 
+  it('keeps the newer occurrence when repeated prompts and answers are identical', () => {
+    const folded = {
+      id: '2-assistant-stored',
+      role: 'assistant' as const,
+      parts: [
+        { type: 'text' as const, text: 'Checking.' },
+        { type: 'tool-call' as const, toolCallId: 'call-1', toolName: 'terminal', result: 'ok' },
+        { type: 'text' as const, text: 'Done.' }
+      ]
+    }
+
+    const next = [
+      msg('1-user-stored', 'user', 'same prompt'),
+      folded,
+      msg('3-user-stored', 'user', 'same prompt')
+    ]
+    const previous = [
+      msg('user-local-first', 'user', 'same prompt'),
+      msg('assistant-stream-first', 'assistant', 'Done.', { pending: false }),
+      msg('user-local-second', 'user', 'same prompt'),
+      msg('assistant-stream-second', 'assistant', 'Done.', { pending: false })
+    ]
+
+    const preserved = preserveLocalPendingTurnMessages(next, previous)
+
+    expect(preserved.map(message => message.id)).not.toContain('assistant-stream-first')
+    expect(preserved.map(message => message.id)).toContain('assistant-stream-second')
+  })
+
   it('keeps a settled final-answer bubble the folded tool round has not absorbed', () => {
     const toolRound = {
       id: 'row-1-assistant',
