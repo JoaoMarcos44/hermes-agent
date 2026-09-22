@@ -704,7 +704,7 @@ function foldedOccurrenceCarriesSettledSegment(
 
           const committedText = textWithoutReferenceLines(part.text).trim()
 
-          return committedText === wantedText || isStrictAnswerTextExtension(committedText, wantedText)
+          return committedText === wantedText
         }))
 
     if (!carriesSegment) {
