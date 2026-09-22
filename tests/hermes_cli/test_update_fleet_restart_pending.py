@@ -1011,6 +1011,50 @@ def test_startup_warn_discharged_when_inventory_less_marker_fleet_current(monkey
     assert not update_cmd_fleet._fleet_restart_obligation_armed()
 
 
+def test_inventoried_obligation_discharges_on_local_ahead_checkout(monkeypatch):
+    """A local commit/cherry-pick after the pulled SHA must not make the host obligation immortal."""
+    expected_sha = "a" * 40
+    checkout_sha = "b" * 40
+    update_cmd._write_fleet_restart_pending_marker(
+        expected_sha=expected_sha,
+        runtimes=[{"kind": "gateway", "profile": "default"}],
+    )
+    monkeypatch.setattr(update_cmd_fleet, "_current_checkout_sha", lambda: checkout_sha)
+    monkeypatch.setattr(
+        update_cmd_fleet, "_checkout_contains_obligation_sha",
+        lambda expected, current: expected == expected_sha and current == checkout_sha,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kwargs: [
+            {"profile": "default", "pid": 42, "code_sha": checkout_sha, "state": "current"}
+        ],
+    )
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is False
+    assert not update_cmd_fleet._fleet_restart_obligation_armed()
+
+
+def test_inventoried_obligation_stays_armed_when_expected_sha_not_ancestor(monkeypatch):
+    expected_sha = "a" * 40
+    checkout_sha = "b" * 40
+    update_cmd._write_fleet_restart_pending_marker(
+        expected_sha=expected_sha,
+        runtimes=[{"kind": "gateway", "profile": "default"}],
+    )
+    monkeypatch.setattr(update_cmd_fleet, "_current_checkout_sha", lambda: checkout_sha)
+    monkeypatch.setattr(update_cmd_fleet, "_checkout_contains_obligation_sha", lambda *_: False)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kwargs: [
+            {"profile": "default", "pid": 42, "code_sha": checkout_sha, "state": "current"}
+        ],
+    )
+
+    assert update_cmd_fleet._pending_fleet_restart_needed() is True
+    assert update_cmd_fleet._fleet_restart_obligation_armed()
+
+
 def test_startup_warn_kept_when_inventory_less_marker_fleet_stale(monkeypatch, capsys):
     disk_sha = "e" * 40
     update_cmd._write_fleet_restart_pending_marker(expected_sha=disk_sha)
