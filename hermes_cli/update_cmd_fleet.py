@@ -180,6 +180,32 @@ def _current_checkout_sha() -> str | None:
         return _capture_head_sha(["git"], _m().PROJECT_ROOT)
 
 
+def _checkout_contains_obligation_sha(expected_sha: str, checkout_sha: str) -> bool:
+    """True when the current checkout contains the commit this restart obligation targets.
+
+    Equality is insufficient for supported local-ahead checkouts: a cherry-pick/local commit
+    moves HEAD while retaining the pulled update as an ancestor. Unknown, missing, behind or
+    unrelated histories stay fail-closed.
+    """
+    if not expected_sha or not checkout_sha:
+        return False
+    if expected_sha == checkout_sha:
+        return True
+    from hermes_cli.update_cmd import _m
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", expected_sha, checkout_sha],
+            cwd=_m().PROJECT_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _receipt_looks_unfinished(receipt: dict) -> bool:
     """True when *receipt* is from an update that did not finish cleanly.
 
@@ -333,8 +359,9 @@ def _marker_only_restart_obsolete() -> bool:
     #115311) clears outright, and an inventory-less marker (the pre-inventory writer, or a tail
     that died before its inventory was recorded, #115638) clears once every live gateway is
     current on the checkout — there is no recorded owed set, so the fleet running the code on disk
-    is the whole of the evidence the marker's warning can be about, even after HEAD moved past
-    ``expected_sha`` by an out-of-band pull.
+    is the whole of the evidence the marker's warning can be about. Inventoried obligations also
+    accept a checkout that DESCENDS from ``expected_sha`` (for example a carried local cherry-pick),
+    but still require every recorded gateway identity to serve that current checkout.
 
     A serve/dashboard row whose supervisor owns the restart (Desktop backend, systemd/launchd
     unit, Windows service) is outside the gateway matrix's evidence, not evidence against it —
@@ -387,9 +414,17 @@ def _marker_only_restart_obsolete() -> bool:
     if not expected_sha:
         return False
     checkout_sha = _current_checkout_sha()
-    if owed is not None and checkout_sha != expected_sha:
-        return False  # a newer pull moved HEAD; it owns a fresh obligation
-    target_sha = expected_sha if owed is not None else checkout_sha
+    if owed is not None:
+        # An inventoried obligation survives only until its pulled SHA is contained by the
+        # current checkout and the recorded fleet is verified on that CURRENT checkout. A local
+        # cherry-pick/commit moves HEAD without creating a newer pull obligation, so exact SHA
+        # equality strands the old marker forever (#119367). Behind/unrelated/unknown history
+        # remains fail-closed.
+        if not checkout_sha or not _checkout_contains_obligation_sha(expected_sha, checkout_sha):
+            return False
+        target_sha = checkout_sha
+    else:
+        target_sha = checkout_sha
     if not target_sha:
         return False
     try:
