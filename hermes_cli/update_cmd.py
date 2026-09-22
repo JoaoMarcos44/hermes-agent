@@ -377,16 +377,21 @@ def _print_called_process_error_tail(exc: subprocess.CalledProcessError, *, limi
 
 
 def _invalidate_update_cache():
-    """Delete the update-check cache for ALL profiles: the repo is shared, so one profile's
-    update makes every profile current and a stale "commits behind" banner would linger."""
+    """Delete repo-derived caches for ALL profiles after an update.
+
+    The checkout is shared across profiles. Keeping either the update-check result or the
+    live plugin-catalog mirror after the checkout changes lets pre-update state outvote the
+    code/catalog that was just installed (#119340).
+    """
     default_home = get_default_hermes_root()
     profiles_root = default_home / "profiles"
     homes = [default_home]
     if profiles_root.is_dir():
         homes += [entry for entry in profiles_root.iterdir() if entry.is_dir()]
     for home in homes:
-        with suppress(Exception):
-            (home / ".update_check").unlink(missing_ok=True)
+        for cache_path in (home / ".update_check", home / "cache" / "plugin-catalog.json"):
+            with suppress(Exception):
+                cache_path.unlink(missing_ok=True)
 
 
 def _write_marker_file(path: Path, *, label: str) -> None:
