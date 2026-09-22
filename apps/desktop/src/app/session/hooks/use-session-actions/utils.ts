@@ -600,6 +600,136 @@ function durableFoldCoversLiveResponse(messages: ChatMessage[], live: ChatMessag
   })
 }
 
+
+/** Visible prompt identity used only to locate a persisted user occurrence. */
+const occurrenceUserText = (message: ChatMessage) =>
+  textWithoutReferenceLines(chatMessageText(message)).trim()
+
+/**
+ * Find the committed user row that owns a local settled stream segment.
+ *
+ * Exact ids win. Optimistic user ids necessarily change when the row is
+ * persisted, so fall back only when the visible prompt has ONE authoritative
+ * match (or one exact-timestamp match among repeated prompts). Ambiguity fails
+ * closed: preserving one extra local row is safer than deleting a reply from a
+ * different occurrence.
+ */
+function committedOwnerIndex(
+  nextMessages: ChatMessage[],
+  previousMessages: ChatMessage[],
+  local: ChatMessage
+): number {
+  const localIndex = previousMessages.indexOf(local)
+  const owner = previousMessages
+    .slice(0, localIndex)
+    .findLast(message => message.role === 'user' && !isGatewaySystemMarker(message))
+
+  if (!owner) {
+    return -1
+  }
+
+  const exact = nextMessages.findIndex(message => message.id === owner.id)
+
+  if (exact >= 0) {
+    return exact
+  }
+
+  const ownerText = occurrenceUserText(owner)
+
+  if (!ownerText) {
+    return -1
+  }
+
+  const candidates = nextMessages
+    .map((message, index) => ({ index, message }))
+    .filter(
+      ({ message }) =>
+        message.role === 'user' &&
+        !isGatewaySystemMarker(message) &&
+        occurrenceUserText(message) === ownerText
+    )
+
+  if (candidates.length === 1) {
+    return candidates[0].index
+  }
+
+  if (typeof owner.timestamp !== 'number' || !Number.isFinite(owner.timestamp) || owner.timestamp <= 0) {
+    return -1
+  }
+
+  const timestampMatches = candidates.filter(
+    ({ message }) =>
+      typeof message.timestamp === 'number' &&
+      Number.isFinite(message.timestamp) &&
+      message.timestamp === owner.timestamp
+  )
+
+  return timestampMatches.length === 1 ? timestampMatches[0].index : -1
+}
+
+/**
+ * Whether a committed folded tool turn already represents this settled local
+ * stream segment inside the SAME user occurrence.
+ *
+ * Hydration folds pre-tool commentary, tool calls, later commentary and the
+ * final answer into one durable assistant row. The live renderer seals those
+ * pieces as separate assistant-stream rows. Whole-row equality therefore
+ * cannot prove identity; match the folded row's tool ids or individual text
+ * parts, but only after locating the owning persisted user occurrence.
+ */
+function foldedOccurrenceCarriesSettledSegment(
+  nextMessages: ChatMessage[],
+  previousMessages: ChatMessage[],
+  local: ChatMessage
+): boolean {
+  const ownerIndex = committedOwnerIndex(nextMessages, previousMessages, local)
+
+  if (ownerIndex < 0) {
+    return false
+  }
+
+  const nextUserIndex = nextMessages.findIndex(
+    (message, index) =>
+      index > ownerIndex && message.role === 'user' && !isGatewaySystemMarker(message)
+  )
+  const occurrence = nextMessages.slice(ownerIndex + 1, nextUserIndex < 0 ? nextMessages.length : nextUserIndex)
+  const wantedText = textWithoutReferenceLines(chatMessageText(local)).trim()
+  const wantedToolIds = new Set(
+    local.parts.flatMap(part => (part.type === 'tool-call' && part.toolCallId ? [part.toolCallId] : []))
+  )
+
+  return occurrence.some(message => {
+    if (
+      message.role !== 'assistant' ||
+      isLiveTailRow(message) ||
+      !message.parts.some(part => part.type === 'tool-call')
+    ) {
+      return false
+    }
+
+    if (
+      wantedToolIds.size &&
+      message.parts.some(part => part.type === 'tool-call' && wantedToolIds.has(part.toolCallId))
+    ) {
+      return true
+    }
+
+    if (!wantedText) {
+      return false
+    }
+
+    return message.parts.some(part => {
+      if (part.type !== 'text') {
+        return false
+      }
+
+      const committedText = textWithoutReferenceLines(part.text).trim()
+
+      return committedText === wantedText || isStrictAnswerTextExtension(committedText, wantedText)
+    })
+  })
+}
+
 export function preserveLocalPendingTurnMessages(
   nextMessages: ChatMessage[],
   previousMessages: ChatMessage[]
@@ -720,11 +850,12 @@ export function preserveLocalPendingTurnMessages(
     if (
       isPendingAssistant &&
       message.pending !== true &&
-      nextMessages.some(
+      (nextMessages.some(
         candidate =>
           candidate.role === 'assistant' &&
           textWithoutReferenceLines(chatMessageText(candidate)) === textWithoutReferenceLines(chatMessageText(message))
-      )
+      ) ||
+        foldedOccurrenceCarriesSettledSegment(nextMessages, previousMessages, message))
     ) {
       continue
     }
