@@ -340,6 +340,10 @@ _MOA_ADAPTER_SHAPE_BUGS = (
 _PROVIDER_POLICY_BLOCKED_PATTERNS = (
     "no endpoints available matching your guardrail", "no endpoints available matching your data policy",
     "no endpoints found matching your data policy",
+    # OpenCode Go account/workspace privacy gate: the model exists, but this
+    # workspace has not opted into endpoints that train on request data.
+    "model trains on request data", "models that train on request data",
+    "endpoints that train on request data",
 )
 
 # Per-prompt safety-filter blocks: deterministic for the unchanged request, so
