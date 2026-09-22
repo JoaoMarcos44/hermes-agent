@@ -434,8 +434,12 @@ def load_catalog_live() -> List[PluginCatalogEntry]:
     in_tree = {e.name: e for e in load_catalog()}
     live_t, tree_t = _live_generated_time(data), in_tree_catalog_time()
     tree_is_newer = (tree_t > live_t) if (live_t is not None and tree_t is not None) else None
-    return [in_tree[e.name] if e.name in in_tree and _prefer_in_tree_entry(in_tree[e.name], e, tree_is_newer) else e
-            for e in entries]
+    resolved = [in_tree[e.name] if e.name in in_tree and _prefer_in_tree_entry(in_tree[e.name], e, tree_is_newer) else e
+                for e in entries]
+    if tree_is_newer:
+        live_names = {e.name for e in entries}
+        resolved.extend(e for e in in_tree.values() if e.name not in live_names)
+    return resolved
 
 
 def live_removed_list() -> List[RemovedEntry]:
