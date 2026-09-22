@@ -1245,7 +1245,12 @@ describe('preserveLocalPendingTurnMessages', () => {
     expect(preserved.map(message => message.id)).toEqual(['1-user-stored', '2-assistant-stored'])
     expect(
       preserved.flatMap(message => message.parts.filter(part => part.type === 'text').map(part => part.text))
-    ).toEqual(['inspect the setup', 'Checking the workspace first.', 'The config is next.', 'Everything is configured correctly.'])
+    ).toEqual([
+      'inspect the setup',
+      'Checking the workspace first.',
+      'The config is next.',
+      'Everything is configured correctly.'
+    ])
   })
 
   // Competing #119511 maps an optimistic owner to the authoritative transcript
