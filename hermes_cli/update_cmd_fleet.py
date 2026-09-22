@@ -1945,14 +1945,21 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
             row for row in _fleet_snapshot
             if row.get("pid") in deferred and row.get("state") == "stale"
         ]
-        effective_snapshot = [row for row in _fleet_snapshot if row not in deferred_rows]
         if deferred_rows:
+            # Persist the deferred state too: leaving these rows as stale would make the
+            # next update reconstruct a restart debt that cannot discharge until this
+            # updater returns (#119597).
+            deferred_ids = {id(row) for row in deferred_rows}
+            _fleet_snapshot = [
+                ({**row, "state": "pending_self_restart"} if id(row) in deferred_ids else row)
+                for row in _fleet_snapshot
+            ]
             for row in deferred_rows:
                 print(
                     f"  ↻ {row.get('profile')} (pid {row.get('pid')}): restart pending "
                     "until this update process exits"
                 )
-        if print_fleet_version_matrix(effective_snapshot):
+        if print_fleet_version_matrix(_fleet_snapshot):
             restart.incomplete = True
             # A proven-stale survivor must not keep running (its ticker yields every tick and
             # nothing else restarts it, #117275): hand it to the drain-first restart path.
