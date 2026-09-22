@@ -74,6 +74,8 @@ function hermesDevToken(): Plugin {
 }
 
 export default defineConfig({
+  // Keep production chunks relative so reverse-proxy path prefixes are preserved.
+  base: './',
   plugins: [
     react(),
     babel({ presets: [compilerPreset()] }),
