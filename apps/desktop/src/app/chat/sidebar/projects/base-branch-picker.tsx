@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -43,43 +43,47 @@ export function BaseBranchPicker({
   const repoStatus = useStore($repoStatus)
   const [branches, setBranches] = useState<HermesGitBaseBranch[]>([])
   const [loading, setLoading] = useState(false)
-  const [loaded, setLoaded] = useState(false)
   const [open, setOpen] = useState(false)
+  const valueRef = useRef(value)
+  valueRef.current = value
+  const onValueChangeRef = useRef(onValueChange)
+  onValueChangeRef.current = onValueChange
 
   const currentBranch = repoStatus?.detached ? null : (repoStatus?.branch ?? null)
 
-  const load = useCallback(async () => {
-    if (!shouldLoadBaseBranches(repoPath, loaded, loading)) {
-      return
-    }
-
-    setLoading(true)
-
-    try {
-      const list = await listBaseBranches(repoPath)
-      setBranches(list)
-      setLoaded(true)
-      onValueChange(baseBranchAfterLoad(value, list))
-    } catch {
-      setBranches([])
-      setLoaded(true)
-    } finally {
-      setLoading(false)
-    }
-  }, [loaded, loading, onValueChange, repoPath, value])
-
+  // Fetch once for each repoPath. The cleanup handles both a repo switch and
+  // unmount, so an old response cannot update this picker or its parent.
   useEffect(() => {
+    let active = true
+    const valueAtRequest = valueRef.current
     setBranches([])
-    setLoaded(false)
-  }, [repoPath])
+    setLoading(Boolean(repoPath))
 
-  // Load on mount so the default branch fills in before the user opens the
-  // popover — otherwise the button reads "branch off " with nothing after it.
-  useEffect(() => {
-    if (shouldLoadBaseBranches(repoPath, loaded, loading)) {
-      void load()
+    if (!repoPath) {
+      return () => {
+        active = false
+      }
     }
-  }, [load, loaded, loading, repoPath])
+
+    void listBaseBranches(repoPath)
+      .then(list => {
+        if (!active) return
+        setBranches(list)
+        if (valueRef.current === valueAtRequest) {
+          onValueChangeRef.current(baseBranchAfterLoad(valueAtRequest, list))
+        }
+      })
+      .catch(() => {
+        if (active) setBranches([])
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [repoPath])
 
   // Pin the current session's branch to the top, keep the rest in git's
   // most-recently-committed order.
@@ -105,10 +109,6 @@ export function BaseBranchPicker({
     <div className="space-y-1.5">
       <Popover
         onOpenChange={next => {
-          if (next && shouldLoadBaseBranches(repoPath, loaded, loading)) {
-            void load()
-          }
-
           setOpen(next)
         }}
         open={open}
