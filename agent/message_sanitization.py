@@ -7,6 +7,8 @@ characters that would crash ``json.dumps`` in the OpenAI SDK or be rejected upst
 
 from __future__ import annotations
 
+_FULL_ARGS_LOG_BOUND = 100_000
+
 import hashlib
 import json
 import logging
