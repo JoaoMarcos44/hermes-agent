@@ -10,10 +10,6 @@ import { useI18n } from '@/i18n'
 import { $repoStatus } from '@/store/coding-status'
 import { listBaseBranches } from '@/store/projects'
 
-export function shouldLoadBaseBranches(repoPath: string, loaded: boolean, loading: boolean) {
-  return Boolean(repoPath) && !loaded && !loading
-}
-
 export function baseBranchAfterLoad(currentValue: string, branches: Pick<HermesGitBaseBranch, 'isDefault' | 'name'>[]) {
   if (branches.length === 0 || branches.some(branch => branch.name === currentValue)) {
     return currentValue

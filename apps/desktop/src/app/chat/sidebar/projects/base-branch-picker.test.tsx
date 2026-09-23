@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, beforeEach, vi } from 'vitest'
 
 import { BaseBranchPicker } from './base-branch-picker'
 import { listBaseBranches } from '@/store/projects'
@@ -34,27 +34,48 @@ function deferred<T>() {
 }
 
 describe('BaseBranchPicker', () => {
-  it('loads once per repository and ignores a stale response after switching repositories', async () => {
-    const a = deferred<Branch[]>(); const b = deferred<Branch[]>()
-    vi.mocked(listBaseBranches).mockImplementation(path => path === 'A' ? a.promise : b.promise)
-    const onValueChange = vi.fn()
-    const view = render(<BaseBranchPicker repoPath="A" value="" onValueChange={onValueChange} />)
-    view.rerender(<BaseBranchPicker repoPath="B" value="" onValueChange={onValueChange} />)
-    await act(async () => { a.resolve([branch('a-main', true)]); await a.promise })
-    expect(onValueChange).not.toHaveBeenCalled()
-    await act(async () => { b.resolve([branch('b-main', true)]); await b.promise })
-    await waitFor(() => expect(onValueChange).toHaveBeenCalledWith('b-main'))
-    expect(listBaseBranches).toHaveBeenCalledTimes(2)
+  beforeEach(() => {
+    vi.clearAllMocks()
   })
-
-  it('does not replace a newer explicit selection when the request resolves', async () => {
+  it('fetches once when an empty response settles, even after reopening', async () => {
     const request = deferred<Branch[]>()
     vi.mocked(listBaseBranches).mockReturnValue(request.promise)
     const onValueChange = vi.fn()
     const view = render(<BaseBranchPicker repoPath="A" value="" onValueChange={onValueChange} />)
-    view.rerender(<BaseBranchPicker repoPath="A" value="chosen" onValueChange={onValueChange} />)
-    await act(async () => { request.resolve([branch('default', true), branch('chosen')]); await request.promise })
+
+    await act(async () => {
+      request.resolve([])
+      await request.promise
+    })
+    view.rerender(<BaseBranchPicker repoPath="A" value="" onValueChange={onValueChange} />)
+    fireEvent.click(screen.getByRole('button'))
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(listBaseBranches).toHaveBeenCalledTimes(1)
+    expect(onValueChange).not.toHaveBeenCalled()
+  })
+
+  it('ignores a stale response and preserves a newer explicit selection while the new repository loads', async () => {
+    const a = deferred<Branch[]>()
+    const b = deferred<Branch[]>()
+    vi.mocked(listBaseBranches).mockImplementation(path => path === 'A' ? a.promise : b.promise)
+    const onValueChange = vi.fn()
+    const view = render(<BaseBranchPicker repoPath="A" value="" onValueChange={onValueChange} />)
+    view.rerender(<BaseBranchPicker repoPath="B" value="" onValueChange={onValueChange} />)
+    view.rerender(<BaseBranchPicker repoPath="B" value="chosen" onValueChange={onValueChange} />)
+
+    await act(async () => {
+      a.resolve([branch('a-main', true)])
+      await a.promise
+    })
+    expect(onValueChange).not.toHaveBeenCalled()
+
+    await act(async () => {
+      b.resolve([branch('b-main', true), branch('chosen')])
+      await b.promise
+    })
     await waitFor(() => expect(screen.getByText('chosen')).toBeTruthy())
     expect(onValueChange).not.toHaveBeenCalled()
+    expect(listBaseBranches).toHaveBeenCalledTimes(2)
   })
 })
