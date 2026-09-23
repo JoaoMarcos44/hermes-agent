@@ -419,7 +419,7 @@ def _fail(operation: ConnectionOperation, target: Target, detail: str) -> None:
         logger.debug("mcp target %s: failure dropped, the operation settled first", target.name)
         return
     if target.state == TargetState.failed:
-        operation.refresh(target.name, connect_url=None, detail=detail, actor=Actor.backend_watcher)
+        operation.refresh(target.name, connect_url=None, detail=detail, actor=Actor.backend_watcher, kind=target.kind)
         return
     target.connect_url = None  # whatever link the row was offering is dead
     _move(operation, target, TargetState.failed, Actor.backend_watcher, detail=detail)
@@ -528,7 +528,8 @@ def _start_install(runner: _Runner, operation: ConnectionOperation, target: Targ
         # refresh is what tells the renderer to ask again.
         target.required_env = missing
         operation.refresh(target.name, connect_url=target.connect_url, actor=Actor.backend_watcher,
-                          detail=f"waiting for {', '.join(str(spec['name']) for spec in missing)}")
+                          detail=f"waiting for {', '.join(str(spec['name']) for spec in missing)}",
+                          kind=target.kind)
         return
     runner.approved_env[target.name] = approved
     actor = _actor(target)
@@ -561,7 +562,7 @@ def _start_install_oauth(runner: _Runner, operation: ConnectionOperation, target
     if operation.settled:
         return
     operation.refresh(target.name, connect_url=attempt.auth_url, actor=Actor.backend_watcher,
-                      detail=getattr(attempt, "detail", ""))
+                      detail=getattr(attempt, "detail", ""), kind=target.kind)
 
 
 def _fail_install(runner: _Runner, operation: ConnectionOperation, target: Target, error: Any) -> None:

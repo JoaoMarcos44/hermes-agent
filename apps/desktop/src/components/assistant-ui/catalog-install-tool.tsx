@@ -130,7 +130,12 @@ export function CatalogRow({ request, target }: CatalogRowProps) {
   }
 
   return (
-    <div className={cn(SHELL_CLASS, 'grid min-w-0 gap-1.5')} data-connector-row={target.name} tabIndex={-1}>
+    <div
+      className={cn(SHELL_CLASS, 'grid min-w-0 gap-1.5')}
+      data-connector-kind={target.kind}
+      data-connector-row={target.name}
+      tabIndex={-1}
+    >
       <div className="flex min-w-0 items-start gap-3">
         <span
           aria-hidden
