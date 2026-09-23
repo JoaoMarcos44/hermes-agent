@@ -1470,3 +1470,76 @@ class TestWebhookEnvOverride:
             config.platforms[Platform.WEBHOOK].extra.get("secret")
             == "shared-secret"
         )
+
+
+class TestPlatformExtraEnvExpansion:
+    def test_platform_extra_env_refs_expand(self, tmp_path, monkeypatch):
+        """${VAR} refs in platforms.*.extra expand in the typed gateway loader.
+
+        Contract: a webhook secret, an api_server key, and teams credentials
+        written as ${VAR} must reach PlatformConfig.extra as resolved values,
+        never the literal placeholder; an unset ref stays verbatim.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  webhook:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      secret: ${WEBHOOK_SECRET}\n"
+            "      routes:\n"
+            "        gh:\n"
+            "          secret: ${WEBHOOK_ROUTE_SECRET}\n"
+            "  api_server:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      key: ${API_SERVER_KEY}\n"
+            "  teams:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      client_id: cid-123\n"
+            "      client_secret: ${TEAMS_CLIENT_SECRET}\n"
+            "      tenant_id: tid-123\n"
+            "      service_url: ${UNSET_HERMES_TEST_REF_7F3A}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("WEBHOOK_SECRET", "whsec-live")
+        monkeypatch.setenv("WEBHOOK_ROUTE_SECRET", "whsec-route")
+        monkeypatch.setenv("API_SERVER_KEY", "api-key-live-value-123")
+        monkeypatch.setenv("TEAMS_CLIENT_SECRET", "teams-secret-live")
+        monkeypatch.delenv("UNSET_HERMES_TEST_REF_7F3A", raising=False)
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.WEBHOOK].extra["secret"] == "whsec-live"
+        assert config.platforms[Platform.WEBHOOK].extra["routes"]["gh"]["secret"] == "whsec-route"
+        assert config.platforms[Platform.API_SERVER].extra["key"] == "api-key-live-value-123"
+        teams_extra = config.platforms[Platform("teams")].extra
+        assert teams_extra["client_secret"] == "teams-secret-live"
+        assert teams_extra["service_url"] == "${UNSET_HERMES_TEST_REF_7F3A}"
+
+    def test_typed_loader_matches_effective_loader(self, tmp_path, monkeypatch):
+        """The typed GatewayConfig path and the dict effective path agree on expansion."""
+        from hermes_cli.config_effective import load_user_config_effective
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  webhook:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      secret: ${env:WEBHOOK_SECRET}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("WEBHOOK_SECRET", "whsec-env-form")
+
+        config = load_gateway_config()
+        effective = load_user_config_effective(config_path)
+
+        assert config.platforms[Platform.WEBHOOK].extra["secret"] == "whsec-env-form"
+        assert effective["platforms"]["webhook"]["extra"]["secret"] == "whsec-env-form"

@@ -393,6 +393,17 @@ def read_yaml_layers(home: Path) -> dict:
         with open(config_yaml_path, encoding="utf-8") as f:
             yaml_cfg = yaml.safe_load(f) or {}
 
+    # Expand ${VAR} / ${env:VAR} refs in the user layer BEFORE the managed
+    # overlay, mirroring hermes_cli.config_effective._effective: a managed
+    # ${VAR} then resolves against the process env only and can never be
+    # re-resolved through a profile's secret scope. Without this the typed
+    # GatewayConfig path kept literal "${...}" in platforms.*.extra (webhook
+    # secrets, api_server keys, teams credentials) while the dict path
+    # (_load_gateway_config) already expanded them.
+    if isinstance(yaml_cfg, dict):
+        from hermes_cli.config import _expand_env_vars
+        yaml_cfg = _expand_env_vars(yaml_cfg)
+
     # Managed scope: overlay administrator-pinned values (this loader bypasses
     # hermes_cli.config.load_config, so managed quick_commands / stt would otherwise be ignored).
     from hermes_cli import managed_scope
