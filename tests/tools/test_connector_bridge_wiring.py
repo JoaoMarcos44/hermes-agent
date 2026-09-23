@@ -159,12 +159,13 @@ def test_normalize_repairs_malformed_string_envelope_once(monkeypatch):
 
 
 def test_normalize_repairs_truncated_nested_string_envelope():
-    entries, err = normalize_tool_call_entries({
-        "calls": '[{"name":"session_search","arguments":{"query":"truncated"}',
-    })
+    query = 'truncated with a "quoted" value'
+    calls = json.dumps([{"name": "session_search", "arguments": {"query": query}}])
+
+    entries, err = normalize_tool_call_entries({"calls": calls[:-1]})
 
     assert err is None
-    assert entries == [{"name": "session_search", "arguments": {"query": "truncated"}}]
+    assert entries == [{"name": "session_search", "arguments": {"query": query}}]
 
 
 def test_normalize_actual_helper_sentinel_preserves_json_error():
