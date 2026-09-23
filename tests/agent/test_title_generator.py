@@ -399,6 +399,10 @@ class TestMaybeAutoTitle:
             ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "main"}, True),
             ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "custom:gptoss-local"}, True),
             ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "gptoss-local"}, True),
+            # Local aliases with no pin fall through to the custom branch and reuse main_runtime.
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "llamacpp"}, True),
+            # A bare local-alias host is rewritten to /v1 by auxiliary_client before dispatch.
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "llamacpp", "base_url": "http://127.0.0.1:8080"}, True),
             # Route identity beats provider labeling: an explicit first-class
             # provider pointed at the same local URL still shares the one slot.
             ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "openrouter", "base_url": "http://127.0.0.1:8080/v1/"}, True),
@@ -431,6 +435,28 @@ class TestMaybeAutoTitle:
                 tg.start_title_upgrade(upgrade)
             assert started.wait(timeout=10), "auto_title thread never ran"
             assert upgrade in tg._UPGRADE_THREADS
+
+    def test_named_custom_route_lookup_stays_read_only(self):
+        """Scheduling a title must not turn a route-identity check into a config migration/write."""
+        from agent import title_generator as tg
+
+        config = {
+            "providers": {
+                "gptoss-local": {
+                    "name": "GPT OSS local",
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "gpt-oss-120b",
+                },
+            },
+        }
+        with patch("hermes_cli.config.load_config_readonly", return_value=config), \
+                patch("hermes_cli.config.load_config", side_effect=AssertionError("migration-capable load_config called")):
+            assert tg._title_provider_shares_custom_main(
+                "custom",
+                "gptoss-local",
+                main_base_url="HTTP://127.0.0.1:8080/v1/",
+                pinned_base_url="",
+            )
 
     def test_kanban_worker_is_named_after_its_card_without_the_llm_thread(self, tmp_path, monkeypatch):
         """A worker's session takes the board card's title synchronously; no auxiliary model call (#111166)."""
