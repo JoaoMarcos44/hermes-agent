@@ -15,6 +15,7 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from utils import is_truthy_value
+from .paths import PORTABLE_DB_PATH, expand_db_path, normalize_db_path_for_save, resolve_db_path
 from .store import MemoryStore
 from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
@@ -115,13 +116,17 @@ class HolographicMemoryProvider(MemoryProvider):
         """Write config to config.yaml under plugins.hermes-memory-store."""
         # The canonical writer: config lock, managed-mode refusal, default stripping, atomic replace.
         # ``merge_existing`` keeps every other section; *hermes_home* is the active profile already.
+        # ``db_path`` is normalised to the portable ``$HERMES_HOME`` spelling so a cloned or
+        # renamed profile resolves its own fact DB instead of sharing the source's.
         from hermes_cli.config import save_config
-        save_config({"plugins": {"hermes-memory-store": dict(values)}}, merge_existing=True)
+        normalised = dict(values)
+        if "db_path" in normalised:
+            normalised["db_path"] = normalize_db_path_for_save(normalised["db_path"], hermes_home)
+        save_config({"plugins": {"hermes-memory-store": normalised}}, merge_existing=True)
 
     def get_config_schema(self):
-        from hermes_constants import display_hermes_home
         return [
-            {"key": "db_path", "description": "SQLite database path", "default": f"{display_hermes_home()}/memory_store.db"},
+            {"key": "db_path", "description": "SQLite database path", "default": PORTABLE_DB_PATH},
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
@@ -130,9 +135,16 @@ class HolographicMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
         _hermes_home = str(get_hermes_home())
-        db_path = self._config.get("db_path", _hermes_home + "/memory_store.db")
-        if isinstance(db_path, str):  # expand $HERMES_HOME so paths resolve to the active profile
-            db_path = db_path.replace("$HERMES_HOME", _hermes_home).replace("${HERMES_HOME}", _hermes_home)
+        raw_db_path = self._config.get("db_path", PORTABLE_DB_PATH)
+        # Portable values resolve per active profile; legacy concrete values pinning another
+        # profile's DB (clone sharing its source, rename pointing at the ghost old dir) heal
+        # to this profile's own store.
+        db_path = resolve_db_path(raw_db_path, _hermes_home)
+        if db_path != expand_db_path(raw_db_path, _hermes_home):
+            logger.warning(
+                "Holographic db_path %r points at another profile's store; using %r instead",
+                raw_db_path, db_path,
+            )
         hrr_dim = int(self._config.get("hrr_dim", 1024))
         self._store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim)
         self._retriever = FactRetriever(store=self._store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),

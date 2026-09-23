@@ -499,9 +499,11 @@ hermes config set memory.provider holographic
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `db_path` | `$HERMES_HOME/memory_store.db` | SQLite database path |
+| `db_path` | `$HERMES_HOME/memory_store.db` | SQLite database path (portable: resolves per active profile) |
 | `auto_extract` | `false` | Auto-extract facts at session end |
 | `default_trust` | `0.5` | Default trust score (0.0–1.0) |
+
+Each profile keeps its own fact DB: cloning starts with an empty store (or a copy of the facts with `--clone-all`) and renaming keeps the profile's facts. A custom `db_path` outside the profile tree is always respected verbatim.
 
 **Unique capabilities:**
 - `probe` — entity-specific algebraic recall (all facts about a person/thing)

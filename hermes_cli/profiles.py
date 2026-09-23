@@ -1257,6 +1257,8 @@ def create_profile(
             stripped = strip_channel_settings(staging, include_state=clone_all, source_dir=source_dir)
             if stripped:
                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
+        if source_dir is not None:
+            _sanitize_cloned_holographic_db_path(staging, canon, source_dir)
         _finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description)
         os.rename(staging, profile_dir)
     except BaseException:
@@ -2098,6 +2100,97 @@ def _atomic_write_json(path: Path, data: dict) -> bool:
         return False
 
 
+def _rewrite_holographic_db_path_to_portable(
+    config_path: Path, home: Path, source_dir: Optional[Path] = None
+) -> bool:
+    """Rewrite a stale concrete holographic ``db_path`` to the portable form.
+
+    Returns True when the file was rewritten. Best-effort: never raises, so a
+    clone/rename can never fail on a metadata fixup. The portable
+    ``$HERMES_HOME/memory_store.db`` resolves per active profile, so a clone
+    stops sharing its source's fact DB and a rename finds its own facts again.
+    Custom paths (other filenames, locations outside any Hermes tree) are left
+    untouched. Round-trips through ``atomic_config_write`` so comments survive.
+
+    ``source_dir`` (clone only): when given, any value resolving inside the
+    source profile is stale by definition, even outside the standard tree.
+    """
+    if not config_path.is_file():
+        return False
+    try:
+        from hermes_cli.config import atomic_config_write, read_user_config_raw
+        from plugins.memory.holographic.paths import (
+            PORTABLE_DB_PATH,
+            is_stale_profile_pinned_path,
+            normalize_db_path_for_save,
+        )
+    except Exception as exc:
+        logger.debug("holographic db_path rewrite skipped (import): %s", exc)
+        return False
+    try:
+        raw = read_user_config_raw(config_path)
+        node = raw.get("plugins")
+        store = node.get("hermes-memory-store") if isinstance(node, dict) else None
+        if not isinstance(store, dict) or "db_path" not in store:
+            return False
+        current = store["db_path"]
+        if isinstance(current, str) and current.strip() == PORTABLE_DB_PATH:
+            return False
+        if _holographic_db_path_pins_dir(current, source_dir) or is_stale_profile_pinned_path(current, home):
+            store["db_path"] = PORTABLE_DB_PATH
+        else:
+            normalised = normalize_db_path_for_save(current, home)
+            if normalised == (current.strip() if isinstance(current, str) else current):
+                return False
+            # Only collapse concrete default spellings to portable; never rewrite a
+            # genuine custom path during clone/rename.
+            if normalised != PORTABLE_DB_PATH:
+                return False
+            store["db_path"] = normalised
+        atomic_config_write(config_path, raw)
+        return True
+    except Exception as exc:
+        logger.debug("holographic db_path rewrite skipped (%s): %s", config_path, exc)
+        return False
+
+
+def _holographic_db_path_pins_dir(raw: object, directory: Optional[Path]) -> bool:
+    """True when a stored ``db_path`` resolves inside *directory* (clone source / rename target).
+
+    Exact knowledge beats heuristics: the clone/rename caller knows which tree
+    the stale value would point at, so custom-tree layouts are covered without
+    ever touching intentional custom paths elsewhere.
+    """
+    if directory is None or raw is None or not isinstance(raw, str):
+        return False
+    text = raw.strip()
+    if not text or "$HERMES_HOME" in text:
+        return False
+    try:
+        from plugins.memory.holographic.paths import DEFAULT_DB_FILENAME
+        expanded = os.path.expanduser(text)
+        if Path(expanded).name != DEFAULT_DB_FILENAME:
+            return False
+        Path(expanded).resolve().relative_to(Path(directory).resolve())
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _sanitize_cloned_holographic_db_path(staging: Path, canon: str, source_dir: Optional[Path] = None) -> None:
+    """Point a fresh clone at its own fact DB (portable form), never the source's."""
+    if _rewrite_holographic_db_path_to_portable(staging / "config.yaml", staging, source_dir):
+        logger.info("profile %s: holographic db_path reset to portable $HERMES_HOME form", canon)
+        print("✓ Holographic memory path reset to this profile's own store")
+
+
+def _migrate_holographic_db_path(new_dir: Path, old_canon: str = "") -> None:
+    """Point a renamed profile at its own (moved) fact DB instead of the ghost old dir."""
+    old_dir = get_profile_dir(old_canon) if old_canon else None
+    if _rewrite_holographic_db_path_to_portable(new_dir / "config.yaml", new_dir, old_dir):
+        print("✓ Holographic memory path updated to the renamed profile's store")
+
+
 def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) -> None:
     """Rename Honcho host blocks for a renamed profile without changing peers."""
     old_host = f"hermes_{old_name}"
@@ -2217,6 +2310,10 @@ def rename_profile(old_name: str, new_name: str) -> Path:
 
     # 3. Update profile-scoped Honcho host blocks, preserving aiPeer identity
     _migrate_honcho_profile_host(old_canon, new_canon, new_dir)
+
+    # 3b. Update a stale concrete holographic fact-DB path to the portable form so the
+    # renamed profile keeps its (moved) facts instead of recreating a ghost old dir.
+    _migrate_holographic_db_path(new_dir, old_canon)
 
     # 4. Update wrapper script
     remove_wrapper_script(old_canon)
