@@ -392,15 +392,30 @@ class TestMaybeAutoTitle:
         [
             ({"provider": "custom", "base_url": "http://127.0.0.1:8080/v1"}, {}, True),
             ({"provider": "custom", "base_url": "http://127.0.0.1:8080/v1"}, {"base_url": "http://127.0.0.1:8080/v1/"}, True),
+            # #120558: named custom runtimes are the same self-hosted route.
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {}, True),
+            # These route aliases are accepted by auxiliary routing too. #120560's
+            # provider-prefix-only fix still starts the title request for them.
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "main"}, True),
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "custom:gptoss-local"}, True),
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "gptoss-local"}, True),
+            # Route identity beats provider labeling: an explicit first-class
+            # provider pointed at the same local URL still shares the one slot.
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "openrouter", "base_url": "http://127.0.0.1:8080/v1/"}, True),
+            # A same-name pin with another URL really is elsewhere.
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "custom:gptoss-local", "base_url": "http://10.0.0.2:8080/v1"}, False),
+            ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "custom:other"}, False),
             ({"provider": "custom", "base_url": "http://127.0.0.1:8080/v1"}, {"provider": "openrouter"}, False),
             ({"provider": "custom", "base_url": "http://127.0.0.1:8080/v1"}, {"base_url": "http://10.0.0.2:8080/v1"}, False),
             ({"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"}, {}, False),
         ],
     )
     def test_title_call_waits_for_the_turn_when_it_shares_a_custom_endpoint(self, main_runtime, title_cfg, deferred):
-        """#117296: a self-hosted server serving the main turn and the concurrent json_schema title request
-        can decode the title into the main reply. The upgrade must not go on the wire until the caller starts
-        it after the turn; every other route keeps the turn-start timing."""
+        """#117296/#120558: route aliases must not bypass self-hosted title serialization.
+
+        The upgrade must not go on the wire until the caller starts it after the turn when the title lane
+        resolves to the same custom endpoint. A genuinely different route keeps turn-start timing.
+        """
         import threading
         from agent import title_generator as tg
         db = MagicMock()

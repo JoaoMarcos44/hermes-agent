@@ -177,30 +177,80 @@ def _model_title_upgrade_enabled() -> bool:
         return True
 
 
+def _title_provider_shares_custom_main(
+    main_provider: str, pinned_provider: str, *, main_base_url: str, pinned_base_url: str,
+) -> bool:
+    """Whether the configured title route resolves back to the live custom main endpoint.
+
+    Auxiliary routing accepts several identities for the same route: ``auto`` and ``main``
+    inherit the live runtime; named custom providers accept both ``custom:<name>`` and
+    ``<name>``; bare ``custom`` keeps the historical shared-endpoint behavior. The title
+    scheduler must follow those semantics instead of treating every non-literal ``custom``
+    value as "pinned elsewhere" — that recreates #117296 under another spelling.
+    """
+    main_provider = str(main_provider or "").strip().lower()
+    pinned_provider = str(pinned_provider or "").strip().lower()
+    main_base_url = str(main_base_url or "").strip().rstrip("/")
+    pinned_base_url = str(pinned_base_url or "").strip().rstrip("/")
+
+    if main_provider != "custom" and not main_provider.startswith("custom:"):
+        return False
+    # An explicit auxiliary URL is the strongest route identity we have. Provider
+    # labels do not make two requests independent when they still hit the same
+    # single-slot server (for example provider=openrouter with a local override).
+    if pinned_base_url:
+        return bool(main_base_url and pinned_base_url == main_base_url)
+    if pinned_provider in ("", "auto", "main", "custom"):
+        return True
+    if pinned_provider == main_provider:
+        return True
+    if main_provider.startswith("custom:"):
+        main_name = main_provider.split(":", 1)[1].strip()
+        if main_name and pinned_provider == main_name:
+            return True
+
+    # A bare/custom runtime can still be the same configured named endpoint.
+    # Resolve the configured provider only as a final identity check; failures
+    # stay fail-open for scheduling (start now) rather than disabling titles.
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+        entry = _get_named_custom_provider(pinned_provider)
+    except Exception:
+        entry = None
+    if not isinstance(entry, dict):
+        return False
+    entry_base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+    return bool(entry_base_url and main_base_url and entry_base_url == main_base_url)
+
+
 def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     """True when the model title call would hit the SAME self-hosted endpoint as the turn's own request.
 
-    A ``custom`` main route (llama.cpp, Ollama, vLLM, LM Studio…) whose ``auxiliary.title_generation``
-    is not pinned elsewhere shares one local server between the streaming main request and the
-    concurrent ``response_format: json_schema`` title request. Single-slot servers then serve the
-    title grammar/completion into the main turn: the user's reply arrives as ``{"title": ...}``, is
+    A custom main route (bare ``custom`` or named ``custom:<name>``) whose
+    ``auxiliary.title_generation`` route resolves back to that same endpoint shares one local
+    server between the streaming main request and the concurrent
+    ``response_format: json_schema`` title request. Single-slot servers then serve the title
+    grammar/completion into the main turn: the user's reply arrives as ``{"title": ...}``, is
     persisted as a genuine assistant row and replayed, and the model adopts the format (#117296).
+
     Running the title call after the turn settles keeps the two requests off the wire at once.
-    Hosted providers multiplex requests independently and keep the turn-start timing.
+    Hosted providers or a genuinely different auxiliary endpoint keep the turn-start timing.
     """
-    provider = str((main_runtime or {}).get("provider") or "").strip().lower()
-    if provider != "custom":
+    runtime = main_runtime or {}
+    provider = str(runtime.get("provider") or "").strip().lower()
+    main_base_url = str(runtime.get("base_url") or "").strip().rstrip("/")
+    if provider != "custom" and not provider.startswith("custom:"):
         return False
     try:
         cfg = _title_config()
     except Exception:
         return True
-    pinned_provider = str(cfg.get("provider") or "").strip().lower()
-    pinned_base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
-    main_base_url = str((main_runtime or {}).get("base_url") or "").strip().rstrip("/")
-    if pinned_provider and pinned_provider not in ("", "auto", "custom"):
-        return False
-    return not pinned_base_url or pinned_base_url == main_base_url
+    return _title_provider_shares_custom_main(
+        provider,
+        cfg.get("provider"),
+        main_base_url=main_base_url,
+        pinned_base_url=cfg.get("base_url"),
+    )
 
 
 def start_title_upgrade(upgrade: Optional[threading.Thread]) -> None:
