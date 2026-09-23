@@ -79,7 +79,7 @@ def test_repair_diagnostics_never_log_argument_payload(caplog):
         assert _repair_tool_call_arguments(raw, "write_file") == "{}"
 
     assert "write_file" in caplog.text
-    assert "private-payload" in caplog.text
+    assert "private-payload" not in caplog.text
 
 
 def test_repaired_argument_diagnostic_never_logs_raw_or_repaired_payload(caplog):
@@ -91,7 +91,7 @@ def test_repaired_argument_diagnostic_never_logs_raw_or_repaired_payload(caplog)
 
     assert repaired == '{"secret":"private-payload"}'
     assert "write_file" in caplog.text
-    assert "private-payload" in caplog.text
+    assert "private-payload" not in caplog.text
 
 
 def test_envelope_repair_can_omit_payload_log(caplog):
