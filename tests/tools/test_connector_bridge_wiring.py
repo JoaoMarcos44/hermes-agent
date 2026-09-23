@@ -142,9 +142,10 @@ def test_normalize_repairs_malformed_string_envelope_once(monkeypatch):
     calls = []
     original = message_sanitization._repair_tool_call_arguments
 
-    def repair_once(raw, tool_name="?"):
+    def repair_once(raw, tool_name="?", **kwargs):
         calls.append((raw, tool_name))
-        return original(raw, tool_name)
+        assert kwargs == {"log_payload": False}
+        return original(raw, tool_name, **kwargs)
 
     monkeypatch.setattr(message_sanitization, "_repair_tool_call_arguments", repair_once)
     entries, err = normalize_tool_call_entries({
@@ -157,12 +158,28 @@ def test_normalize_repairs_malformed_string_envelope_once(monkeypatch):
     assert calls[0][1] == "tool_call calls envelope"
 
 
+def test_normalize_repairs_truncated_nested_string_envelope():
+    entries, err = normalize_tool_call_entries({
+        "calls": '[{"name":"session_search","arguments":{"query":"truncated"}',
+    })
+
+    assert err is None
+    assert entries == [{"name": "session_search", "arguments": {"query": "truncated"}}]
+
+
+def test_normalize_actual_helper_sentinel_preserves_json_error():
+    entries, err = normalize_tool_call_entries({"calls": '{"name":"session_search","arguments":"unterminated'})
+
+    assert entries == []
+    assert "tool_call 'calls' is not valid JSON" in err
+
+
 def test_normalize_keeps_original_json_error_when_envelope_unrepairable(monkeypatch):
     from agent import message_sanitization
 
     calls = []
 
-    def repair_once(raw, tool_name="?"):
+    def repair_once(raw, tool_name="?", **kwargs):
         calls.append(raw)
         return "not repaired"
 

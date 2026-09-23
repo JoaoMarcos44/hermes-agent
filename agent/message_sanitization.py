@@ -213,7 +213,9 @@ def _rebalance_json_closers(raw: str) -> str | None:
     return "".join(out) + "".join(_JSON_CLOSERS[ch] for ch in reversed(stack))
 
 
-def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
+def _repair_tool_call_arguments(
+    raw_args: str, tool_name: str = "?", *, log_payload: bool = True
+) -> str:
     """Repair malformed tool_call argument JSON (truncation, trailing commas, Python ``None``,
     control chars); ``"{}"`` if unrepairable so the request succeeds. Repairs log at WARNING."""
     raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
@@ -252,17 +254,20 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         fixed = fixed[:-1]
 
     if _loads_ok(fixed):
-        logger.warning("Repaired malformed tool_call arguments for %s", tool_name)
+        if log_payload:
+            logger.warning("Repaired malformed tool_call arguments for %s: %s → %s", tool_name, raw_stripped[:80], fixed[:80])
         return fixed
 
     # Pass 5: escape control chars inside strings (strict=False alone fails when other
     # malformations are present too), then retry.
     escaped = _escape_invalid_chars_in_json_strings(fixed)
     if escaped != fixed and _loads_ok(escaped):
-        logger.warning("Repaired control-char-laced tool_call arguments for %s", tool_name)
+        if log_payload:
+            logger.warning("Repaired control-char-laced tool_call arguments for %s", tool_name)
         return escaped
 
-    logger.warning("Unrepairable tool_call arguments for %s — replaced with empty object", tool_name)
+    if log_payload:
+        logger.warning("Unrepairable tool_call arguments for %s — replaced with empty object", tool_name)
     return "{}"
 
 
