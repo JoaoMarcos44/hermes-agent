@@ -136,6 +136,44 @@ def test_normalize_parses_string_envelope_single_dict():
     assert entries == [{"name": "session_search", "arguments": {"query": "x"}}]
 
 
+def test_normalize_repairs_malformed_string_envelope_once(monkeypatch):
+    from agent import message_sanitization
+
+    calls = []
+    original = message_sanitization._repair_tool_call_arguments
+
+    def repair_once(raw, tool_name="?"):
+        calls.append((raw, tool_name))
+        return original(raw, tool_name)
+
+    monkeypatch.setattr(message_sanitization, "_repair_tool_call_arguments", repair_once)
+    entries, err = normalize_tool_call_entries({
+        "calls": '[{"name":"connectors__gmail__SEND_EMAIL","arguments":{},}]',
+    })
+
+    assert err is None
+    assert entries == [{"name": "connectors__gmail__SEND_EMAIL", "arguments": {}}]
+    assert len(calls) == 1
+    assert calls[0][1] == "tool_call calls envelope"
+
+
+def test_normalize_keeps_original_json_error_when_envelope_unrepairable(monkeypatch):
+    from agent import message_sanitization
+
+    calls = []
+
+    def repair_once(raw, tool_name="?"):
+        calls.append(raw)
+        return "not repaired"
+
+    monkeypatch.setattr(message_sanitization, "_repair_tool_call_arguments", repair_once)
+    entries, err = normalize_tool_call_entries({"calls": "nope"})
+
+    assert entries == []
+    assert "tool_call 'calls' is not valid JSON" in err
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "bad,expected_fragment",
     [
