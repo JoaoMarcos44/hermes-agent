@@ -255,7 +255,8 @@ def _title_provider_shares_custom_main(
     pinned_provider = str(pinned_provider or "").strip().lower()
     main_route = _normalize_title_route_base_url(main_base_url)
 
-    if main_provider != "custom" and not main_provider.startswith("custom:"):
+    from hermes_cli.route_identity import is_custom_endpoint_provider
+    if not is_custom_endpoint_provider(main_provider):
         return False
 
     # An explicit auxiliary URL is the strongest route identity we have. Mirror
@@ -296,7 +297,8 @@ def _title_provider_shares_custom_main(
 def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     """True when the model title call would hit the SAME self-hosted endpoint as the turn's own request.
 
-    A custom main route (bare ``custom`` or named ``custom:<name>``) whose
+    A self-hosted/user-supplied main route (custom, named custom, LM Studio, llama.cpp,
+    Ollama, or vLLM family) whose
     ``auxiliary.title_generation`` route resolves back to that same endpoint shares one local
     server between the streaming main request and the concurrent
     ``response_format: json_schema`` title request. Single-slot servers then serve the title
@@ -309,7 +311,8 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     runtime = main_runtime or {}
     provider = str(runtime.get("provider") or "").strip().lower()
     main_base_url = runtime.get("base_url")
-    if provider != "custom" and not provider.startswith("custom:"):
+    from hermes_cli.route_identity import is_custom_endpoint_provider
+    if not is_custom_endpoint_provider(provider):
         return False
     try:
         cfg = _title_config()

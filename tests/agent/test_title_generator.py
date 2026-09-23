@@ -391,6 +391,18 @@ class TestMaybeAutoTitle:
         "main_runtime, title_cfg, deferred",
         [
             ({"provider": "custom", "base_url": "http://127.0.0.1:8080/v1"}, {}, True),
+            # #117552: LM Studio preserves a first-class provider id but shares the same
+            # single-slot self-hosted failure class as #117296.
+            ({"provider": "lmstudio", "base_url": "http://127.0.0.1:1234/v1"}, {}, True),
+            # Other runtime spellings in the same self-hosted endpoint family must not need
+            # provider-specific follow-up patches.
+            ({"provider": "local", "base_url": "http://127.0.0.1:8080/v1"}, {}, True),
+            ({"provider": "llamacpp", "base_url": "http://127.0.0.1:8080/v1"}, {}, True),
+            ({"provider": "llama.cpp", "base_url": "http://127.0.0.1:8080/v1"}, {}, True),
+            ({"provider": "llama-cpp", "base_url": "http://127.0.0.1:8080/v1"}, {}, True),
+            ({"provider": "ollama", "base_url": "http://127.0.0.1:11434/v1"}, {}, True),
+            ({"provider": "vllm", "base_url": "http://127.0.0.1:8000/v1"}, {}, True),
+            ({"provider": "lmstudio", "base_url": "http://127.0.0.1:1234/v1"}, {"provider": "openrouter"}, False),
             ({"provider": "custom", "base_url": "http://127.0.0.1:8080/v1"}, {"base_url": "http://127.0.0.1:8080/v1/"}, True),
             # #120558: named custom runtimes are the same self-hosted route.
             ({"provider": "custom:gptoss-local", "base_url": "http://127.0.0.1:8080/v1"}, {}, True),
@@ -414,7 +426,7 @@ class TestMaybeAutoTitle:
             ({"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"}, {}, False),
         ],
     )
-    def test_title_call_waits_for_the_turn_when_it_shares_a_custom_endpoint(self, main_runtime, title_cfg, deferred):
+    def test_title_call_waits_for_the_turn_when_it_shares_a_self_hosted_endpoint(self, main_runtime, title_cfg, deferred):
         """#117296/#120558: route aliases must not bypass self-hosted title serialization.
 
         The upgrade must not go on the wire until the caller starts it after the turn when the title lane
@@ -435,6 +447,36 @@ class TestMaybeAutoTitle:
                 tg.start_title_upgrade(upgrade)
             assert started.wait(timeout=10), "auto_title thread never ran"
             assert upgrade in tg._UPGRADE_THREADS
+
+    def test_named_custom_route_from_real_config_defers(self, tmp_path, monkeypatch):
+        """Real config chain: a named custom title route that resolves to the live endpoint is deferred."""
+        home = tmp_path / "hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-oss-120b\n"
+            "  provider: gptoss-local\n"
+            "providers:\n"
+            "  gptoss-local:\n"
+            "    base_url: http://127.0.0.1:8080/v1\n"
+            "    model: gpt-oss-120b\n"
+            "auxiliary:\n"
+            "  title_generation:\n"
+            "    provider: gptoss-local\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        from hermes_cli import config as cfgmod
+        for cache_name in ("_CONFIG_CACHE", "_config_cache"):
+            cache = getattr(cfgmod, cache_name, None)
+            if hasattr(cache, "clear"):
+                cache.clear()
+
+        from agent.title_generator import title_upgrade_must_wait_for_turn
+        assert title_upgrade_must_wait_for_turn({
+            "provider": "custom:gptoss-local",
+            "base_url": "http://127.0.0.1:8080/v1",
+        }) is True
 
     def test_named_custom_route_lookup_stays_read_only(self):
         """Scheduling a title must not turn a route-identity check into a config migration/write."""
