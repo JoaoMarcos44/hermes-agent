@@ -185,6 +185,43 @@ def test_an_approved_row_installs_into_default_and_lists_the_live_tools(tmp_path
     assert call["home"].resolve() == Path(get_profile_dir("default")).resolve() != setup_home.resolve()
 
 
+def test_plugin_and_skill_with_the_same_id_install_as_separate_rows():
+    class CollisionInstaller(FakeInstaller):
+        def __init__(self):
+            super().__init__([_entry("shared")])
+            self.skill_installs = []
+
+        def skill_meta(self, identifier):
+            return {"name": "Shared Skill", "description": "Skill twin.", "source": "official",
+                    "identifier": identifier} if identifier == "shared" else None
+
+        def install_skill(self, identifier, *, force):
+            self.skill_installs.append((identifier, force))
+            return {"name": "shared-skill", "already_installed": False}
+
+    installer = CollisionInstaller()
+
+    def approve_both(payload):
+        assert [(t["kind"], t["name"]) for t in payload["targets"]] == [
+            ("plugin", "shared"), ("skill", "shared")
+        ]
+        return {"targets": [
+            {"kind": t["kind"], "name": t["name"], "status": "approved"}
+            for t in payload["targets"]
+        ]}
+
+    out = _install(
+        [{"kind": "plugin", "id": "shared"}, {"kind": "skill", "id": "shared"}],
+        installer,
+        _card(approve_both),
+    )
+    rows = {(row["kind"], row["name"]): row for row in out["targets"]}
+    assert rows[("plugin", "shared")]["state"] == TargetState.connected.value
+    assert rows[("skill", "shared")]["state"] == TargetState.connected.value
+    assert [call["name"] for call in installer.installs] == ["shared"]
+    assert installer.skill_installs == [("shared", False)]
+
+
 def test_advanced_values_pick_the_profile_force_and_pin(tmp_path):
     from hermes_cli.profiles import create_profile
 

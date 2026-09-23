@@ -227,10 +227,11 @@ export function applyOperationStatus(request: ConnectionRequest, status: Connect
     return request
   }
 
-  const byName = new Map(status.targets.map(target => [target.name, target] as const))
+  const targetKey = (target: Pick<ConnectionOperationTarget, 'kind' | 'name'>) => `${target.kind}:\0${target.name}`
+  const byName = new Map(status.targets.map(target => [targetKey(target), target] as const))
 
   const targets = request.targets.map(target => {
-    const live: ConnectionOperationTarget | undefined = byName.get(target.name)
+    const live: ConnectionOperationTarget | undefined = byName.get(targetKey(target))
 
     return live ? mergeLiveTarget(target, live) : target
   })

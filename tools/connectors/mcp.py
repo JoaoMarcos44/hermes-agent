@@ -403,7 +403,7 @@ def _move(operation: ConnectionOperation, target: Target, to: TargetState, actor
     this call. A settled operation has a frozen result, so the lost move is dropped rather than
     raised into the tool result; anything else is a real contract violation."""
     try:
-        operation.transition(target.name, to, actor, **fields)
+        operation.transition(target.name, to, actor, kind=target.kind, **fields)
         return True
     except IllegalTransition:
         if not operation.settled:
