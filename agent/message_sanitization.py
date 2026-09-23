@@ -269,7 +269,11 @@ def _repair_tool_call_arguments(
         return escaped
 
     if log_payload:
-        logger.warning("Unrepairable tool_call arguments for %s — replaced with empty object", tool_name)
+        logger.warning(
+            "Unrepairable tool_call arguments for %s: %s — replaced with empty object",
+            tool_name,
+            raw_stripped[:_FULL_ARGS_LOG_BOUND],
+        )
     return "{}"
 
 
