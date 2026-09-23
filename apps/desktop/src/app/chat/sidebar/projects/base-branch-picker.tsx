@@ -10,6 +10,18 @@ import { useI18n } from '@/i18n'
 import { $repoStatus } from '@/store/coding-status'
 import { listBaseBranches } from '@/store/projects'
 
+export function shouldLoadBaseBranches(repoPath: string, loaded: boolean, loading: boolean) {
+  return Boolean(repoPath) && !loaded && !loading
+}
+
+export function baseBranchAfterLoad(currentValue: string, branches: Pick<HermesGitBaseBranch, 'isDefault' | 'name'>[]) {
+  if (branches.length === 0 || branches.some(branch => branch.name === currentValue)) {
+    return currentValue
+  }
+
+  return branches.find(branch => branch.isDefault)?.name ?? branches[0].name
+}
+
 // Filterable combobox for picking the base branch of a new worktree. Lists
 // local + remote-tracking branches, defaults to the default branch
 // (origin/HEAD, or local main/master when no remote). The current session's
@@ -31,12 +43,13 @@ export function BaseBranchPicker({
   const repoStatus = useStore($repoStatus)
   const [branches, setBranches] = useState<HermesGitBaseBranch[]>([])
   const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(false)
   const [open, setOpen] = useState(false)
 
   const currentBranch = repoStatus?.detached ? null : (repoStatus?.branch ?? null)
 
   const load = useCallback(async () => {
-    if (!repoPath) {
+    if (!shouldLoadBaseBranches(repoPath, loaded, loading)) {
       return
     }
 
@@ -45,31 +58,28 @@ export function BaseBranchPicker({
     try {
       const list = await listBaseBranches(repoPath)
       setBranches(list)
-
-      // Default to the remote default (origin/HEAD). Fall back to the local
-      // default branch (main/master) when no remote exists. The value is
-      // always a concrete branch — never undefined.
-      const defaultBranch = list.find(b => b.isDefault)
-
-      if (defaultBranch) {
-        onValueChange(defaultBranch.name)
-      } else {
-        onValueChange(list[0]?.name ?? '')
-      }
+      setLoaded(true)
+      onValueChange(baseBranchAfterLoad(value, list))
     } catch {
       setBranches([])
+      setLoaded(true)
     } finally {
       setLoading(false)
     }
-  }, [repoPath, onValueChange])
+  }, [loaded, loading, onValueChange, repoPath, value])
+
+  useEffect(() => {
+    setBranches([])
+    setLoaded(false)
+  }, [repoPath])
 
   // Load on mount so the default branch fills in before the user opens the
   // popover — otherwise the button reads "branch off " with nothing after it.
   useEffect(() => {
-    if (branches.length === 0 && !loading) {
+    if (shouldLoadBaseBranches(repoPath, loaded, loading)) {
       void load()
     }
-  }, [branches.length, loading, load])
+  }, [load, loaded, loading, repoPath])
 
   // Pin the current session's branch to the top, keep the rest in git's
   // most-recently-committed order.
@@ -95,7 +105,7 @@ export function BaseBranchPicker({
     <div className="space-y-1.5">
       <Popover
         onOpenChange={next => {
-          if (next && branches.length === 0 && !loading) {
+          if (next && shouldLoadBaseBranches(repoPath, loaded, loading)) {
             void load()
           }
 
