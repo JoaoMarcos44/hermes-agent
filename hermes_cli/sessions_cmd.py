@@ -332,11 +332,18 @@ def _cmd_export(db, args):
         from hermes_cli.session_export_md import redact_session_data
         return redact_session_data(data)
 
+    # HTML and --only are human-readable transcript surfaces. Full-session JSONL stays live-only for import;
+    # --only remains a transcript projection when its record encoding is JSONL.
+    shown = args.format == "html" or bool(getattr(args, "only", None))
+
+    def _export_for_view(session_id):
+        return db.export_session(session_id, include_compacted=True) if shown else db.export_session(session_id)
+
     def _collect_sessions():
         """--session-id / filters / bare export -> redacted session dicts, or None after printing an error."""
         if args.session_id:
             resolved = db.resolve_session_id(args.session_id)
-            data = _redact(db.export_session(resolved)) if resolved else None
+            data = _redact(_export_for_view(resolved)) if resolved else None
             if not data:
                 _not_found(args.session_id)
                 return None
@@ -345,10 +352,11 @@ def _cmd_export(db, args):
             candidates = db.list_prune_candidates(**filters)
             if args.dry_run:
                 return _print_dry_run_preview(candidates, filters)
-            return [s for s in (_redact(db.export_session(row["id"])) for row in candidates) if s]
+            return [s for s in (_redact(_export_for_view(row["id"])) for row in candidates) if s]
         if args.dry_run:
             return print("--dry-run requires at least one filter.")
-        return [_redact(s) for s in db.export_all(source=None)]
+        exported = db.export_all(source=None, include_compacted=True) if shown else db.export_all(source=None)
+        return [_redact(s) for s in exported]
     if getattr(args, "only", None):
         return _export_flat("only", args, _collect_sessions)
     if args.format == "trace":
@@ -472,13 +480,18 @@ def _export_markdown(db, args, filters, redact):
     output_dir = _export_dir(args.output)
 
     def _export_one(session_id: str, *, include_lineage: bool = False):
-        data = db.export_session_lineage(session_id) if include_lineage else db.export_session(session_id)
-        if not data:
-            return None, None
-        data = redact(data)
+        export = db.export_session_lineage if include_lineage else db.export_session
+        raw_data = export(session_id, include_compacted=True)
+        if not raw_data:
+            return None, None, None
+        snapshots = {
+            segment["id"]: segment.get("messages") or []
+            for segment in (raw_data.get("segments") or [raw_data]) if segment.get("id")
+        }
+        data = redact(raw_data)
         path = write_session_markdown(data, output_dir, fmt=args.format, force=args.force)
         append_manifest_entry(output_dir, data, path, fmt=args.format)
-        return data, path
+        return data, path, snapshots
     if args.delete_after_verified and not args.yes:
         print("--delete-after-verified requires --yes.")
         return
@@ -498,7 +511,7 @@ def _export_markdown(db, args, filters, redact):
     exported = 0
     for row in candidates:
         try:
-            data, exported_path = _export_one(row["id"], include_lineage=lineage_is_logical)
+            data, exported_path, _ = _export_one(row["id"], include_lineage=lineage_is_logical)
         except FileExistsError as e:
             print(f"Skipping existing export: {e}. Pass --force to overwrite.")
             continue
@@ -520,7 +533,7 @@ def _export_markdown_single(db, args, export_one, output_dir, lineage_is_logical
     exported_items = []
     for target_id in delete_target_ids:
         try:
-            data, exported_path = export_one(
+            data, exported_path, snapshots = export_one(
                 target_id, include_lineage=(target_id == resolved_session_id and lineage_is_logical),
             )
         except FileExistsError as e:
@@ -529,22 +542,32 @@ def _export_markdown_single(db, args, export_one, output_dir, lineage_is_logical
         if not data or not exported_path:
             print(f"Session '{target_id}' disappeared during export; nothing was deleted.")
             return
-        exported_items.append((data, exported_path))
-    message_count = sum(len(data.get("messages") or []) for data, _path in exported_items)
+        exported_items.append((data, exported_path, snapshots))
+    message_count = sum(len(data.get("messages") or []) for data, _path, _ in exported_items)
     n = len(exported_items)
     print(f"Exported {n} session{'' if n == 1 else 's'} ({message_count} message{'' if message_count == 1 else 's'}) "
           f"to {exported_items[0][1] if n == 1 else output_dir}")
     if not args.delete_after_verified:
         return
-    for data, exported_path in exported_items:
+    expected_messages = {}
+    for data, exported_path, snapshots in exported_items:
         ok, reason = verify_export_file(exported_path, data)
         if not ok:
             print(f"Export verification failed; not deleting session '{data.get('id')}': {reason}")
             return
+        for covered_id, snapshot in snapshots.items():
+            previous = expected_messages.get(covered_id)
+            if previous is not None and previous != snapshot:
+                print(f"Export verification failed; not deleting session '{data.get('id')}': "
+                      f"session '{covered_id}' changed while the export set was being built")
+                return
+            expected_messages[covered_id] = snapshot
     if not db.delete_session(
-        resolved_session_id, sessions_dir=_sessions_dir(), expected_delete_ids=delete_target_ids
+        resolved_session_id, sessions_dir=_sessions_dir(), expected_delete_ids=delete_target_ids,
+        expected_display_messages=expected_messages,
     ):
-        print(f"Exported, but session '{resolved_session_id}' was not deleted because its delegate set changed.")
+        print(f"Exported, but session '{resolved_session_id}' was not deleted because its history or delegate set "
+              "changed after export.")
         return
     delegates = len(delete_target_ids) - 1
     delegate_suffix = f" and {delegates} delegate session{'' if delegates == 1 else 's'}" if delegates else ""

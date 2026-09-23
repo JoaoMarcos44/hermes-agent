@@ -207,6 +207,9 @@ def _fenced_text(text: str, *, language: str = "text") -> str:
 # --- Current-session save helper (shared by CLI /save and gateway /save) ---
 
 SAVE_FORMATS = ("json", "md", "html")
+# Human-readable transcripts mirror the history the user sees. JSON remains live-only because
+# import_sessions would otherwise restore compacted archive rows as live model context.
+SAVE_TRANSCRIPT_FORMATS = frozenset({"md", "html"})
 
 SAVE_USAGE = """/save — export the current session to a file
 Usage: /save <format> [filename] [redact]
