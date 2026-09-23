@@ -97,7 +97,7 @@ def _install(items, installer, card):
 
 
 def _approve(env=None):
-    return lambda payload: {"targets": [{"name": t["name"], "status": "approved", "env": env}
+    return lambda payload: {"targets": [{"kind": t["kind"], "name": t["name"], "status": "approved", "env": env}
                                         for t in payload["targets"] if t["state"] == "pending"]}
 
 
@@ -183,6 +183,19 @@ def test_an_approved_row_installs_into_default_and_lists_the_live_tools(tmp_path
     (call,) = installer.installs
     assert (call["force"], call["enable"], call["ref"]) == (False, True, None)
     assert call["home"].resolve() == Path(get_profile_dir("default")).resolve() != setup_home.resolve()
+
+
+def test_name_only_lookup_fails_closed_when_catalog_rows_collide():
+    from tools.connectors.operation import ConnectionOperation, Target
+
+    operation = ConnectionOperation([
+        Target(name="shared", kind="plugin", action="install"),
+        Target(name="shared", kind="skill", action="install"),
+    ])
+
+    assert operation.target("shared") is None
+    assert operation.target("shared", "plugin").kind == "plugin"
+    assert operation.target("shared", "skill").kind == "skill"
 
 
 def test_plugin_and_skill_with_the_same_id_install_as_separate_rows():

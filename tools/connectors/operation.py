@@ -93,7 +93,10 @@ class ConnectionOperation:
             self.deadline_at = self.created_at + OPERATION_DEADLINE_SECONDS
 
     def target(self, name: str, kind: Optional[str] = None) -> Optional[Target]:
-        return next((t for t in self.targets if t.name == name and (kind is None or t.kind == kind)), None)
+        matches = [t for t in self.targets if t.name == name and (kind is None or t.kind == kind)]
+        # Legacy callers may omit kind while names are unique. Once two rows share a name, choosing
+        # the first would mutate the wrong row; require the discriminator instead.
+        return matches[0] if len(matches) == 1 else None
 
     def transition(
         self, name: str, to: TargetState, actor: Actor, *, kind: Optional[str] = None, detail: Optional[str] = None,

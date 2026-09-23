@@ -140,6 +140,9 @@ const settleReason = oneOf(SETTLE_REASONS)
 export const isCatalogKind = (kind: ConnectionTargetKind): kind is 'plugin' | 'skill' =>
   kind === 'plugin' || kind === 'skill'
 
+const connectionTargetKey = (target: Pick<ConnectionOperationTarget, 'kind' | 'name'>): string =>
+  `${target.kind}:\0${target.name}`
+
 function catalogEntry(entry: ConnectionOperationTarget, name: string): CatalogEntry {
   return {
     appState: entry.app_state ?? null,
@@ -227,11 +230,10 @@ export function applyOperationStatus(request: ConnectionRequest, status: Connect
     return request
   }
 
-  const targetKey = (target: Pick<ConnectionOperationTarget, 'kind' | 'name'>) => `${target.kind}:\0${target.name}`
-  const byName = new Map(status.targets.map(target => [targetKey(target), target] as const))
+  const byIdentity = new Map(status.targets.map(target => [connectionTargetKey(target), target] as const))
 
   const targets = request.targets.map(target => {
-    const live: ConnectionOperationTarget | undefined = byName.get(targetKey(target))
+    const live: ConnectionOperationTarget | undefined = byIdentity.get(connectionTargetKey(target))
 
     return live ? mergeLiveTarget(target, live) : target
   })
