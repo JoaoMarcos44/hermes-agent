@@ -321,7 +321,41 @@ def test_idle_phase_policy_is_narrow_and_preserves_operator_overrides(
     assert watchdogs.est_tokens == input_chars // 4
     assert watchdogs.idle_enabled is idle_enabled
     assert watchdogs.idle_requires_progress is requires_progress
-    assert (watchdogs.progress_timeout > 0) is requires_progress
+    assert watchdogs.progress_timeout == (watchdogs.idle_timeout if requires_progress else 0.0)
+
+
+@pytest.mark.parametrize(("input_chars", "expected"), [
+    (40_004, 60.0),
+    (240_004, 120.0),
+    (440_004, 180.0),
+])
+def test_first_progress_budget_reuses_context_scaled_idle_policy(tmp_path, monkeypatch, input_chars, expected):
+    """Pre-progress uses the existing implicit idle budget instead of a parallel fixed timeout."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    agent.reasoning_config = {"enabled": False}
+    wd = h._resolve_nonstream_watchdogs(
+        agent, {"model": "gpt-5.6-sol", "input": "x" * input_chars}
+    )
+
+    assert wd.idle_requires_progress
+    assert wd.idle_timeout == expected
+    assert wd.progress_timeout == expected
+
+
+def test_high_effort_first_progress_keeps_reasoning_floor(tmp_path, monkeypatch):
+    """#112909: high-effort silent reasoning still receives the full 300s grace."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    agent.reasoning_config = {"enabled": True, "effort": "high"}
+    wd = h._resolve_nonstream_watchdogs(
+        agent, {"model": "gpt-5.6-sol", "input": "x" * 40_004}
+    )
+
+    assert wd.idle_requires_progress
+    assert wd.progress_timeout == wd.idle_timeout == h.HIGH_EFFORT_SILENCE_FLOOR_SECONDS
 
 
 def test_lifecycle_event_does_not_restart_first_progress_deadline():

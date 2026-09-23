@@ -1216,7 +1216,7 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
         idle_timeout=idle_timeout, idle_requires_progress=progress_gated,
         # A lifecycle frame proves transport liveness, not model progress. Bound that phase
         # from the physical-attempt start; events cannot restart the grace period.
-        progress_timeout=HIGH_EFFORT_SILENCE_FLOOR_SECONDS if progress_gated else 0.0)
+        progress_timeout=idle_timeout if progress_gated else 0.0)
 
 
 def _codex_silent_hang_hint(agent, api_kwargs: dict) -> Optional[str]:
