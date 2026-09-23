@@ -265,7 +265,12 @@ def _repair_tool_call_arguments(
     escaped = _escape_invalid_chars_in_json_strings(fixed)
     if escaped != fixed and _loads_ok(escaped):
         if log_payload:
-            logger.warning("Repaired control-char-laced tool_call arguments for %s", tool_name)
+            logger.warning(
+                "Repaired control-char-laced tool_call arguments for %s: %s → %s",
+                tool_name,
+                raw_stripped[:80],
+                escaped[:80],
+            )
         return escaped
 
     if log_payload:
