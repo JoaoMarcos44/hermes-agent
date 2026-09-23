@@ -1,8 +1,9 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, beforeEach, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { listBaseBranches } from '@/store/projects'
 
 import { BaseBranchPicker } from './base-branch-picker'
-import { listBaseBranches } from '@/store/projects'
 
 vi.mock('@/store/projects', () => ({ listBaseBranches: vi.fn() }))
 vi.mock('@/store/coding-status', () => ({ $repoStatus: { subscribe: () => () => undefined } }))
@@ -30,6 +31,7 @@ const branch = (name: string, isDefault = false): Branch => ({ name, isDefault, 
 function deferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>(r => { resolve = r })
+
   return { promise, resolve }
 }
 
@@ -41,13 +43,13 @@ describe('BaseBranchPicker', () => {
     const request = deferred<Branch[]>()
     vi.mocked(listBaseBranches).mockReturnValue(request.promise)
     const onValueChange = vi.fn()
-    const view = render(<BaseBranchPicker repoPath="A" value="" onValueChange={onValueChange} />)
+    const view = render(<BaseBranchPicker onValueChange={onValueChange} repoPath="A" value="" />)
 
     await act(async () => {
       request.resolve([])
       await request.promise
     })
-    view.rerender(<BaseBranchPicker repoPath="A" value="" onValueChange={onValueChange} />)
+    view.rerender(<BaseBranchPicker onValueChange={onValueChange} repoPath="A" value="" />)
     fireEvent.click(screen.getByRole('button'))
     fireEvent.click(screen.getByRole('button'))
 
@@ -60,9 +62,9 @@ describe('BaseBranchPicker', () => {
     const b = deferred<Branch[]>()
     vi.mocked(listBaseBranches).mockImplementation(path => path === 'A' ? a.promise : b.promise)
     const onValueChange = vi.fn()
-    const view = render(<BaseBranchPicker repoPath="A" value="" onValueChange={onValueChange} />)
-    view.rerender(<BaseBranchPicker repoPath="B" value="" onValueChange={onValueChange} />)
-    view.rerender(<BaseBranchPicker repoPath="B" value="chosen" onValueChange={onValueChange} />)
+    const view = render(<BaseBranchPicker onValueChange={onValueChange} repoPath="A" value="" />)
+    view.rerender(<BaseBranchPicker onValueChange={onValueChange} repoPath="B" value="" />)
+    view.rerender(<BaseBranchPicker onValueChange={onValueChange} repoPath="B" value="chosen" />)
 
     await act(async () => {
       a.resolve([branch('a-main', true)])
@@ -74,7 +76,7 @@ describe('BaseBranchPicker', () => {
       b.resolve([branch('b-main', true), branch('chosen')])
       await b.promise
     })
-    await waitFor(() => expect(screen.getByText('chosen')).toBeTruthy())
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /chosen/i }).find(button => button.textContent?.startsWith('branch off chosen'))).toBeTruthy())
     expect(onValueChange).not.toHaveBeenCalled()
     expect(listBaseBranches).toHaveBeenCalledTimes(2)
   })

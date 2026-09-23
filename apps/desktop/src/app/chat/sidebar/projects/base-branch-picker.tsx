@@ -63,17 +63,28 @@ export function BaseBranchPicker({
 
     void listBaseBranches(repoPath)
       .then(list => {
-        if (!active) return
+        if (!active) {
+          return
+        }
+
         setBranches(list)
+
         if (valueRef.current === valueAtRequest) {
-          onValueChangeRef.current(baseBranchAfterLoad(valueAtRequest, list))
+          const nextValue = baseBranchAfterLoad(valueAtRequest, list)
+          if (nextValue !== valueAtRequest) {
+            onValueChangeRef.current(nextValue)
+          }
         }
       })
       .catch(() => {
-        if (active) setBranches([])
+        if (active) {
+          setBranches([])
+        }
       })
       .finally(() => {
-        if (active) setLoading(false)
+        if (active) {
+          setLoading(false)
+        }
       })
 
     return () => {
