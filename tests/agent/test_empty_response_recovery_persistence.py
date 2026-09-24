@@ -183,7 +183,7 @@ def real_empty_recovery_loop(tmp_path, monkeypatch):
     agent.compression_enabled = False
     agent.save_trajectories = False
 
-    def run(script, user_message):
+    def run(script, user_message, conversation_history=None):
         pending = list(script)
         agent.client = MagicMock()
 
@@ -192,7 +192,10 @@ def real_empty_recovery_loop(tmp_path, monkeypatch):
             return item(**kwargs) if callable(item) else item
 
         agent.client.chat.completions.create.side_effect = next_response
-        return agent.run_conversation(user_message)
+        return agent.run_conversation(
+            user_message,
+            conversation_history=conversation_history,
+        )
 
     yield SimpleNamespace(
         agent=agent,
@@ -267,6 +270,7 @@ def test_real_turn_empty_give_up_keeps_executed_write_in_next_model_context(
     second = loop.run(
         [answer_without_repeating_tool],
         "did it work? if not, do it again",
+        conversation_history=first["messages"],
     )
 
     assert second["final_response"] == "The payment write already completed."
