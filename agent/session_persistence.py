@@ -345,7 +345,8 @@ class SessionPersistenceMixin:
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save to SQLite on any exit path. Trailing empty-response scaffolding is dropped from
-        the live list; the persist override is applied to the DB row only.
+        the live list; if that exposes an executed tool result, the turn is closed instead of
+        rewound. The persist override is applied to the DB row only.
 
         The persist user-message *override* is NOT applied here — it is resolved inside
         ``_flush_messages_to_session_db`` and written only to the DB row, never mutating the live message
