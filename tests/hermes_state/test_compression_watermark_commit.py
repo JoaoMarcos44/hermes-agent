@@ -14,6 +14,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,22 @@ def _seed(db: SessionDB, n: int = 6) -> None:
     for i in range(n):
         role = "user" if i % 2 == 0 else "assistant"
         db.append_message("sess1", role=role, content=f"turn {i}")
+
+
+def _prefix_proof(db: SessionDB, messages=None):
+    held = messages if messages is not None else db.get_messages_as_conversation("sess1", include_row_ids=True)
+    proof = db.match_active_message_prefix_proof("sess1", held)
+    assert proof is not None
+    return proof
+
+
+@contextmanager
+def _rewrite_lease(db: SessionDB, holder: str):
+    assert db.try_acquire_compression_lock("sess1", holder) is True
+    try:
+        yield
+    finally:
+        db.release_compression_lock("sess1", holder)
 
 
 SUMMARY = [
@@ -59,6 +76,108 @@ class TestWatermarkCommit:
             "mid-compression reply",
         ], "tail must follow the summary, in arrival order"
         assert count == 4
+
+    def test_expected_prefix_derives_watermark_and_keeps_unseen_tail(self, db: SessionDB) -> None:
+        _seed(db)
+        held_ids, held_digest = _prefix_proof(db)
+        holder = "prefix-worker"
+        with _rewrite_lease(db, holder):
+            # Appends are deliberately not blocked by the rewrite lease.
+            db.append_message("sess1", role="user", content="foreign turn")
+            db.archive_and_compact(
+                "sess1", SUMMARY,
+                expected_active_prefix_ids=held_ids,
+                expected_active_prefix_digest=held_digest,
+                lock_holder=holder,
+            )
+
+        assert [row["content"] for row in db.get_messages("sess1")] == [
+            SUMMARY[0]["content"], SUMMARY[1]["content"], "foreign turn",
+        ]
+
+    @pytest.mark.parametrize("mutation", ["generation", "payload", "closed"])
+    def test_expected_prefix_refuses_stale_source(self, db: SessionDB, mutation: str) -> None:
+        _seed(db)
+        held = db.get_messages_as_conversation("sess1", include_row_ids=True)
+        held_ids, held_digest = _prefix_proof(db, held)
+        holder = f"{mutation}-worker"
+        with _rewrite_lease(db, holder):
+            if mutation == "generation":
+                db.archive_and_compact("sess1", SUMMARY, watermark=held_ids[-1])
+            elif mutation == "payload":
+                first = held[0]
+                assert db.set_message_api_content(
+                    "sess1", first["_row_id"], first["content"], "late provider-side context",
+                ) == 1
+            else:
+                db.end_session("sess1", "compression")
+
+            with pytest.raises(SessionCompressionInProgressError):
+                db.archive_and_compact(
+                    "sess1", SUMMARY, expected_active_prefix_ids=held_ids,
+                    expected_active_prefix_digest=held_digest, lock_holder=holder,
+                )
+
+        if mutation == "payload":
+            current = db.get_messages_as_conversation("sess1", include_row_ids=True)
+            assert current[0]["api_content"] == "late provider-side context"
+
+    def test_expected_prefix_requires_rewrite_lease(self, db: SessionDB) -> None:
+        _seed(db, 2)
+        held_ids, held_digest = _prefix_proof(db)
+        with pytest.raises(ValueError, match="lock_holder"):
+            db.archive_and_compact(
+                "sess1", SUMMARY, expected_active_prefix_ids=held_ids,
+                expected_active_prefix_digest=held_digest,
+            )
+
+    def test_live_platform_message_id_matches_replayed_message_id(self, db: SessionDB) -> None:
+        user_id = db.append_message("sess1", "user", "gateway turn", platform_message_id="telegram-42")
+        assistant_id = db.append_message("sess1", "assistant", "gateway reply")
+        held = [
+            {"role": "user", "content": "gateway turn", "platform_message_id": "telegram-42",
+             "_row_id": user_id, "_db_persisted": True},
+            {"role": "assistant", "content": "gateway reply", "_row_id": assistant_id, "_db_persisted": True},
+        ]
+        proof = db.match_active_message_prefix_proof("sess1", held)
+        assert proof is not None and proof[0] == [user_id, assistant_id]
+    @pytest.mark.parametrize("case", ["equal", "replaced-model-switch"])
+    def test_unstamped_durable_identity_is_ambiguous(self, db: SessionDB, case: str) -> None:
+        _seed(db, 2)
+        held = db.get_messages_as_conversation("sess1", include_row_ids=True)
+        if case == "equal":
+            held.append({"role": "user", "content": "yes"})
+            db.append_message("sess1", "user", "yes")
+        else:
+            old = "[System: The active model for this chat has changed to test/old.]"
+            new = "[System: The active model for this chat has changed to test/new.]"
+            db.append_message("sess1", "user", old, display_kind="model_switch")
+            held.append({"role": "user", "content": new, "display_kind": "model_switch"})
+            db.append_message("sess1", "user", new, display_kind="model_switch")
+        assert db.match_active_message_prefix_proof("sess1", held) is None
+    def test_unstamped_unmatched_suffix_remains_in_memory_tail(self, db: SessionDB) -> None:
+        _seed(db, 2)
+        held = db.get_messages_as_conversation("sess1", include_row_ids=True)
+        held.append({"role": "user", "content": "fresh local turn"})
+
+        proof = db.match_active_message_prefix_proof("sess1", held)
+
+        assert proof is not None
+        resolved, _digest = proof
+        assert len(resolved) == 2
+
+    @pytest.mark.parametrize("include_row_ids", [False, True])
+    def test_prefix_rejects_stale_provider_sidecar(
+        self, db: SessionDB, include_row_ids: bool,
+    ) -> None:
+        _seed(db, 2)
+        held = db.get_messages_as_conversation("sess1", include_row_ids=include_row_ids)
+        row_id = db.get_messages("sess1")[0]["id"]
+        assert db.set_message_api_content(
+            "sess1", row_id, held[0]["content"], "newer provider-side context",
+        ) == 1
+
+        assert db.match_active_message_prefix_proof("sess1", held) is None
 
     def test_tail_clone_preserves_every_column(self, db: SessionDB) -> None:
         """The pure-SQL clone must carry sidecar fields byte-exact."""

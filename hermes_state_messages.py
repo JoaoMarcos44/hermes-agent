@@ -57,6 +57,39 @@ _DISPLAY_INDEX_MISSING_SQL = ("SELECT 1 FROM messages WHERE session_id = ?" + _D
 _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 ORDER BY id"
 _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls FROM messages "
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
+_ARCHIVE_SOURCE_PROOF_KEYS = (
+    "role", "content", "api_content", "tool_call_id", "tool_calls", "tool_name",
+    "effect_disposition", "finish_reason", "reasoning", "reasoning_content",
+    "reasoning_details", "codex_reasoning_items", "codex_message_items", "message_id",
+    "observed", "_compressed_summary", "timestamp", "display_kind", "display_metadata",
+)
+
+
+def _archive_source_payload(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonical persisted replay/display payload for destructive-rewrite proof."""
+    payload = {
+        key: message[key] for key in _ARCHIVE_SOURCE_PROOF_KEYS
+        if key in message and message[key] is not None
+    }
+    if "message_id" not in message and message.get("platform_message_id") is not None:
+        payload["message_id"] = message["platform_message_id"]
+    return payload
+
+
+def _archive_source_matches(held: Dict[str, Any], live: Dict[str, Any]) -> bool:
+    if "role" not in held or "content" not in held:
+        return False
+    expected, actual = _archive_source_payload(held), _archive_source_payload(live)
+    if "timestamp" not in held:
+        actual.pop("timestamp", None)
+    return expected == actual
+
+def _archive_source_digest(messages: List[Dict[str, Any]]) -> str:
+    raw = json.dumps(
+        [_archive_source_payload(message) for message in messages],
+        sort_keys=True, default=str, ensure_ascii=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
@@ -624,6 +657,63 @@ class SessionMessagesMixin:
             kept += 1
         return kept
 
+    def match_active_message_prefix_proof(
+        self, session_id: str, messages: List[Dict[str, Any]],
+    ) -> Optional[Tuple[List[int], str]]:
+        """Resolve the active prefix represented by *messages* without trusting caller markers.
+
+        Proven rows extend the prefix. An exact row without provenance is ambiguous and fails closed;
+        a nonmatching unstamped row is fresh only when no later durable row already represents it.
+        """
+        if not session_id or any(not isinstance(message, dict) for message in messages):
+            return None
+        rows = self._read_all(
+            "SELECT * FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+            (session_id,),
+        )
+        current = self._rows_to_conversation(
+            rows, session_id=session_id, include_ancestors=False,
+            repair_alternation=False, include_row_ids=True, include_summary_markers=True,
+        )
+
+        resolved: List[int] = []
+        matched: List[Dict[str, Any]] = []
+        split = len(messages)
+        for index, held in enumerate(messages):
+            if index >= len(current):
+                split = index
+                break
+            live = current[index]
+            row_id = live.get("_row_id")
+            explicit = held.get("_row_id") if "_row_id" in held else None
+            if not isinstance(row_id, int) or isinstance(row_id, bool) or row_id <= 0:
+                return None
+            if "_row_id" in held and (
+                not isinstance(explicit, int) or isinstance(explicit, bool)
+                or explicit <= 0 or explicit != row_id
+            ):
+                return None
+            matches = _archive_source_matches(held, live)
+            has_provenance = "_row_id" in held or bool(held.get(_DB_PERSISTED_MARKER_KEY))
+            if not has_provenance:
+                if matches:  # equal payload cannot prove same-vs-fresh logical identity
+                    return None
+                split = index
+                break
+            if not matches:
+                return None
+            resolved.append(row_id)
+            matched.append(live)
+
+        # An unstamped tail is fresh only if no later durable row already represents it.
+        durable_tail = current[split:]
+        for message in messages[split:]:
+            if "_row_id" in message or message.get(_DB_PERSISTED_MARKER_KEY):
+                return None
+            if any(_archive_source_matches(message, live) for live in durable_tail):
+                return None
+        return resolved, _archive_source_digest(matched)
+
     @staticmethod
     def _loaded_view_content(role: str, content: Any) -> Any:
         """Content as ``_rows_to_messages`` hands it to callers: user/assistant strings are sanitized and
@@ -735,12 +825,19 @@ class SessionMessagesMixin:
     def archive_and_compact(self, session_id: str, compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None, watermark: Optional[int] = None,
         lock_holder: Optional[str] = None, tail_count: int = 0,
-        carried_messages: Optional[List[Dict[str, Any]]] = None) -> int:
+        carried_messages: Optional[List[Dict[str, Any]]] = None,
+        expected_active_prefix_ids: Optional[List[int]] = None,
+        expected_active_prefix_digest: Optional[str] = None) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
         START): rows ``id > watermark`` arrived during the slow summary and are re-sequenced after the
-        compacted set by a pure-SQL clone (fresh ids); ``None`` archives everything. *lock_holder*: verified
+        compacted set by a pure-SQL clone (fresh ids); ``None`` archives everything.
+        *expected_active_prefix_ids* plus *expected_active_prefix_digest* form a transaction-local
+        source-generation CAS: with a live *lock_holder*, both the active row ids and their persisted
+        replay/display payload must still match what the caller observed. Later ids are preserved as
+        the concurrent tail. An empty list proves an empty durable source.
+        *lock_holder*: verified
         in-txn so a reclaimed lease fails instead of clobbering the winner. *tail_count*: the LAST N compacted
         rows are the verbatim carried tail; *carried_messages* names exact durable originals carried forward
         verbatim when they are not a contiguous suffix (micro-compaction's prefix + marker + suffix shape).
@@ -758,29 +855,75 @@ class SessionMessagesMixin:
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
         """
         from hermes_state import SessionCompressionInProgressError
+        # _insert_message_rows stamps timestamp/_row_id on its inputs. Keep those writes
+        # transaction-local so a later SQLite failure cannot publish rolled-back row ids
+        # into the caller's live transcript.
+        pending_messages = [dict(message) for message in compacted_messages]
         def _do(conn):
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
+
+            effective_watermark = watermark
+            if expected_active_prefix_ids is not None:
+                if lock_holder is None:
+                    raise ValueError("expected_active_prefix_ids requires a compression lock_holder")
+                if not isinstance(expected_active_prefix_digest, str) or not expected_active_prefix_digest:
+                    raise ValueError("expected_active_prefix_ids requires expected_active_prefix_digest")
+                session_row = conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()
+                if session_row is None or session_row["ended_at"] is not None:
+                    raise SessionCompressionInProgressError(
+                        f"Session {session_id!r} closed before compaction commit; refusing to rewrite a stale parent")
+
+                expected = [int(rid) for rid in expected_active_prefix_ids]
+                if expected != sorted(set(expected)) or any(rid <= 0 for rid in expected):
+                    raise ValueError("expected_active_prefix_ids must be an ordered set of positive row ids")
+                if expected:
+                    rows = conn.execute(
+                        "SELECT * FROM messages WHERE session_id = ? AND active = 1 AND id <= ? ORDER BY id",
+                        (session_id, expected[-1]),
+                    ).fetchall()
+                    actual = [int(row["id"]) for row in rows]
+                    current = self._rows_to_conversation(
+                        rows, session_id=session_id, include_ancestors=False,
+                        repair_alternation=False, include_row_ids=True, include_summary_markers=True,
+                    )
+                    if (
+                        actual != expected
+                        or len(current) != len(expected)
+                        or _archive_source_digest(current) != expected_active_prefix_digest
+                    ):
+                        raise SessionCompressionInProgressError(
+                            f"Session {session_id!r} active history changed before compaction commit")
+                    effective_watermark = expected[-1]
+                else:
+                    active_row = conn.execute(
+                        "SELECT id FROM messages WHERE session_id = ? AND active = 1 ORDER BY id LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if active_row is not None or expected_active_prefix_digest != _archive_source_digest([]):
+                        raise SessionCompressionInProgressError(
+                            f"Session {session_id!r} gained active history before compaction commit")
+                    effective_watermark = 0
             patch = model_config_patch is not None
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(
                 conn, session_id, model_config_patch, on_missing="raise") if patch else None
-            tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
+            tail_ids, tail_tool_calls = ([], 0) if effective_watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
-                (session_id, int(watermark)))
+                (session_id, int(effective_watermark)))
             # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
                 conn, session_id, carried_messages or [])
             if tail_count > 0:
-                bound = watermark is not None
+                bound = effective_watermark is not None
                 rewind_ids += [int(row["id"]) for row in conn.execute(
                     f"SELECT id FROM messages WHERE session_id = ? AND active = 1{' AND id <= ?' if bound else ''} "
                     "ORDER BY id DESC LIMIT ?",
-                    (session_id, *((int(watermark),) if bound else ()), int(tail_count))).fetchall()]
+                    (session_id, *((int(effective_watermark),) if bound else ()), int(tail_count))).fetchall()]
             rewind_ids += tail_ids
             rewind_ids = list(dict.fromkeys(rewind_ids))
             if rewind_ids:
@@ -790,7 +933,7 @@ class SessionMessagesMixin:
                 conn.execute(f"{_ARCHIVE_ACTIVE_SQL} AND id NOT IN ({placeholders})", [session_id, *rewind_ids])
             else:
                 conn.execute(_ARCHIVE_ACTIVE_SQL, (session_id,))
-            inserted, tool_calls_total = self._insert_message_rows(conn, session_id, compacted_messages)
+            inserted, tool_calls_total = self._insert_message_rows(conn, session_id, pending_messages)
             if tail_ids:
                 self._clone_message_rows(conn, tail_ids)
                 inserted += len(tail_ids)
@@ -798,7 +941,12 @@ class SessionMessagesMixin:
             conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
                 (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
             return inserted
-        return self._execute_write(_do)
+        inserted = self._execute_write(_do)
+        for live, committed in zip(compacted_messages, pending_messages):
+            live["timestamp"] = committed["timestamp"]
+            if "_row_id" in committed:
+                live["_row_id"] = committed["_row_id"]
+        return inserted
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""
