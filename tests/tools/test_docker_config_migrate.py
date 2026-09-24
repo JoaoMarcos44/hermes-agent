@@ -101,19 +101,34 @@ def test_docker_config_migrate_skips_below_floor_config_untouched(tmp_path: Path
     assert not list(tmp_path.glob("*.bak-*"))
 
 
-def test_docker_config_migrate_skips_unversioned_config_untouched(tmp_path: Path) -> None:
-    """Unversioned configs coerce to version 0 — below the floor, so refused."""
+def test_docker_config_migrate_recovers_unversioned_config_without_rewriting_choices(
+    tmp_path: Path,
+) -> None:
+    """Missing provenance is recovered, not misclassified as an unsupported v0 schema."""
     config_path = tmp_path / "config.yaml"
-    original = yaml.safe_dump({"model": {"default": "m", "provider": "openrouter"}})
-    config_path.write_text(original, encoding="utf-8")
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"default": "m", "provider": "openrouter"},
+                "display": {"personality": "kawaii"},
+                "compression": {"summary_model": "legacy/summary"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
 
     proc = _run_migration(tmp_path)
 
     assert proc.returncode == 0, proc.stderr
-    assert "Migrating config schema" not in proc.stdout
-    assert "can no longer be auto-migrated" in proc.stderr
-    assert config_path.read_text(encoding="utf-8") == original
-    assert not list(tmp_path.glob("*.bak-*"))
+    assert "Migrating config schema 0 ->" in proc.stdout
+    assert "can no longer be auto-migrated" not in proc.stderr
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+    assert raw["model"] == {"default": "m", "provider": "openrouter"}
+    assert raw["display"]["personality"] == "kawaii"
+    assert raw["auxiliary"]["compression"]["model"] == "legacy/summary"
+    assert list((tmp_path / "backups" / "config").glob("config.yaml.pre-docker-migrate.*"))
 
 
 def test_docker_config_migrate_does_not_rewrite_invalid_yaml(tmp_path: Path) -> None:
