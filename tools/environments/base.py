@@ -217,6 +217,7 @@ def _file_mtime_key(host_path: str) -> tuple[float, int] | None:
     except OSError:
         return None
 
+
 def extract_framed_payload(output: str, marker: str) -> str | None:
     """Return text between exactly two marker-only lines, ignoring surrounding shell noise."""
     if not output or not marker:
@@ -314,7 +315,7 @@ class BaseEnvironment(ABC):
         result = self.execute(
             f"set +x 2>/dev/null; [ -f {quoted} ] || exit 1; echo {marker}; "
             f"head -c {max_bytes + 1} < {quoted} | base64; "
-            f"__hh=${PIPESTATUS[0]} __hb=${PIPESTATUS[1]}; echo {marker}; "
+            f"__hh=${{PIPESTATUS[0]}} __hb=${{PIPESTATUS[1]}}; echo {marker}; "
             f"[ \"$__hh\" -eq 0 ] && [ \"$__hb\" -eq 0 ]",
             timeout=_FETCH_TIMEOUT_SECONDS, rewrite_compound_background=False)
         output = result.get("output") or ""
