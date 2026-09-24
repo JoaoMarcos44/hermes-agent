@@ -673,6 +673,9 @@ class TestMicroCompaction:
         captured = {}
 
         class _DB:
+            def refresh_compression_lock(self, *_args, **_kwargs):
+                return True
+
             def archive_and_compact(self, session_id, messages, **kwargs):
                 captured["session_id"] = session_id
                 captured["messages"] = messages
@@ -694,11 +697,15 @@ class TestMicroCompaction:
             {"role": "assistant", "content": "rewritten", "_row_id": 16},
         ]
 
-        cc._sync_micro_compact_to_db(compacted)
+        guard = ("micro-test-holder", [11, 15, 16], "micro-test-digest")
+        assert cc._sync_micro_compact_to_db(compacted, rewrite_guard=guard) is True
 
         assert captured["session_id"] == "sess"
         carried = captured["kwargs"].get("carried_messages")
         assert [message.get("_row_id") for message in carried] == [11, 15]
+        assert captured["kwargs"]["expected_active_prefix_ids"] == [11, 15, 16]
+        assert captured["kwargs"]["expected_active_prefix_digest"] == "micro-test-digest"
+        assert captured["kwargs"]["lock_holder"] == "micro-test-holder"
         assert "tail_count" not in captured["kwargs"]
 
     def test_splice_preserves_db_persisted_stamps(self):
@@ -732,10 +739,7 @@ class TestMicroCompaction:
 
 
 class TestDefragFlushCursorInvalidation:
-    """Sibling of the finalize_turn pop site (#75170): defrag pops
-    _DB_PERSISTED_MARKER from the live marker dict in place, so the bounded
-    flush-scan cursor must be invalidated or the rewritten summary is
-    identity-skipped and never re-persisted."""
+    """A replacement defrag marker must invalidate the bounded flush-scan snapshot."""
 
     def _defrag_setup(self):
         from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -760,9 +764,8 @@ class TestDefragFlushCursorInvalidation:
 
         markers = _summary_markers(result)
         assert len(markers) == 1
-        # The pop happened in place on the live dict...
         assert not markers[0].get(_DB_PERSISTED_MARKER)
-        # ...so the compressor must flag the flush-scan cursor stale.
+        # The replacement marker makes the prior identity snapshot stale.
         assert cc._flush_scan_cursor_invalidated is True
 
     def test_no_defrag_no_flag(self):
@@ -859,3 +862,138 @@ def test_superseding_marker_never_shows_a_user_input_twice_in_display_history(tm
     finally:
         legacy.close()
         db.close()
+
+
+def _durable_micro_case(tmp_path, sid: str, *, row_ids: bool = True, summary: str = ""):
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(sid, source="cli")
+    messages = _conversation(exchanges=8)
+    for msg in messages:
+        row_id = db.append_message(sid, role=msg["role"], content=msg["content"])
+        if row_ids:
+            msg["_row_id"] = row_id
+        msg[_DB_PERSISTED_MARKER] = True
+    cc = _compressor(summary=summary)
+    cc._session_db, cc._session_id = db, sid
+    return db, messages, cc
+
+
+def test_micro_compaction_preserves_append_that_lands_during_summary(tmp_path):
+    sid = "snapshot-during-summary"
+    db, messages, cc = _durable_micro_case(tmp_path, sid)
+    foreign = "[from Telegram] keep this concurrent steer"
+
+    def summarize(_text):
+        # Appends do not take the compression lease: they must survive above the source prefix.
+        db.append_message(sid, "user", foreign)
+        return "ROLLING SUMMARY"
+
+    cc._micro_summarize_one = summarize
+    result = cc._micro_compact(messages)
+
+    assert result is not messages
+    live = [str(m["content"]) for m in db.get_messages_as_conversation(sid)]
+    assert live[-1] == foreign
+    assert sum(foreign in content for content in live) == 1
+
+
+def test_micro_compaction_skips_when_another_rewrite_holds_the_lease(tmp_path):
+    sid = "micro-lock-held"
+    db, messages, cc = _durable_micro_case(tmp_path, sid)
+
+    assert db.try_acquire_compression_lock(sid, "batch-winner") is True
+    try:
+
+        def should_not_run(_text):
+            raise AssertionError("summarizer ran while another compression rewrite held the lease")
+
+        cc._micro_summarize_one = should_not_run
+        before = [m["content"] for m in messages]
+        result = cc._micro_compact(messages)
+
+        assert result is messages
+        assert [m["content"] for m in result] == before
+    finally:
+        db.release_compression_lock(sid, "batch-winner")
+
+
+def test_micro_compaction_rolls_back_when_source_generation_changes_before_commit(tmp_path):
+    sid = "micro-stale-generation"
+    db, messages, cc = _durable_micro_case(tmp_path, sid)
+    before = (
+        [m["content"] for m in messages], [id(m) for m in messages],
+        cc._micro_compact_cursor, cc._micro_compact_rolling_summary,
+    )
+    winner = [{"role": "user", "content": "winner summary source"},
+              {"role": "assistant", "content": "winner generation"}]
+
+    def summarize(_text):
+        db.archive_and_compact(sid, winner)  # bypass the lease; transaction-local CAS must refuse
+        return "STALE SUMMARY"
+
+    cc._micro_summarize_one = summarize
+    result = cc._micro_compact(messages)
+
+    assert result is messages
+    assert (
+        [m["content"] for m in result], [id(m) for m in result],
+        cc._micro_compact_cursor, cc._micro_compact_rolling_summary,
+    ) == before
+    assert [m["content"] for m in db.get_messages_as_conversation(sid)] == [
+        "winner summary source", "winner generation",
+    ]
+
+
+def test_failed_commit_does_not_publish_rolled_back_row_metadata(tmp_path, monkeypatch):
+    sid = "micro-post-insert-failure"
+    db, messages, cc = _durable_micro_case(tmp_path, sid)
+    before = [(m.get("_row_id"), m.get("timestamp")) for m in messages]
+    foreign = "[from Telegram] concurrent tail"
+
+    def summarize(_text):
+        db.append_message(sid, "user", foreign)
+        return "ROLLING SUMMARY"
+
+    def fail_after_insert(*_args, **_kwargs):
+        raise RuntimeError("after insert")
+
+    cc._micro_summarize_one = summarize
+    monkeypatch.setattr(db, "_clone_message_rows", fail_after_insert)
+
+    result = cc._micro_compact(messages)
+
+    assert result is messages
+    assert [(m.get("_row_id"), m.get("timestamp")) for m in messages] == before
+    assert db.match_active_message_prefix_proof(sid, messages) is not None
+    assert [m["content"] for m in db.get_messages_as_conversation(sid)][-1] == foreign
+
+
+def test_failed_defrag_does_not_mutate_aliased_source_message(tmp_path):
+    sid = "micro-alias-rollback"
+    db, messages, cc = _durable_micro_case(tmp_path, sid, summary="FIRST SUMMARY")
+    messages = cc._micro_compact(messages)
+    alias = _summary_markers(messages)[0]
+    before = dict(alias)
+
+    cc._micro_compact_rolling_summary = "x" * 40_000
+    cc._micro_summarize_one = lambda _text: "UNCOMMITTED DEFRAG"
+    cc._sync_micro_compact_to_db = lambda *_args, **_kwargs: False
+
+    result = cc._micro_compact(messages)
+
+    assert result is messages
+    assert alias == before
+
+
+def test_micro_compaction_resolves_row_id_less_persisted_prefix(tmp_path):
+    sid = "micro-row-id-less-prefix"
+    db, messages, cc = _durable_micro_case(tmp_path, sid, row_ids=False)
+    cc._micro_summarize_one = lambda _text: "ROW-ID-LESS SUMMARY"
+    result = cc._micro_compact(messages)
+
+    assert result is not messages
+    assert any(m.get(COMPRESSED_SUMMARY_METADATA_KEY) for m in result)
+    assert any("ROW-ID-LESS SUMMARY" in str(m.get("content")) for m in db.get_messages_as_conversation(sid))

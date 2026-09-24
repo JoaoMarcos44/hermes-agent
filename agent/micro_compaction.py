@@ -164,31 +164,22 @@ class MicroCompactionMixin:
         return estimate_tokens_rough(self._micro_compact_rolling_summary) >= self._micro_compact_defrag_threshold_tokens
 
     def _defrag_rolling_summary(self, messages: List[Dict[str, Any]]) -> bool:
-        """Re-summarize the rolling summary text and rewrite the marker in place.
-        Transcript-shape-neutral (no splice, no cursor move). Returns True when it rewrote."""
+        """Re-summarize the rolling summary and replace the newest micro marker copy-on-write."""
         old_summary = self._micro_compact_rolling_summary
         if not old_summary.strip():
             return False
-        # Empty base turns the merge prompt into a rewrite-compactly instruction.
         self._micro_compact_rolling_summary = ""
         fresh_summary = self._micro_summarize_one(old_summary)
         self._micro_compact_rolling_summary = fresh_summary or old_summary
         if not fresh_summary:
             return False
-        # Rewrite only the newest MICRO marker (resume rehydrates from it); a batch marker holds
-        # history we lack.
-        entry = next((e for e in reversed(messages) if _is_micro_marker(e)), None)
-        if entry is not None:
+        marker_idx = next((i for i in range(len(messages) - 1, -1, -1)
+                           if _is_micro_marker(messages[i])), None)
+        if marker_idx is not None:
+            entry = dict(messages[marker_idx])
             entry["content"] = self._render_micro_marker_content(fresh_summary)
-            # Content changed: clear the persisted stamp so the DB sync rewrites the row. An
-            # in-place pop on a live dict would be identity-skipped by the bounded flush scan;
-            # flag the finalizer.
             entry.pop(_cc()._DB_PERSISTED_MARKER, None)
-            # Sibling of the finalize_turn pop site (#75170): this pop also strips the marker from a LIVE
-            # dict in place, so the bounded flush-scan cursor would identity-skip the rewritten marker and
-            # the defragged summary would never reach state.db. The compressor holds no agent reference, so
-            # raise a flag the finalizer consumes to invalidate agent._db_flush_scan_prefix. (The pop sites
-            # at module scope — fresh copies in strip-marker helpers — break identity and need no flag.)
+            messages[marker_idx] = entry
             self._flush_scan_cursor_invalidated = True
         logger.info(
             "Micro-compaction defrag: rolling summary re-summarized (%d -> %d chars)",
@@ -216,13 +207,38 @@ class MicroCompactionMixin:
                 return messages
             self._micro_compact_turns_since_pass = 0
 
+        session_db, session_id = getattr(self, "_session_db", None), getattr(self, "_session_id", "")
+        rollback_state = (
+            self._micro_compact_rolling_summary, self._micro_compact_cursor,
+            self._micro_compact_consecutive_failures, self._micro_compact_last_failure_cursor,
+            self._flush_scan_cursor_invalidated,
+        ) if session_db and session_id else None
+        marker_key = _cc().MICRO_COMPACT_MARKER_KEY
+        rollback_markers = [
+            (msg, marker_key in msg, msg.get(marker_key)) for msg in messages
+            if rollback_state is not None and isinstance(msg, dict) and self._is_context_summary_message(msg)
+        ]
+
+        def _rollback_failed_commit() -> List[Dict[str, Any]]:
+            if rollback_state is not None:
+                (
+                    self._micro_compact_rolling_summary, self._micro_compact_cursor,
+                    self._micro_compact_consecutive_failures, self._micro_compact_last_failure_cursor,
+                    self._flush_scan_cursor_invalidated,
+                ) = rollback_state
+                # Cursor resolution can tag a rehydrated summary before rewrite admission.
+                for msg, had_marker, value in rollback_markers:
+                    if had_marker:
+                        msg[marker_key] = value
+                    else:
+                        msg.pop(marker_key, None)
+            return messages
+
         n_messages = len(messages)
         exchange = self._next_exchange(messages) if n_messages >= 4 else None
         if exchange is None:
             return messages
         exchange_start, exchange_end = exchange
-
-        # Telemetry baseline; taken only once an exchange exists so no-op turns don't pay.
         _started_at = time.monotonic()
         _tokens_before = estimate_messages_tokens_rough(messages)
 
@@ -232,39 +248,63 @@ class MicroCompactionMixin:
                 tokens_before=_tokens_before, duration_ms=int((time.monotonic() - _started_at) * 1000), **extra,
             )
 
-        # Defrag rewrites summary text/marker in place (no splice, no cursor move) instead of
-        # absorbing this turn.
-        if self._needs_defrag():
-            defragged = self._defrag_rolling_summary(messages)
-            if defragged:
-                self._sync_micro_compact_to_db(messages)
+        rewrite_guard = None
+        if session_db and session_id:
+            rewrite_guard = _cc()._begin_archive_rewrite_guard(
+                session_db, session_id, messages, label="micro-compaction",
+            )
+            if rewrite_guard is None:
+                restored = _rollback_failed_commit()
+                _telemetry("persistence_guard_refused", restored, tokens_after=_tokens_before)
+                return restored
+        try:
+            if self._needs_defrag():
+                # Copy only the list spine and the one dict defrag mutates. This keeps aliases
+                # untouched on refusal without deep-copying every transcript/tool payload.
+                candidate = list(messages) if rewrite_guard is not None else messages
+                defragged = self._defrag_rolling_summary(candidate)
+                if not defragged:
+                    _telemetry("defrag_failed", messages, tokens_after=_tokens_before)
+                    return messages
+                if not self._sync_micro_compact_to_db(candidate, rewrite_guard=rewrite_guard):
+                    restored = _rollback_failed_commit()
+                    _telemetry("persistence_refused", restored, tokens_after=_tokens_before)
+                    return restored
+                if candidate is not messages:
+                    messages[:] = candidate
                 self._reset_micro_failure_tracking()
-            outcome = "defrag" if defragged else "defrag_failed"
-            _telemetry(outcome, messages, tokens_after=estimate_messages_tokens_rough(messages))
-            return messages
+                _telemetry("defrag", messages, tokens_after=estimate_messages_tokens_rough(messages))
+                return messages
 
-        # Cumulative iff it subsumes an earlier marker; captured before summarizing.
-        _cumulative = bool(self._micro_compact_rolling_summary.strip())
+            # Cumulative iff it subsumes an earlier marker; captured before summarizing.
+            _cumulative = bool(self._micro_compact_rolling_summary.strip())
 
-        exchange_text = self._serialize_for_summary(messages[exchange_start:exchange_end])
-        _exchange_tokens = estimate_tokens_rough(exchange_text)
-        updated_summary = self._micro_summarize_one(exchange_text)
-        if updated_summary is None:
-            _outcome = self._record_micro_failure(exchange_start, exchange_end)
-            _telemetry(_outcome, messages, tokens_after=_tokens_before, exchange_tokens=_exchange_tokens)
-            return messages
+            exchange_text = self._serialize_for_summary(messages[exchange_start:exchange_end])
+            _exchange_tokens = estimate_tokens_rough(exchange_text)
+            updated_summary = self._micro_summarize_one(exchange_text)
+            if updated_summary is None:
+                _outcome = self._record_micro_failure(exchange_start, exchange_end)
+                _telemetry(_outcome, messages, tokens_after=_tokens_before, exchange_tokens=_exchange_tokens)
+                return messages
 
-        self._micro_compact_rolling_summary = updated_summary
-        self._micro_compact_cursor = exchange_end
-        self._reset_micro_failure_tracking()
+            self._micro_compact_rolling_summary = updated_summary
+            self._micro_compact_cursor = exchange_end
+            self._reset_micro_failure_tracking()
 
-        result = self._splice_micro_compact_result(messages, exchange_start, exchange_end, supersede=_cumulative)
-        self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
-        self._sync_micro_compact_to_db(result)
-        _telemetry(
-            "absorbed", result, tokens_after=estimate_messages_tokens_rough(result), exchange_tokens=_exchange_tokens,
-        )
-        return result
+            result = self._splice_micro_compact_result(messages, exchange_start, exchange_end, supersede=_cumulative)
+            self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
+            if not self._sync_micro_compact_to_db(result, rewrite_guard=rewrite_guard):
+                restored = _rollback_failed_commit()
+                _telemetry(
+                    "persistence_refused", restored, tokens_after=_tokens_before, exchange_tokens=_exchange_tokens,
+                )
+                return restored
+            _telemetry(
+                "absorbed", result, tokens_after=estimate_messages_tokens_rough(result), exchange_tokens=_exchange_tokens,
+            )
+            return result
+        finally:
+            _cc()._release_archive_rewrite_guard(session_db, session_id, rewrite_guard)
 
     def _record_micro_failure(self, exchange_start: int, exchange_end: int) -> str:
         """Count a summarize failure at this cursor; skip the exchange after too many in a row."""
@@ -344,13 +384,26 @@ class MicroCompactionMixin:
         except Exception as exc:
             logger.debug("failed to emit micro-compaction telemetry: %s", exc)
 
-    def _sync_micro_compact_to_db(self, compacted_messages: List[Dict[str, Any]]) -> None:
-        """Persist the micro-compacted set to the session DB atomically and stamp rows persisted.
-        Without this the old exchange rows stay ``active=1`` and a resume double-loads both the
-        summary and the originals."""
+    def _sync_micro_compact_to_db(
+        self, compacted_messages: List[Dict[str, Any]], *, rewrite_guard: Any = None,
+    ) -> bool:
+        """Persist one guarded micro rewrite; False means the caller must roll back its in-memory splice."""
         session_db, session_id = getattr(self, "_session_db", None), getattr(self, "_session_id", "")
         if not session_db or not session_id:
-            return
+            return True
+        if rewrite_guard is None:
+            logger.info("Micro-compaction DB sync refused: no source-generation rewrite guard")
+            return False
+        holder, expected_ids, expected_digest = rewrite_guard
+        try:
+            refreshed = session_db.refresh_compression_lock(
+                session_id, holder, ttl_seconds=_cc().ARCHIVE_REWRITE_LEASE_TTL_SECONDS,
+            )
+        except Exception:
+            refreshed = False
+        if not refreshed:
+            logger.info("Micro-compaction DB sync refused: compression lease was lost before commit")
+            return False
         try:
             # Micro-compaction is prefix + marker + suffix, not a contiguous tail. Identify the exact
             # byte-identical originals by their persistence marker; the state transaction resolves each
@@ -362,15 +415,20 @@ class MicroCompactionMixin:
                 if isinstance(message, dict) and message.get(_cc()._DB_PERSISTED_MARKER)
             ]
             session_db.archive_and_compact(
-                session_id, compacted_messages, carried_messages=carried_messages)
+                session_id,
+                compacted_messages,
+                carried_messages=carried_messages,
+                expected_active_prefix_ids=expected_ids,
+                expected_active_prefix_digest=expected_digest,
+                lock_holder=holder,
+            )
             # Shared post-commit stamp site with batch commit and proactive prune.
             # See #98450.
             _cc().stamp_db_persisted_markers(compacted_messages)
+            return True
         except Exception:
-            logger.info(
-                "Micro-compaction DB sync failed — resume will double-load "
-                "compacted messages until the next batch compression"
-            )
+            logger.info("Micro-compaction DB sync refused; rolling back the in-memory rewrite", exc_info=True)
+            return False
 
     def _splice_micro_compact_result(
         self, messages: List[Dict[str, Any]], splice_start: int, splice_end: int, supersede: bool = True,
@@ -424,16 +482,12 @@ class MicroCompactionMixin:
         for msg in result:
             prev = merged[-1] if merged else None
             if _plain_user(msg) and _plain_user(prev):
+                prev = dict(prev)
+                merged[-1] = prev
                 prev["content"] = "\n\n".join(c for c in (prev["content"], msg["content"]) if c)
-                drop_stale_api_content(prev)  # merged content invalidates the api_content sidecar
-                # The originals stay in display history as compacted rows; showing the join too
-                # would paint every merged input twice on resume.
+                drop_stale_api_content(prev)
                 prev["display_metadata"] = {**(prev.get("display_metadata") or {}),
                                             _cc().MODEL_ONLY_DISPLAY_METADATA_KEY: True}
-                # The merge rewrites a live dict that may carry _db_persisted: pop the stamp
-                # and flag the finalizer to invalidate the bounded flush-scan cursor, or the
-                # merged text is identity-skipped and never reaches state.db. Same contract
-                # as the defrag rewrite site above.
                 prev.pop(_cc()._DB_PERSISTED_MARKER, None)
                 self._flush_scan_cursor_invalidated = True
             else:
