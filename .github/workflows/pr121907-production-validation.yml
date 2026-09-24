@@ -183,6 +183,15 @@ jobs:
               "has_provider": f"Provider: {chosen_provider}" in resumed._cached_system_prompt,
               "has_execution_guidance": "Execution discipline" in resumed._cached_system_prompt,
               "hash_changed": hash_after != hash_before,
+              "old_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_before,)
+              ).fetchone()[0],
+              "new_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_after,)
+              ).fetchone()[0],
+              "tool_names_hash": db._conn.execute(
+                  "SELECT tool_names FROM sessions WHERE id = ?", (sid,)
+              ).fetchone()["tool_names"],
               "blob_rows": db._conn.execute("SELECT COUNT(*) FROM system_prompts").fetchone()[0],
               "hydrated_matches_cache": hydrated_after == resumed._cached_system_prompt,
           }
@@ -195,6 +204,8 @@ jobs:
               assert result["has_provider"] is False
               assert result["has_execution_guidance"] is False
               assert result["hash_changed"] is False
+              assert result["old_prompt_blob_present"] == 1
+              assert result["new_prompt_blob_present"] == 1
           else:
               # #121907 behavior: modern missing identity is stale and uses the existing rebuild path.
               assert result["reused_old_bytes"] is False
@@ -202,8 +213,10 @@ jobs:
               assert result["has_provider"] is True
               assert result["has_execution_guidance"] is True
               assert result["hash_changed"] is True
-              # update_system_prompt remains blob ownership/GC owner: one live snapshot remains.
-              assert result["blob_rows"] == 1
+              # The old prompt blob is collected. The table may also contain the tools[] pin,
+              # which intentionally shares this content-addressed store.
+              assert result["old_prompt_blob_present"] == 0
+              assert result["new_prompt_blob_present"] == 1
               assert result["hydrated_matches_cache"] is True
 
           db.close()
