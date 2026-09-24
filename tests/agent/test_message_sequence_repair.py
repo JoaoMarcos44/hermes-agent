@@ -2,8 +2,9 @@
 
 Covers ``_repair_message_sequence`` and
 ``_drop_trailing_empty_response_scaffolding``, which removes only synthetic
-recovery rows while retaining already-executed tool history. Together these prevent the self-reinforcing empty-
-response loop observed in session 20260507_044111_fa7e65, where a tool-result
+recovery rows while retaining already-executed tool history. Together these
+prevent the self-reinforcing empty-response loop observed in session
+20260507_044111_fa7e65, where a tool-result
 followed directly by a user message produced silent empty responses from
 providers (violating role alternation), which retriggered the empty-retry
 recovery every turn.
