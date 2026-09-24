@@ -7,6 +7,8 @@ or a temp file (local). Cohesive pieces live in sibling modules (``base_output``
 ``base_session_env``, ``base_wait``, ``path_utils``).
 """
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -305,15 +307,15 @@ class BaseEnvironment(ABC):
         unique markers so login-shell noise in the merged stdout/stderr can't corrupt the decode.
         Raises :class:`FileFetchError` on a missing/unreadable/oversized file.
         """
-        import base64
-        import binascii
         marker = f"__HERMES_FETCH_{uuid.uuid4().hex[:12]}__"
         quoted = shlex.quote(remote_path)
         # ``[ -f ]`` follows symlinks, so a link to a denied host file is judged by the CALLER on
         # ``readlink -f`` output before any bytes move.
         result = self.execute(
-            f"set +x 2>/dev/null; [ -f {quoted} ] && echo {marker} && "
-            f"head -c {max_bytes + 1} < {quoted} | base64 && echo {marker}",
+            f"set +x 2>/dev/null; [ -f {quoted} ] || exit 1; echo {marker}; "
+            f"head -c {max_bytes + 1} < {quoted} | base64; "
+            f"__hh=${PIPESTATUS[0]} __hb=${PIPESTATUS[1]}; echo {marker}; "
+            f"[ \"$__hh\" -eq 0 ] && [ \"$__hb\" -eq 0 ]",
             timeout=_FETCH_TIMEOUT_SECONDS, rewrite_compound_background=False)
         output = result.get("output") or ""
         if int(result.get("returncode") or 0) != 0:
