@@ -1,0 +1,223 @@
+name: PR121907 production-shaped validation
+
+on:
+  push:
+    branches:
+      - validation/pr121907-prod-probe-c33b47d
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout validation head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install test dependencies
+        run: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web --extra bedrock
+
+      - name: Targeted route/prompt/blob regression suites
+        run: |
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/agent/test_route_prompt_snapshot.py \
+            tests/gateway/test_empty_model_fallback.py \
+            tests/gateway/test_empty_model_recovery.py \
+            tests/agent/test_system_prompt_restore.py \
+            tests/agent/test_compression_concurrent_fork.py \
+            tests/agent/test_compression_orphan_recovery.py \
+            tests/hermes_cli/test_session_system_prompt_dedup.py
+
+      - name: Lint touched Python
+        run: |
+          source .venv/bin/activate
+          ruff check \
+            agent/conversation_loop.py \
+            agent/conversation_compression.py \
+            hermes_state_sessions.py \
+            hermes_state_usage.py \
+            tests/agent/test_route_prompt_snapshot.py \
+            tests/hermes_cli/test_session_system_prompt_dedup.py
+
+      - name: Fetch exact competitor head
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+          git fetch --no-tags upstream pull/121843/head:refs/remotes/upstream/pr121843
+          test "$(git rev-parse refs/remotes/upstream/pr121843)" = "af35db6f713e1335712bb7bd1463e01ea03c7cf9"
+          git worktree add --detach /tmp/pr121843 refs/remotes/upstream/pr121843
+
+      - name: Write production-shaped A/B probes
+        shell: bash
+        run: |
+          cat > /tmp/route_prompt_probe.py <<'PY'
+          import os
+          import sys
+          import tempfile
+          from pathlib import Path
+          from types import SimpleNamespace
+          from unittest.mock import patch
+
+          expected = sys.argv[1]
+          assert expected in {"red", "green"}
+
+          home = Path(tempfile.mkdtemp(prefix=f"hermes-{expected}-"))
+          os.environ["HERMES_HOME"] = str(home)
+          os.environ["OPENROUTER_API_KEY"] = ""
+          os.environ["OPENAI_API_KEY"] = ""
+          os.environ["NOUS_API_KEY"] = ""
+
+          from gateway.run import GatewayRunner
+          from hermes_state import SessionDB
+          from run_agent import AIAgent
+          from agent.conversation_loop import _restore_or_build_system_prompt
+          from agent.conversation_compression import _adopt_live_compression_child
+
+          runner = object.__new__(GatewayRunner)
+          runner._session_model_overrides = {}
+          with patch("gateway.run._resolve_gateway_model", return_value=""), patch(
+              "gateway.run._resolve_runtime_agent_kwargs",
+              return_value={
+                  "provider": "",
+                  "api_key": "offline",
+                  "base_url": "http://127.0.0.1:9/v1",
+                  "api_mode": "chat_completions",
+              },
+          ):
+              model, runtime = runner._resolve_session_agent_runtime()
+          assert model == ""
+          assert (runtime.get("provider") or "") == ""
+
+          db = SessionDB(db_path=home / "state.db")
+          sid = "prod-route-probe"
+          first = AIAgent(
+              model=model, provider=runtime.get("provider") or "",
+              base_url=runtime.get("base_url"), api_key="offline",
+              api_mode="chat_completions", session_id=sid, session_db=db,
+              platform="discord", enabled_toolsets=["terminal"], quiet_mode=True,
+              skip_context_files=True, skip_memory=True, skip_background_review=True,
+          )
+          first._cached_system_prompt = first._build_system_prompt(None)
+          first._ensure_db_session()
+
+          stored_before = db.get_session(sid)["system_prompt"]
+          assert "\nModel:" not in stored_before
+          assert "\nProvider:" not in stored_before
+          assert "Execution discipline" not in stored_before
+          raw_before = db._conn.execute(
+              "SELECT system_prompt, system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          hash_before = raw_before["system_prompt_hash"]
+          assert raw_before["system_prompt"] is None and hash_before
+
+          chosen_model = "deepseek/deepseek-v4-flash"
+          chosen_provider = "openrouter"
+          db.update_session_model(
+              sid, chosen_model, provider=chosen_provider,
+              base_url="https://openrouter.ai/api/v1", api_mode="chat_completions",
+          )
+          raw_after_route = db._conn.execute(
+              "SELECT system_prompt, system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          assert raw_after_route["system_prompt_hash"] == hash_before
+          assert db.get_session(sid)["system_prompt"] == stored_before
+
+          resumed = AIAgent(
+              model=chosen_model, provider=chosen_provider,
+              base_url="https://openrouter.ai/api/v1", api_key="offline",
+              api_mode="chat_completions", session_id=sid, session_db=db,
+              platform="discord", enabled_toolsets=["terminal"], quiet_mode=True,
+              skip_context_files=True, skip_memory=True, skip_background_review=True,
+          )
+          resumed._cached_system_prompt = None
+          _restore_or_build_system_prompt(
+              resumed, None, [{"role": "user", "content": "production-shaped restore probe"}]
+          )
+          raw_after_restore = db._conn.execute(
+              "SELECT system_prompt, system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          hash_after = raw_after_restore["system_prompt_hash"]
+          route_result = {
+              "reused_old_bytes": resumed._cached_system_prompt == stored_before,
+              "has_model": f"Model: {chosen_model}" in resumed._cached_system_prompt,
+              "has_provider": f"Provider: {chosen_provider}" in resumed._cached_system_prompt,
+              "has_execution_guidance": "Execution discipline" in resumed._cached_system_prompt,
+              "hash_changed": hash_after != hash_before,
+              "old_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_before,)
+              ).fetchone()[0],
+              "new_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_after,)
+              ).fetchone()[0],
+          }
+
+          class CompressionDB:
+              def get_compression_tip(self, _parent):
+                  return "child"
+              def get_session(self, _sid):
+                  return {"ended_at": None, "system_prompt": "Model: model-a\nProvider: openrouter"}
+              def get_messages_as_conversation(self, _sid):
+                  return [{"role": "user", "content": "continued"}]
+
+          inherited = "Model: model-a\nProvider: openrouter"
+          adopting = SimpleNamespace(
+              session_id="parent", model="model-b", provider="openrouter", platform="cli",
+              pass_session_id=False, _cached_system_prompt=inherited, _memory_manager=None,
+              context_compressor=SimpleNamespace(on_session_start=lambda *args, **kwargs: None),
+          )
+          recovered = _adopt_live_compression_child(adopting, CompressionDB(), "parent")
+          adoption_result = {
+              "recovered": bool(recovered),
+              "child_session": adopting.session_id,
+              "inherited_parent_prompt_survived": adopting._cached_system_prompt == inherited,
+              "cache_cleared_for_restore": adopting._cached_system_prompt is None,
+          }
+
+          print({"expected": expected, "route": route_result, "adoption": adoption_result})
+
+          if expected == "red":
+              assert route_result["reused_old_bytes"] is True
+              assert route_result["has_execution_guidance"] is False
+              assert route_result["hash_changed"] is False
+              assert route_result["old_prompt_blob_present"] == 1
+              assert adoption_result["inherited_parent_prompt_survived"] is True
+              assert adoption_result["cache_cleared_for_restore"] is False
+          else:
+              assert route_result["reused_old_bytes"] is False
+              assert route_result["has_model"] is True
+              assert route_result["has_provider"] is True
+              assert route_result["has_execution_guidance"] is True
+              assert route_result["hash_changed"] is True
+              assert route_result["old_prompt_blob_present"] == 0
+              assert route_result["new_prompt_blob_present"] == 1
+              assert adoption_result["inherited_parent_prompt_survived"] is False
+              assert adoption_result["cache_cleared_for_restore"] is True
+
+          db.close()
+          PY
+
+      - name: Exact competitor RED
+        run: |
+          cd /tmp/pr121843
+          PYTHONPATH=. "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/route_prompt_probe.py red
+
+      - name: Current PR GREEN
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          PYTHONPATH=. .venv/bin/python /tmp/route_prompt_probe.py green
