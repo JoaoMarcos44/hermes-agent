@@ -950,3 +950,32 @@ def test_exact_byte_reader_falls_back_to_od_when_base64_is_missing():
     data, error = ShellFileOperations(Env(), cwd="/tmp")._read_exact_bytes("/tmp/file")
     assert error is None
     assert data == payload
+
+
+def test_binary_admission_uses_od_sample_when_base64_is_missing():
+    from tools.file_operations import ShellFileOperations
+
+    # A single NUL is binary under the byte-level policy, but the legacy text
+    # heuristic's >30% control-character threshold would misclassify this sample.
+    payload = (b"A" * 500) + b"\x00" + (b"B" * 499)
+
+    class Env:
+        cwd = "/tmp"
+
+        def execute(self, command, **_kwargs):
+            import re
+            marker_match = re.search(r"__HERMES_RB_[0-9a-f]+__", command)
+            if marker_match and "| base64" in command:
+                marker = marker_match.group(0)
+                return {"output": f"{marker}\n{marker}\n", "returncode": 127}
+            if marker_match and "| od -An -v -tx1" in command:
+                marker = marker_match.group(0)
+                hexed = " ".join(f"{b:02x}" for b in payload)
+                return {"output": f"{marker}\n{hexed}\n{marker}\n", "returncode": 0}
+            if command.startswith("head -c"):
+                return {"output": payload.decode("latin-1"), "returncode": 0}
+            raise AssertionError(f"unexpected command: {command}")
+
+    is_binary, sample = ShellFileOperations(Env(), cwd="/tmp")._detect_binary("/tmp/file")
+    assert is_binary is True
+    assert sample == payload

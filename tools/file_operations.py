@@ -263,10 +263,38 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             f"set +x 2>/dev/null; echo {sentinel}; "
             f"head -c {length} {arg} 2>/dev/null | base64; "
             f"__hs=${{PIPESTATUS[0]}} __bs=${{PIPESTATUS[1]}}; echo {sentinel}; "
-            f"[ \"$__hs\" -eq 0 ] && [ \"$__bs\" -eq 0 ]")
+            f"if [ \"$__hs\" -ne 0 ]; then exit \"$__hs\"; fi; exit \"$__bs\"")
+        if result.exit_code == 127:
+            return self._sample_file_bytes_hex(path, length)
         if result.exit_code != 0:
             return None
         return decode_framed_base64(result.stdout or "", sentinel)
+
+    def _sample_file_bytes_hex(self, path: str, length: int) -> Optional[bytes]:
+        """POSIX ``od`` sample fallback when the backend has no base64 utility."""
+        sentinel = _new_sentinel(_BYTES_SENTINEL_PREFIX)
+        arg = self._escape_shell_arg(path)
+        result = self._exec(
+            f"set +x 2>/dev/null; echo {sentinel}; "
+            f"head -c {length} {arg} 2>/dev/null | od -An -v -tx1; "
+            f"__hs=${{PIPESTATUS[0]}} __ho=${{PIPESTATUS[1]}}; echo {sentinel}; "
+            f"[ \"$__hs\" -eq 0 ] && [ \"$__ho\" -eq 0 ]")
+        if result.exit_code != 0:
+            return None
+        return self._decode_framed_hex(result.stdout or "", sentinel)
+
+    @staticmethod
+    def _decode_framed_hex(output: str, sentinel: str) -> Optional[bytes]:
+        payload = extract_framed_payload(output, sentinel)
+        if payload is None:
+            return None
+        compact = "".join(payload.split())
+        if not re.fullmatch(r"[0-9a-fA-F]*", compact):
+            return None
+        try:
+            return bytes.fromhex(compact)
+        except ValueError:
+            return None
 
     def _read_exact_bytes(self, path: str) -> "tuple[Optional[bytes], Optional[ExecuteResult]]":
         """Read one regular file byte-for-byte, without trusting merged shell stdout as payload."""
@@ -311,16 +339,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             stdout=f"{path}: no byte-exact base64/od transport is available", exit_code=1)
         if result.exit_code != 0:
             return None, unavailable if result.exit_code == 127 else result
-        payload = extract_framed_payload(result.stdout or "", sentinel)
-        if payload is None:
-            return None, unavailable
-        compact = "".join(payload.split())
-        if not re.fullmatch(r"[0-9a-fA-F]*", compact):
-            return None, unavailable
-        try:
-            return bytes.fromhex(compact), None
-        except ValueError:
-            return None, unavailable
+        data = self._decode_framed_hex(result.stdout or "", sentinel)
+        return (data, None) if data is not None else (None, unavailable)
+
 
     @staticmethod
     def _decode_base64_sample(text: str) -> Optional[bytes]:
