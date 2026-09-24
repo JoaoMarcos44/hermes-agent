@@ -343,13 +343,7 @@ class SessionPersistenceMixin:
         if platform_id is not None:  # load-bearing for restart drain-window recovery dedup (has_platform_message_id)
             msg["platform_message_id"] = platform_id
 
-    def _persist_session(
-        self,
-        messages: List[Dict],
-        conversation_history: List[Dict] = None,
-        *,
-        empty_response_tail_close_text: Optional[str] = None,
-    ):
+    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save to SQLite on any exit path. Trailing empty-response scaffolding is dropped from
         the live list; the persist override is applied to the DB row only.
 
@@ -365,7 +359,7 @@ class SessionPersistenceMixin:
             # close the turn instead of rewinding history. This runs at the shared
             # persistence boundary so every early-exit caller gets the same invariant.
             if self._drop_trailing_empty_response_scaffolding(messages):
-                close_interrupted_tool_sequence(messages, empty_response_tail_close_text)
+                close_interrupted_tool_sequence(messages)
             self._session_messages = messages
             self._flush_messages_to_session_db(messages, conversation_history)
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
