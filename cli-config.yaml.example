@@ -4,6 +4,9 @@
 # This file configures CLI behavior; only documented secret environment
 # variables in .env take precedence over their corresponding settings.
 
+# Managed by Hermes. Installers copy this template to seed config.yaml.
+_config_version: 46
+
 # =============================================================================
 # Database Configuration
 # =============================================================================

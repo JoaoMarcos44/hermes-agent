@@ -631,18 +631,31 @@ def _migrate_to_46(results: Dict[str, Any], quiet: bool) -> None:
         f"  ✓ Turned off MCP servers the profile editor had marked disabled: {names}.")
 
 
+def _evidence_gated(step: Callable[[Dict[str, Any], bool], None]):
+    """Mark a step safe for a config with no version stamp.
+
+    These migrations only mutate when a retired key/artifact proves the config predates that
+    change. Value/default/absence-based migrations must remain unmarked: on a never-stamped
+    current-schema file those values are user choices, not evidence of an old schema.
+    """
+    setattr(step, "_runs_without_version_stamp", True)
+    return step
+
+
 #: Registry of (target_version, step), strictly ascending; simple default-flip steps are
 #: declared inline via _rewrite_stale_default / _rewrite_key partials. Later steps observe
 #: earlier steps' writes via read_raw_config() (filesystem state). v12 is the support floor:
 #: configs already AT v12 still get every step below; only configs BELOW 12 are refused by the
 #: floor gate in run_migrations()'s caller. Versions absent here (15, 18-20, 22, 24, 26-28, 30)
-#: only added a schema default that runtime merging supplies without a write.
+#: only added a schema default that runtime merging supplies without a write. Steps wrapped in
+#: _evidence_gated() may also run on never-stamped configs because a legacy key/artifact is their
+#: own proof that the targeted shape predates the migration.
 MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
-    (12, _migrate_to_12),
+    (12, _evidence_gated(_migrate_to_12)),
     (13, _migrate_to_13),
-    (14, _migrate_to_14),
-    (16, _migrate_to_16),
-    (17, _migrate_to_17),
+    (14, _evidence_gated(_migrate_to_14)),
+    (16, _evidence_gated(_migrate_to_16)),
+    (17, _evidence_gated(_migrate_to_17)),
     (21, _migrate_to_21),
     (23, _migrate_to_23),
     # 24 → 25: model_catalog TTL 24h → 1h (only the OLD default 24).
@@ -650,7 +663,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
         section="model_catalog", key="ttl_hours", old=24, new=1,
         added="model_catalog.ttl_hours 24→1",
         message="  ✓ Lowered model_catalog.ttl_hours to 1 (hourly picker refresh)")),
-    (29, _migrate_to_29),
+    (29, _evidence_gated(_migrate_to_29)),
     # 30 → 31: verify_on_stop OFF (one-time). The "auto" sentinel was more noise than signal.
     # Rewrite only when missing or still "auto" — an explicit user true/false is preserved.
     (31, functools.partial(
@@ -674,7 +687,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
             "true. Set it to true again to re-enable, or \"auto\" for the "
             "legacy surface-aware behavior."),
         extra_guard=lambda raw: raw.get("verify_on_stop") is True)),
-    (33, _migrate_to_33),
+    (33, _evidence_gated(_migrate_to_33)),
     (34, _migrate_to_34),
     # 34 → 35: background_process_notifications 'all' (old implicit default, rarely chosen on
     # purpose) → 'concise'. Explicit result/error/off choices are preserved.
@@ -706,8 +719,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
             "independent delegated children now fan out wider in parallel. "
             "Each child consumes API tokens independently; set "
             "delegation.max_concurrent_children back to 3 to restore the old cap."))),
-    (38, _migrate_to_38),
-    (39, _migrate_to_39),
+    (38, _evidence_gated(_migrate_to_38)),
+    (39, _evidence_gated(_migrate_to_39)),
     # 39 → 40: model_catalog.ttl_hours → ttl_minutes (default 20). Only the OLD default
     # (ttl_hours: 1, written by v25) is dropped; any other explicit ttl_hours is still honoured.
     (40, _rewrite_stale_default(
@@ -715,27 +728,27 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
         added="model_catalog.ttl_hours 1 → ttl_minutes 20 (default)",
         message="  ✓ Model catalog now refreshes every 20 minutes (model_catalog.ttl_minutes)",
         extra_guard=lambda raw: "ttl_minutes" not in raw)),
-    (41, _migrate_to_41),
+    (41, _evidence_gated(_migrate_to_41)),
     # 41 → 42: cron.model_drift_guard is gone. Unpinned jobs now run on their creation snapshot
     # instead of failing closed when the global model changes, so the toggle has nothing to gate.
-    (42, functools.partial(
+    (42, _evidence_gated(functools.partial(
         _rewrite_key, section="cron", key="model_drift_guard", new=None,
         match=lambda cur: cur is not None,
         added="removed cron.model_drift_guard",
         message=(
             "  ✓ Removed cron.model_drift_guard — unpinned cron jobs now keep running on the "
             "model/provider they were created under when the global default changes, instead "
-            "of being skipped. Pin a job or set cron.model to move it."))),
+            "of being skipped. Pin a job or set cron.model to move it.")))),
     # 42 → 43: gateway.multiplex_profile_allowlist is gone. A multiplexing default gateway serves
     # every live profile under profiles/; a profile that must not be served is archived or deleted.
-    (43, functools.partial(
+    (43, _evidence_gated(functools.partial(
         _rewrite_key, section="gateway", key="multiplex_profile_allowlist", new=None,
         match=lambda _cur: True,
         added="removed gateway.multiplex_profile_allowlist",
         message=(
             "  ✓ Removed gateway.multiplex_profile_allowlist — the multiplexing gateway now serves "
             "every profile under profiles/. Delete or archive a profile you do not want served."),
-        extra_guard=lambda raw: "multiplex_profile_allowlist" in raw)),
+        extra_guard=lambda raw: "multiplex_profile_allowlist" in raw))),
     # 43 → 44: curator prunes faster — stale 30→14 days, archive 90→30 days. A skill nobody has
     # touched in a month is prompt weight, not knowledge; archival is recoverable. Only the OLD
     # defaults are rewritten; an explicit user value is preserved.
@@ -752,18 +765,30 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     # 44 → 45: saved platform_toolsets lists predate the connections toolset (see _migrate_to_45).
     (45, _migrate_to_45),
     # 45 → 46: legacy editor `disabled: true` on MCP servers becomes `enabled: false` (see _migrate_to_46).
-    (46, _migrate_to_46),
+    (46, _evidence_gated(_migrate_to_46)),
 )
 
 
-def run_migrations(current_ver: int, results: Dict[str, Any], quiet: bool) -> None:
-    """Apply every registered migration whose target version exceeds *current_ver*.
+def run_migrations(
+    current_ver: int,
+    results: Dict[str, Any],
+    quiet: bool,
+    *,
+    unversioned: bool = False,
+) -> None:
+    """Apply registered migrations newer than *current_ver*.
 
-    *current_ver* is the on-disk schema version captured ONCE before any step runs and does not
-    advance between steps — each step is gated on the same initial value.
+    A never-stamped config is not equivalent to schema v0: it may have been created yesterday by
+    an installer or targeted writer. In that case only evidence-gated steps run. Versioned configs
+    keep the historical full-ladder behavior.
+
+    *current_ver* is captured ONCE before any step runs and does not advance between steps.
     """
     for target_ver, migration_fn in MIGRATIONS:
-        if current_ver < target_ver:
+        allowed = not unversioned or bool(
+            getattr(migration_fn, "_runs_without_version_stamp", False)
+        )
+        if current_ver < target_ver and allowed:
             try:
                 migration_fn(results, quiet)
             except Exception as exc:

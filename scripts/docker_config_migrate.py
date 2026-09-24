@@ -12,6 +12,7 @@ from hermes_cli.config import (
     get_config_path,
     get_env_path,
     migrate_config,
+    read_user_config_raw,
 )
 from hermes_cli.config_backups import backup_config, list_config_backups
 from hermes_cli.config_migrations import (
@@ -51,11 +52,11 @@ def main() -> int:
     if current_ver >= latest_ver:
         return 0
 
-    # Below the auto-migration support floor: migrate_config() refuses (and
-    # leaves the file untouched), so don't run the backup/verify dance that
-    # would raise "did not advance config version" and block the boot.
-    # Warn-and-continue matches the CLI's fail-safe posture.
-    if current_ver < SUPPORT_FLOOR_VERSION:
+    # Only an explicitly versioned old config is below the support floor. A missing
+    # stamp is current-schema content whose provenance was never recorded; migrate_config()
+    # applies evidence-gated legacy transforms and stamps it.
+    has_version_stamp = "_config_version" in read_user_config_raw()
+    if current_ver < SUPPORT_FLOOR_VERSION and has_version_stamp:
         print(
             f"[config-migrate] WARNING: {support_floor_message()}",
             file=sys.stderr,
