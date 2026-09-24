@@ -23,6 +23,8 @@ def _fmt_pending_list(subsystem: str) -> str:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
+        if subsystem == wa.MEMORY:
+            lines.extend(f"      {line}" for line in _memory_targets(r.get("payload")))
     lines.append("")
     lines.append(f"Apply: /{subsystem} approve <id>   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
@@ -74,13 +76,14 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
             return f"No pending {subsystem} write with id '{target}'."
         targets = [rec]
 
-    applied, failed, overwritten = 0, [], []
+    applied, failed, overwritten, removed = 0, [], [], []
     for rec in targets:
         ok, msg, result = _apply_one(subsystem, rec, memory_store)
         if ok:
             wa.discard_pending(subsystem, rec["id"])
             applied += 1
-            overwritten.extend(f"  {rec['id']}: {text}" for text in _replaced_entries(result))
+            overwritten.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "replaced"))
+            removed.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "removed"))
         else:
             failed.append(f"{rec['id']}: {msg}")
 
@@ -90,17 +93,34 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
         # is the last person who can notice a clause went missing, so show what was lost.
         out.append("Overwrote entire entry (re-add anything you still need):")
         out.extend(overwritten)
+    if removed:
+        out.append("Removed entry (re-add anything you still need):")
+        out.extend(removed)
     if failed:
         out.append("Failed:")
         out.extend(f"  {f}" for f in failed)
     return "\n".join(out)
 
 
-def _replaced_entries(result: dict) -> List[str]:
-    """Full text of every entry a memory replace overwrote, single-op or batch shape."""
-    single = result.get("replaced_entry")
-    batch = result.get("replaced_entries") or {}
+def _changed_entries(result: dict, kind: str) -> List[str]:
+    """Full text changed by a replace/remove, single-op or batch shape."""
+    single = result.get(f"{kind}_entry")
+    batch = result.get(f"{kind}_entries") or {}
     return ([single] if single else []) + [batch[k] for k in sorted(batch, key=int)]
+
+
+def _memory_targets(payload) -> List[str]:
+    """Targets surfaced by a staged memory write; legacy destructive records are visibly unsafe."""
+    if not isinstance(payload, dict):
+        return []
+    ops = payload.get("operations") if payload.get("action") == "batch" else [payload]
+    destructive = [op for op in (ops or []) if isinstance(op, dict)
+                   and op.get("action") in ("replace", "remove")]
+    if not destructive:
+        return []
+    if payload.get("match_mode") != "exact_entry_v1":
+        return ["legacy destructive target was not pinned; reject and recreate before approving"]
+    return [f"{op['action']}s entry: {op.get('old_text', '')}" for op in destructive]
 
 
 def _apply_one(subsystem: str, rec, memory_store):

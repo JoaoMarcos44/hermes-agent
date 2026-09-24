@@ -177,12 +177,153 @@ def test_handle_approve_surfaces_overwritten_entry(hermes_home):
     store = MemoryStore(); store.load_from_disk()
     entry = "RULE A: gate merges. RULE B: ci per HEAD. RULE C: never squash."
     store.add("memory", entry)
-    wa.stage_write("memory", {"action": "batch", "target": "memory", "operations": [
-        {"action": "replace", "old_text": "RULE B: ci per HEAD.", "content": "RULE B: CI is per-head."}]},
+    wa.stage_write("memory", {"action": "batch", "target": "memory", "match_mode": "exact_entry_v1", "operations": [
+        {"action": "replace", "old_text": entry, "content": "RULE B: CI is per-head."}]},
         summary="batch", origin="background_review")
     out = handle_pending_subcommand(wa.MEMORY, ["approve", "all"], memory_store=store)
     assert "Approved 1" in out and entry in out
     assert store.memory_entries == ["RULE B: CI is per-head."]
+
+
+def _stage_unattended_remove(store, old_text):
+    from tools.memory_tool import memory_tool
+    from tools.skill_provenance import (reset_current_write_origin, reset_review_attended,
+                                        set_current_write_origin, set_review_attended)
+    origin = set_current_write_origin("background_review")
+    attended = set_review_attended(False)
+    try:
+        return json.loads(memory_tool(
+            action="remove", target="memory", old_text=old_text, store=store))
+    finally:
+        reset_review_attended(attended)
+        reset_current_write_origin(origin)
+
+
+def test_staged_remove_pins_full_entry_and_refuses_drift(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore, load_on_disk_store
+    from tools import write_approval as wa
+
+    reviewed = "Staging DB: pg-staging-2 (old cluster, retiring)"
+    newer = "Staging DB: pg-staging-3 (migrated; creds in vault)"
+    store = MemoryStore(); store.load_from_disk()
+    assert store.add("memory", reviewed)["success"]
+
+    staged = _stage_unattended_remove(store, "Staging DB")
+    rec = wa.get_pending(wa.MEMORY, staged["pending_id"])
+    assert rec["payload"]["match_mode"] == "exact_entry_v1"
+    assert rec["payload"]["old_text"] == reviewed
+    assert reviewed in handle_pending_subcommand(wa.MEMORY, ["pending"])
+
+    assert store.replace("memory", "pg-staging-2", newer)["success"]
+    out = handle_pending_subcommand(
+        wa.MEMORY, ["approve", staged["pending_id"]], memory_store=load_on_disk_store())
+
+    assert "changed since it was staged" in out
+    assert wa.get_pending(wa.MEMORY, staged["pending_id"]) is not None
+    assert load_on_disk_store().memory_entries == [newer]
+
+
+def test_legacy_destructive_pending_fails_closed(hermes_home):
+    """#120842 still replays this pre-upgrade shape against current memory."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore, load_on_disk_store
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    assert store.add("memory", "Staging DB: pg-staging-2")["success"]
+    rec = wa.stage_write(
+        wa.MEMORY, {"action": "remove", "target": "memory", "old_text": "Staging DB"},
+        summary="legacy remove", origin="background_review")
+    assert store.replace("memory", "pg-staging-2", "Staging DB: pg-staging-3")["success"]
+
+    out = handle_pending_subcommand(
+        wa.MEMORY, ["approve", rec["id"]], memory_store=load_on_disk_store())
+
+    assert "predates exact-target approval" in out
+    assert "legacy destructive target was not pinned" in handle_pending_subcommand(wa.MEMORY, ["pending"])
+    assert wa.get_pending(wa.MEMORY, rec["id"]) is not None
+    assert load_on_disk_store().memory_entries == ["Staging DB: pg-staging-3"]
+
+
+def test_approved_remove_names_exact_entry(hermes_home):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore, load_on_disk_store
+    from tools import write_approval as wa
+
+    reviewed = "Staging DB: pg-staging-2 (old cluster, retiring)"
+    store = MemoryStore(); store.load_from_disk()
+    assert store.add("memory", "keep this")["success"]
+    assert store.add("memory", reviewed)["success"]
+    staged = _stage_unattended_remove(store, "Staging DB")
+
+    out = handle_pending_subcommand(
+        wa.MEMORY, ["approve", staged["pending_id"]], memory_store=load_on_disk_store())
+
+    assert reviewed in out
+    assert load_on_disk_store().memory_entries == ["keep this"]
+    assert wa.get_pending(wa.MEMORY, staged["pending_id"]) is None
+
+
+def test_staged_batch_uses_exact_targets_in_operation_order(hermes_home):
+    from tools.memory_tool import MemoryStore, memory_tool
+    from tools.skill_provenance import (reset_current_write_origin, reset_review_attended,
+                                        set_current_write_origin, set_review_attended)
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    original = "DB: staging-v2"
+    assert store.add("memory", original)["success"]
+    origin = set_current_write_origin("background_review")
+    attended = set_review_attended(False)
+    try:
+        staged = json.loads(memory_tool(
+            target="memory", operations=[
+                {"action": "replace", "old_text": "staging-v2", "content": "DB: staging-v3"},
+                {"action": "remove", "old_text": "staging-v3"},
+            ], store=store))
+    finally:
+        reset_review_attended(attended)
+        reset_current_write_origin(origin)
+
+    ops = wa.get_pending(wa.MEMORY, staged["pending_id"])["payload"]["operations"]
+    assert ops[0]["old_text"] == original
+    assert ops[1]["old_text"] == "DB: staging-v3"
+
+
+def test_staged_batch_refuses_new_entry_that_would_turn_add_into_noop(hermes_home):
+    """A staged add->remove must not delete an identical entry created by another writer later."""
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools.memory_tool import MemoryStore, load_on_disk_store, memory_tool
+    from tools.skill_provenance import (reset_current_write_origin, reset_review_attended,
+                                        set_current_write_origin, set_review_attended)
+    from tools import write_approval as wa
+
+    store = MemoryStore(); store.load_from_disk()
+    assert store.add("memory", "keep this")["success"]
+    origin = set_current_write_origin("background_review")
+    attended = set_review_attended(False)
+    try:
+        staged = json.loads(memory_tool(
+            target="memory", operations=[
+                {"action": "add", "content": "transient marker"},
+                {"action": "remove", "old_text": "transient marker"},
+            ], store=store))
+    finally:
+        reset_review_attended(attended)
+        reset_current_write_origin(origin)
+
+    rec = wa.get_pending(wa.MEMORY, staged["pending_id"])
+    assert rec["payload"]["operations"][0]["expected_present"] is False
+
+    # A different writer creates the same text after staging.
+    assert store.add("memory", "transient marker")["success"]
+    out = handle_pending_subcommand(
+        wa.MEMORY, ["approve", staged["pending_id"]], memory_store=load_on_disk_store())
+
+    assert "changed since this batch was staged" in out
+    assert wa.get_pending(wa.MEMORY, staged["pending_id"]) is not None
+    assert load_on_disk_store().memory_entries == ["keep this", "transient marker"]
 
 
 def test_handle_approval_on(hermes_home):

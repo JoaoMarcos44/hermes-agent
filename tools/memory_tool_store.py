@@ -21,6 +21,7 @@ MEMORY_BLOCK_HEADERS = {
     "memory": "MEMORY (your personal notes)", "user": "USER PROFILE (who the user is)"}
 
 ENTRY_DELIMITER = "\n§\n"
+STAGED_EXACT_MATCH = "exact_entry_v1"
 
 
 def _scan_memory_content(content: str) -> Optional[str]:
@@ -55,15 +56,12 @@ def _read_failed_error(path: Path) -> Dict[str, Any]:
         f"memory, so the write is refused. Nothing was changed — retry in a moment.")
 
 
-def _find_unique_match(entries: List[str], old_text: str) -> Tuple[Optional[int], bool]:
-    """``(index, ambiguous)`` for entries matching *old_text*. A whole-entry
-    EXACT match (``old_text == entry``) takes absolute priority — substring
-    matches are only considered when no entry equals *old_text*, so a short
-    entry stays addressable even when its full text is contained inside a
-    longer sibling entry (remove('test') vs '...tests pass...'). Exact-duplicate
-    matches are safe (first wins); distinct matches → ``(None, True)``."""
+def _find_unique_match(entries: List[str], old_text: str, *, exact_only: bool = False) -> Tuple[Optional[int], bool]:
+    """``(index, ambiguous)`` for entries matching *old_text*. Exact matches
+    take priority; staged approvals can require exact-only matching so a reviewed
+    entry cannot drift into a newer substring match."""
     exact = [i for i, e in enumerate(entries) if e == old_text]
-    matches = exact if exact else [i for i, e in enumerate(entries) if old_text in e]
+    matches = exact if exact or exact_only else [i for i, e in enumerate(entries) if old_text in e]
     if len({entries[i] for i in matches}) > 1:
         return None, True
     return (matches[0] if matches else None), False
@@ -282,7 +280,8 @@ class MemoryStore:
         # content) but still refuse a failed read — add rewrites the WHOLE file.
         return self._mutate(target, _add, skip_drift=True)
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(self, target: str, old_text: str, new_content: str, *,
+                exact_old_text: bool = False) -> Dict[str, Any]:
         """Find the entry containing old_text (whole-entry exact match first) and
         replace the WHOLE entry with new_content — old_text only locates the entry;
         the matched span is not spliced into it."""
@@ -293,22 +292,27 @@ class MemoryStore:
             return _error("new_content cannot be empty. Use 'remove' to delete entries.")
         if scan_error := _scan_memory_content(new_content):
             return _error(scan_error)
-        return self._edit(target, old_text.strip(), new_content)
+        return self._edit(target, old_text.strip(), new_content, exact_old_text=exact_old_text)
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+    def remove(self, target: str, old_text: str, *, exact_old_text: bool = False) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         if not old_text.strip():
             return _error("old_text cannot be empty.")
-        return self._edit(target, old_text.strip(), None)
+        return self._edit(target, old_text.strip(), None, exact_old_text=exact_old_text)
 
-    def _edit(self, target: str, old_text: str, new_content: Optional[str]) -> Dict[str, Any]:
+    def _edit(self, target: str, old_text: str, new_content: Optional[str], *,
+              exact_old_text: bool = False) -> Dict[str, Any]:
         """Locked replace (``new_content`` set) or remove (None) of the entry matching *old_text*."""
         def _apply(entries, limit):
-            idx, ambiguous = _find_unique_match(entries, old_text)
+            idx, ambiguous = _find_unique_match(entries, old_text, exact_only=exact_old_text)
             if ambiguous:
                 return _error(f"Multiple entries matched '{old_text}'. Be more specific.",
                               matches=[e[:80] + ("..." if len(e) > 80 else "") for e in entries if old_text in e])
             if idx is None:
+                if exact_old_text:
+                    return _error(
+                        "Entry changed since it was staged; the reviewed target is no longer present exactly. "
+                        "Nothing was applied. Reject this pending write and recreate it against current memory.")
                 return self._consolidation_failure(_error(
                     f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text "
                     f"of the entry you want to {'replace' if new_content else 'remove'}.", current_entries=entries))
@@ -326,7 +330,8 @@ class MemoryStore:
 
     @staticmethod
     def _apply_batch_op(working: List[str], act: str, content: str, old_text: str,
-                        pos: str) -> Tuple[Optional[str], Optional[str]]:
+                        pos: str, *, exact_old_text: bool = False,
+                        expected_present: Optional[bool] = None) -> Tuple[Optional[str], Optional[str]]:
         """Apply one batch op to *working*; return ``(error message, previous content)``.
         Previous content is captured before each replace/remove, under the store lock.
         It is published only after the entire batch has been validated and persisted.
@@ -334,7 +339,11 @@ class MemoryStore:
         if act == "add":
             if not content:
                 return f"{pos}: content is required.", None
-            if content not in working:  # idempotent -- skip duplicate, don't fail the batch
+            present = content in working
+            if expected_present is not None and present != expected_present:
+                return (f"{pos}: memory changed since this batch was staged; entry presence no longer "
+                        "matches what was reviewed. Reject and recreate the pending write."), None
+            if not present:  # idempotent -- skip duplicate, don't fail the batch
                 working.append(content)
             return None, None
         if act not in ("replace", "remove"):
@@ -343,16 +352,20 @@ class MemoryStore:
             return f"{pos}: old_text is required.", None
         if act == "replace" and not content:
             return f"{pos}: content is required (use action='remove' to delete).", None
-        idx, ambiguous = _find_unique_match(working, old_text)
+        idx, ambiguous = _find_unique_match(working, old_text, exact_only=exact_old_text)
         if ambiguous:
             return f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.", None
         if idx is None:
+            if exact_old_text:
+                return (f"{pos}: entry changed since it was staged; the reviewed target is no longer "
+                        "present exactly. Reject this pending write and recreate it."), None
             return f"{pos}: no entry matched '{old_text}'.", None
         previous_content = working[idx]
         working[idx:idx + 1] = [content] if act == "replace" else []
         return None, previous_content
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def apply_batch(self, target: str, operations: List[Dict[str, Any]], *,
+                    exact_old_text: bool = False) -> Dict[str, Any]:
         """Apply add/replace/remove ops atomically against the FINAL budget, so one call
         can free space and add entries. All-or-nothing: any malformed / unmatched op or
         an over-limit result writes NOTHING and returns the first failure. Aborts do not
@@ -374,7 +387,9 @@ class MemoryStore:
                 act = op.get("action")
                 msg, previous_content = self._apply_batch_op(
                     working, act, (op.get("content") or op.get("new_text") or "").strip(),
-                    (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})")
+                    (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})",
+                    exact_old_text=exact_old_text,
+                    expected_present=op.get("expected_present") if exact_old_text else None)
                 if msg:
                     return self._batch_failure(target, msg)
                 if previous_content is not None:
@@ -402,6 +417,52 @@ class MemoryStore:
                 replaced_fields["removed_entries"] = removed
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
         return self._mutate(target, _apply)
+
+    def prepare_staged_payload(self, target: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Freeze destructive staged writes to the exact entry text reviewed now.
+
+        The normal tool may accept a short substring; approval must not. Batch
+        targets are resolved in operation order against the same working view.
+        """
+        action = payload.get("action")
+        operations = payload.get("operations") if action == "batch" else None
+        destructive = action in ("replace", "remove") or any(
+            isinstance(op, dict) and op.get("action") in ("replace", "remove")
+            for op in (operations or []))
+        if not destructive:
+            return {"success": True, "payload": payload}
+
+        def _prepare(entries, limit):
+            staged = dict(payload)
+            if action == "batch":
+                working, frozen = list(entries), []
+                for i, raw_op in enumerate(operations or []):
+                    op = dict(raw_op or {})
+                    act = op.get("action")
+                    content = (op.get("content") or op.get("new_text") or "").strip()
+                    if act == "add":
+                        op["expected_present"] = content in working
+                    msg, previous = self._apply_batch_op(
+                        working, act, content, (op.get("old_text") or "").strip(),
+                        f"Operation {i + 1} ({act or 'unknown'})")
+                    if msg:
+                        return self._batch_failure(target, msg)
+                    if act in ("replace", "remove"):
+                        op["old_text"] = previous
+                    frozen.append(op)
+                staged["operations"] = frozen
+            else:
+                old_text = (payload.get("old_text") or "").strip()
+                idx, ambiguous = _find_unique_match(entries, old_text)
+                if ambiguous:
+                    return _error(f"Multiple entries matched '{old_text}'. Be more specific.")
+                if idx is None:
+                    return _error(f"No entry matched '{old_text}'.")
+                staged["old_text"] = entries[idx]
+            staged["match_mode"] = STAGED_EXACT_MATCH
+            return {"success": True, "payload": staged}
+
+        return self._mutate(target, _prepare, skip_drift=True)
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
