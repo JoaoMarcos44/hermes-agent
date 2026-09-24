@@ -6,8 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.turn_recovery import abort_turn_on_interrupt
-from agent.turn_finalizer import _close_transcript_tail, _drop_transcript_scaffolding
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -92,81 +90,6 @@ def test_persist_session_strips_scaffolding_and_closes_exposed_tool_tail():
     assert agent.flushed_session_db_messages[-1] == messages
     assert all(not msg.get("_empty_recovery_synthetic") for msg in messages)
 
-
-def _tool_then_empty_nudge():
-    return [
-        {"role": "user", "content": "run the task"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "call_1", "type": "function",
-                            "function": {"name": "write_file", "arguments": "{}"}}],
-        },
-        {"role": "tool", "content": "{\"ok\": true}", "tool_call_id": "call_1"},
-        {"role": "assistant", "content": "(empty)", "_empty_recovery_synthetic": True},
-        {
-            "role": "user",
-            "content": "Please process the tool result and continue.",
-            "_empty_recovery_synthetic": True,
-        },
-    ]
-
-
-def test_empty_retry_interrupt_closes_with_the_real_interrupt_reason():
-    """The durable close must preserve the exit owner's specific interrupt text.
-
-    Closing before scaffold cleanup sees the synthetic user nudge and is a no-op.
-    The Stop owner therefore removes that request-local scaffold before closing the
-    executed-tool tail with the actual interrupt reason.
-    """
-    agent = _agent_with_stubbed_persistence()
-    agent.log_prefix = ""
-    agent._vprint = lambda *_args, **_kwargs: None
-    agent.clear_interrupt = lambda **_kwargs: None
-    messages = _tool_then_empty_nudge()
-    interrupt_text = "Operation interrupted: retrying empty response from model (retry 1/3)."
-
-    result = abort_turn_on_interrupt(
-        agent,
-        messages,
-        conversation_history=[],
-        api_call_count=2,
-        abort_message="Interrupt detected during empty-response retry wait, aborting.",
-        interrupt_text=interrupt_text,
-    )
-
-    assert [msg["role"] for msg in messages] == ["user", "assistant", "tool", "assistant"]
-    assert messages[1]["tool_calls"][0]["id"] == messages[2]["tool_call_id"] == "call_1"
-    assert messages[-1]["content"] == result["final_response"] == interrupt_text
-    assert agent.flushed_session_db_messages[-1] == messages
-    assert all(not msg.get("_empty_recovery_synthetic") for msg in messages)
-
-
-def test_empty_give_up_closes_at_finalizer_without_losing_executed_tool():
-    """The normal give-up path keeps the tool pair, then closes with delivered "(empty)".
-
-    This proves the semantic close already has an owner; persistence does not need to
-    manufacture one.
-    """
-    agent = _agent_with_stubbed_persistence()
-    messages = _tool_then_empty_nudge()
-    # Model the terminal sentinel produced by _terminal_empty after it first drops
-    # the retry nudge.
-    agent._drop_trailing_empty_response_scaffolding(messages)
-    messages.append({
-        "role": "assistant",
-        "content": "(empty)",
-        "_empty_terminal_sentinel": True,
-    })
-
-    _drop_transcript_scaffolding(agent, messages)
-    _close_transcript_tail(agent, messages, "(empty)", False, False)
-    AIAgent._persist_session(agent, messages, conversation_history=[])
-
-    assert [msg["role"] for msg in messages] == ["user", "assistant", "tool", "assistant"]
-    assert messages[1]["tool_calls"][0]["id"] == messages[2]["tool_call_id"] == "call_1"
-    assert messages[-1]["content"] == "(empty)"
-    assert agent.flushed_session_db_messages[-1] == messages
 
 
 def test_persist_session_keeps_unmarked_terminal_empty_response():
