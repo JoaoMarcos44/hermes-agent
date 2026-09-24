@@ -105,7 +105,7 @@ def _tool_then_empty_nudge():
 
 
 def test_empty_retry_interrupt_closes_with_the_real_interrupt_reason():
-    """Regression beyond #120827: the close must preserve the exit owner's text.
+    """The durable close must preserve the exit owner's specific interrupt text.
 
     Closing before scaffold cleanup sees the synthetic user nudge and is a no-op.
     A generic persist-time close then loses the specific retry/Stop reason. This
