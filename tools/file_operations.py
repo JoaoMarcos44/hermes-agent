@@ -1304,7 +1304,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 for line in lines
             ]
             digests = [m.group(1).lower() for m in matches if m]
-            if len(digests) == 1:
+            if len(lines) == 1 and len(digests) == 1:
                 if digests[0] != hashlib.sha256(content_bytes).hexdigest().lower():
                     return False, WriteResult(error=(
                         f"Post-write verification failed for {path}: on-disk "

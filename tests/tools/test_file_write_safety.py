@@ -912,3 +912,24 @@ def test_hash_verification_accepts_one_framed_result_with_outer_noise():
 
     verified, error = ShellFileOperations(Env(), cwd="/tmp")._verify_written_hash("/tmp/f", content)
     assert verified is True and error is None
+
+
+def test_hash_verification_rejects_extra_in_frame_output():
+    import hashlib
+    import re
+    from tools.file_operations import ShellFileOperations
+
+    content = b"same"
+    digest = hashlib.sha256(content).hexdigest()
+
+    class Env:
+        cwd = "/tmp"
+        def execute(self, command, **_kwargs):
+            marker = re.search(r"__HERMES_SHA_[0-9a-f]+__", command).group(0)
+            return {
+                "output": f"{marker}\n{digest}  /tmp/f\nunexpected diagnostic\n{marker}\n",
+                "returncode": 0,
+            }
+
+    verified, error = ShellFileOperations(Env(), cwd="/tmp")._verify_written_hash("/tmp/f", content)
+    assert verified is None and error is None
