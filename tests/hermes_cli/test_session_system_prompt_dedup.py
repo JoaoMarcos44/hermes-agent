@@ -59,7 +59,7 @@ def test_prompt_snapshots_are_deduplicated_and_hydrated_for_readers(db):
     assert db.list_pending_handoffs()[0]["system_prompt"] == prompt
 
 
-def test_prompt_replacement_and_route_changes_collect_only_orphans(db):
+def test_prompt_replacement_collects_orphans_but_route_changes_keep_references(db):
     shared_prompt = "Model: x-ai/grok-4.5\nProvider: nous"
     db.create_session(
         "s1",
@@ -70,6 +70,7 @@ def test_prompt_replacement_and_route_changes_collect_only_orphans(db):
     )
     db.create_session("s2", "cli", system_prompt=shared_prompt)
 
+    # Route metadata is not prompt ownership: both rows keep their shared snapshot.
     db.update_session_runtime_lock(
         "s1",
         model="anthropic/claude-opus-4.8",
@@ -77,7 +78,7 @@ def test_prompt_replacement_and_route_changes_collect_only_orphans(db):
         confirmed=True,
     )
     s1 = db.get_session("s1")
-    assert s1["system_prompt"] is None
+    assert s1["system_prompt"] == shared_prompt
     assert json.loads(s1["model_config"])["_branched_from"] == "parent"
     assert db.get_session("s2")["system_prompt"] == shared_prompt
     assert _prompt_count(db) == 1
@@ -87,12 +88,16 @@ def test_prompt_replacement_and_route_changes_collect_only_orphans(db):
         provider="openrouter",
         base_url="https://example.test/v1",
     )
-    assert db.get_session("s2")["system_prompt"] is None
-    assert _prompt_count(db) == 0
+    assert db.get_session("s2")["system_prompt"] == shared_prompt
+    assert _prompt_count(db) == 1
 
+    # Only replacing/removing a snapshot can orphan its content-addressed prompt.
     db.update_system_prompt("s2", "replacement")
     assert db.get_session("s2")["system_prompt"] == "replacement"
+    assert _prompt_count(db) == 2
     db.update_system_prompt("s2", None)
+    assert _prompt_count(db) == 1
+    db.update_system_prompt("s1", None)
     assert _prompt_count(db) == 0
 
 
