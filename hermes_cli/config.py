@@ -1315,12 +1315,9 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     # Missing/unparseable files never trip the floor gate.
     # Imported lazily because the steps call back into this module.
     from hermes_cli.config_migrations import (
-        SUPPORT_FLOOR_VERSION, run_migrations, support_floor_message)
+        SUPPORT_FLOOR_VERSION, repair_unversioned_config, run_migrations, support_floor_message)
 
-    try:
-        has_explicit_version = "_config_version" in read_user_config_raw()
-    except Exception:
-        has_explicit_version = False
+    has_explicit_version = has_config_version_stamp()
     floor_refused = (
         has_explicit_version and current_ver < SUPPORT_FLOOR_VERSION and current_ver < latest_ver)
     if floor_refused:
@@ -1330,6 +1327,10 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         sys.stderr.write(f"⚠ hermes config: {msg}\n")
         if not quiet:
             print(f"  ⚠ {msg}")
+    elif current_ver < latest_ver and not has_explicit_version:
+        # Missing provenance is not schema v0. Repair only config-local legacy shapes whose own
+        # retired keys prove the transform applies; never infer history from current values/absence.
+        repair_unversioned_config(results, quiet)
     else:
         run_migrations(current_ver, results, quiet)
 
@@ -1961,6 +1962,11 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def has_config_version_stamp(config_path: Optional[Path] = None) -> bool:
+    """Whether an existing user config explicitly declares its schema provenance."""
+    return "_config_version" in read_user_config_raw(config_path)
+
+
 def read_raw_config_readonly() -> Dict[str, Any]:
     """``read_raw_config()`` without the per-call deepcopy, for callers that ONLY READ.
     **Mutating the result corrupts the in-process cache for every subsequent caller.** Meant for
@@ -2004,15 +2010,24 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
 
 
 def atomic_config_write(config_path: Path, data: Dict[str, Any], *, extra_content_on_create: Optional[str] = None) -> None:
-    """THE ``config.yaml`` writer: fail-closed (``require_readable_config_before_write``) and
-    comment-preserving (ruamel round-trip merge of *data* onto the on-disk document). Every code
-    path that persists a config.yaml — ``save_config``, ``config set``, migrations, plugin
-    bookkeeping, gateway/TUI RPCs, auth resets — goes through here; a PyYAML dump of a config
-    path anywhere else is rejected by ``scripts/check_config_yaml_writers.py`` (#92554)."""
+    """THE ``config.yaml`` writer: fail-closed, comment-preserving, and provenance-owning.
+
+    Every production config writer reaches this boundary. A brand-new file therefore receives the
+    current schema stamp here even when a targeted writer (config set, personality/model selection,
+    gateway/TUI RPC, plugin bookkeeping) created it without going through setup. Existing unstamped
+    files are deliberately left unstamped so :func:`migrate_config` can repair legacy key shapes
+    before committing current provenance. Historical migrations write existing files, so this rule
+    also cannot falsely mark a partially-completed migration as current.
+    """
     from utils import atomic_roundtrip_yaml_save
 
     _refuse_failed_read(config_path, data)
-    atomic_roundtrip_yaml_save(config_path, data, extra_content_on_create=extra_content_on_create)
+    write_data = data
+    if not config_path.exists() and "_config_version" not in data:
+        latest = _coerce_config_version(DEFAULT_CONFIG.get("_config_version", 1)) or 1
+        write_data = {"_config_version": latest, **data}
+    atomic_roundtrip_yaml_save(
+        config_path, write_data, extra_content_on_create=extra_content_on_create)
 
 
 def load_config() -> Dict[str, Any]:

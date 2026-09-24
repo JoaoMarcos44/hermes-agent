@@ -16,6 +16,18 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+
+def _config_evidence_repair(step):
+    """Mark a migration that is safe without historical version provenance.
+
+    The step must be authorized by retired data in config.yaml itself and may only rewrite
+    config-owned state. Absence/default-value migrations and external-artifact mutations do not
+    qualify: a missing config stamp says nothing about the age of .env, SOUL.md, or user choices.
+    """
+    setattr(step, "_repairs_unversioned_config", True)
+    return step
+
+
 #: Auto-migration support floor. Configs whose on-disk ``_config_version`` is below this are NOT
 #: auto-migrated (v12 predates ~two years of releases; carrying the sub-v12 steps and the env
 #: bridges they consumed forever is not worth it). Below-floor configs are left byte-for-byte
@@ -110,6 +122,7 @@ def _lower_is(word: str) -> Callable[[Any], bool]:
     return lambda cur: isinstance(cur, str) and cur.strip().lower() == word
 
 
+@_config_evidence_repair
 def _migrate_to_12(results: Dict[str, Any], quiet: bool) -> None:
     # 11 → 12: custom_providers list → providers dict.
     _custom_provider_entry_to_provider_config = _cfg()._custom_provider_entry_to_provider_config
@@ -190,6 +203,7 @@ _LOCAL_WHISPER_MODELS = frozenset({
     "large-v3-turbo", "turbo"})
 
 
+@_config_evidence_repair
 def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
     # 13 → 14: legacy flat stt.model → provider section. A provider-agnostic `stt.model` fed
     # OpenAI names to faster-whisper ("Invalid model size"). Only the raw (user-written) config
@@ -224,6 +238,7 @@ def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
         config, results, quiet, None, "  ✓ Migrated legacy stt.model to provider-specific config")
 
 
+@_config_evidence_repair
 def _migrate_to_16(results: Dict[str, Any], quiet: bool) -> None:
     # 15 → 16: display.tool_progress_overrides → display.platforms.<plat>.tool_progress.
     config = read_raw_config()
@@ -247,6 +262,7 @@ def _migrate_to_16(results: Dict[str, Any], quiet: bool) -> None:
         f"  ✓ Migrated tool_progress_overrides → display.platforms: {migrated}")
 
 
+@_config_evidence_repair
 def _migrate_to_17(results: Dict[str, Any], quiet: bool) -> None:
     # 16 → 17: remove legacy compression.summary_* keys; non-empty, non-default values move to
     # auxiliary.compression without overriding an explicit (non-"auto") aux value.
@@ -375,6 +391,7 @@ def _migrate_to_23(results: Dict[str, Any], quiet: bool) -> None:
                     f"({', '.join(added)}) — edit via `hermes config set`")
 
 
+@_config_evidence_repair
 def _migrate_to_29(results: Dict[str, Any], quiet: bool) -> None:
     # 28 → 29: memory/skills tri-state write_mode (on|off|approve) → boolean write_approval.
     # Only "approve" carried gating intent → true; the old "off = block writes" mode is dropped
@@ -401,6 +418,7 @@ def _migrate_to_29(results: Dict[str, Any], quiet: bool) -> None:
 # at read time and persisting a default would only bloat a lean config. No registry entry.
 
 
+@_config_evidence_repair
 def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
     # 32 → 33: max_async_children is deprecated; fold a raised value into max_concurrent_children
     # (take the max so nobody loses headroom), then drop it.
@@ -484,6 +502,7 @@ def _migrate_to_34(results: Dict[str, Any], quiet: bool) -> None:
             "manual system prompts; personalities live in display.personality.")
 
 
+@_config_evidence_repair
 def _migrate_to_38(results: Dict[str, Any], quiet: bool) -> None:
     # 37 → 38: the bundled observability/nemo_relay plugin was removed (Relay lifecycle moved
     # into the agent core); drop it from plugins.enabled.
@@ -510,6 +529,7 @@ def _migrate_to_38(results: Dict[str, Any], quiet: bool) -> None:
         print(f"  ⚠ {message}")
 
 
+@_config_evidence_repair
 def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
     # 38 → 39: strip the retired `bfl` toolset wherever a backfill/picker save wrote it, so stale
     # config can't resurrect an unknown toolset.
@@ -605,6 +625,7 @@ def _migrate_to_45(results: Dict[str, Any], quiet: bool) -> None:
         "Uncheck Connections in `hermes tools` to turn it off.")
 
 
+@_config_evidence_repair
 def _migrate_to_46(results: Dict[str, Any], quiet: bool) -> None:
     # 45 → 46: the profile editor used to switch an MCP server off with `disabled: true`, a key no
     # runtime reader consults, so the server kept running. Carry that choice over to `enabled:
@@ -718,24 +739,24 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (41, _migrate_to_41),
     # 41 → 42: cron.model_drift_guard is gone. Unpinned jobs now run on their creation snapshot
     # instead of failing closed when the global model changes, so the toggle has nothing to gate.
-    (42, functools.partial(
+    (42, _config_evidence_repair(functools.partial(
         _rewrite_key, section="cron", key="model_drift_guard", new=None,
         match=lambda cur: cur is not None,
         added="removed cron.model_drift_guard",
         message=(
             "  ✓ Removed cron.model_drift_guard — unpinned cron jobs now keep running on the "
             "model/provider they were created under when the global default changes, instead "
-            "of being skipped. Pin a job or set cron.model to move it."))),
+            "of being skipped. Pin a job or set cron.model to move it.")))),
     # 42 → 43: gateway.multiplex_profile_allowlist is gone. A multiplexing default gateway serves
     # every live profile under profiles/; a profile that must not be served is archived or deleted.
-    (43, functools.partial(
+    (43, _config_evidence_repair(functools.partial(
         _rewrite_key, section="gateway", key="multiplex_profile_allowlist", new=None,
         match=lambda _cur: True,
         added="removed gateway.multiplex_profile_allowlist",
         message=(
             "  ✓ Removed gateway.multiplex_profile_allowlist — the multiplexing gateway now serves "
             "every profile under profiles/. Delete or archive a profile you do not want served."),
-        extra_guard=lambda raw: "multiplex_profile_allowlist" in raw)),
+        extra_guard=lambda raw: "multiplex_profile_allowlist" in raw))),
     # 43 → 44: curator prunes faster — stale 30→14 days, archive 90→30 days. A skill nobody has
     # touched in a month is prompt weight, not knowledge; archival is recoverable. Only the OLD
     # defaults are rewritten; an explicit user value is preserved.
@@ -756,24 +777,40 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
 )
 
 
+def _run_migration_step(
+    target_ver: int, migration_fn: Callable[[Dict[str, Any], bool], None],
+    results: Dict[str, Any], quiet: bool,
+) -> None:
+    """Run one migration with the ladder's existing non-fatal error contract."""
+    try:
+        migration_fn(results, quiet)
+    except Exception as exc:
+        warning = f"config migration to v{target_ver} failed and was skipped: {exc}"
+        results.setdefault("warnings", []).append(warning)
+        logger.warning("%s", warning)
+        if not quiet:
+            print(f"  ⚠ {warning}")
+
+
+def repair_unversioned_config(results: Dict[str, Any], quiet: bool) -> None:
+    """Repair only legacy config.yaml shapes that carry their own migration evidence.
+
+    This is deliberately separate from :func:`run_migrations`: a file with no version stamp has
+    no historical position in the ladder. Positive retired-key evidence can authorize a local
+    config rewrite, but it cannot authorize value/default inference or writes to other artifacts.
+    """
+    for target_ver, migration_fn in MIGRATIONS:
+        if getattr(migration_fn, "_repairs_unversioned_config", False):
+            _run_migration_step(target_ver, migration_fn, results, quiet)
+
+
 def run_migrations(current_ver: int, results: Dict[str, Any], quiet: bool) -> None:
     """Apply every registered migration whose target version exceeds *current_ver*.
 
     *current_ver* is the on-disk schema version captured ONCE before any step runs and does not
-    advance between steps — each step is gated on the same initial value.
+    advance between steps — each step is gated on the same initial value. Unversioned recovery is
+    intentionally a separate phase; this runner only interprets explicit historical provenance.
     """
     for target_ver, migration_fn in MIGRATIONS:
         if current_ver < target_ver:
-            try:
-                migration_fn(results, quiet)
-            except Exception as exc:
-                # A malformed nested value in one step must not abort the rest of the
-                # ladder (config loading itself fails otherwise). Loud, not silent.
-                warning = f"config migration to v{target_ver} failed and was skipped: {exc}"
-                results.setdefault("warnings", []).append(warning)
-                # Quiet callers (profile creation, unattended update) discard ``results`` and
-                # migrate_config still stamps the latest version, so without a log line the
-                # skipped step vanishes for good.
-                logger.warning("%s", warning)
-                if not quiet:
-                    print(f"  ⚠ {warning}")
+            _run_migration_step(target_ver, migration_fn, results, quiet)

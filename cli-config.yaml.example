@@ -4,6 +4,10 @@
 # This file configures CLI behavior; only documented secret environment
 # variables in .env take precedence over their corresponding settings.
 
+# Schema provenance: installers copy this file directly, so keep this in sync with
+# DEFAULT_CONFIG["_config_version"].
+_config_version: 46
+
 # =============================================================================
 # Database Configuration
 # =============================================================================

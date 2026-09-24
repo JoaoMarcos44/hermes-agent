@@ -9,6 +9,7 @@ from typing import Iterable
 
 from hermes_cli.config import (
     check_config_version,
+    has_config_version_stamp,
     get_config_path,
     get_env_path,
     migrate_config,
@@ -55,7 +56,7 @@ def main() -> int:
     # leaves the file untouched), so don't run the backup/verify dance that
     # would raise "did not advance config version" and block the boot.
     # Warn-and-continue matches the CLI's fail-safe posture.
-    if current_ver < SUPPORT_FLOOR_VERSION:
+    if current_ver < SUPPORT_FLOOR_VERSION and has_config_version_stamp():
         print(
             f"[config-migrate] WARNING: {support_floor_message()}",
             file=sys.stderr,
