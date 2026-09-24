@@ -2121,6 +2121,65 @@ CONFIG_SCHEMA = ProviderConfigSchema(
         assert get_env_value(custom_endpoint_key_env("local-8000")) == "sk-first"
         assert get_env_value(custom_endpoint_key_env("local-8001")) == "sk-second"
 
+    def test_secret_previews_round_trip_without_overwriting_credentials(self):
+        """GET previews are display tokens: posting them back is a no-op, never a credential rotation."""
+        from hermes_cli.config import custom_endpoint_key_env, get_env_value, load_env, save_env_value
+
+        env_key, env_secret = "OPENAI_API_KEY", "sk-env-secret-1234567890"
+        save_env_value(env_key, env_secret)
+        env_preview = self.client.get("/api/env").json()[env_key]["redacted_value"]
+        assert self.client.put("/api/env", json={"key": env_key, "value": env_preview}).status_code == 200
+        assert get_env_value(env_key) == env_secret
+
+        channel_key, channel_secret = "WECOM_SECRET", "wecom-secret-1234567890"
+        save_env_value(channel_key, channel_secret)
+        platforms = self.client.get("/api/messaging/platforms").json()["platforms"]
+        wecom = next(platform for platform in platforms if platform["id"] == "wecom")
+        channel_preview = next(field for field in wecom["env_vars"] if field["key"] == channel_key)["redacted_value"]
+        assert self.client.put(
+            "/api/messaging/platforms/wecom", json={"env": {channel_key: channel_preview}}
+        ).status_code == 200
+        assert get_env_value(channel_key) == channel_secret
+
+        endpoint_secret = "endpoint-secret-1234567890"
+        assert self.client.post("/api/providers/custom-endpoints", json={
+            "id": "masked-endpoint", "name": "Masked endpoint",
+            "base_url": "https://masked.example.com/v1", "model": "masked-model",
+            "api_key": endpoint_secret,
+        }).status_code == 200
+        endpoint = next(
+            item for item in self.client.get("/api/providers/custom-endpoints").json()["endpoints"]
+            if item["id"] == "masked-endpoint"
+        )
+        assert endpoint["api_key_preview"] and endpoint_secret not in endpoint["api_key_preview"]
+        assert self.client.post("/api/providers/custom-endpoints", json={
+            "id": endpoint["id"], "name": endpoint["name"], "base_url": endpoint["base_url"],
+            "model": endpoint["model"], "api_key": endpoint["api_key_preview"],
+        }).status_code == 200
+        assert load_env()[custom_endpoint_key_env("masked-endpoint")] == endpoint_secret
+
+    def test_messaging_process_env_preview_never_becomes_a_dotenv_secret(self, monkeypatch):
+        """The unscoped GET may fall back to os.environ; Save must recognize that exact preview too."""
+        from hermes_cli.config import load_env, redact_key
+
+        key, secret = "WECOM_SECRET", "inherited-wecom-secret-1234567890"
+        monkeypatch.setenv(key, secret)
+        assert key not in load_env()
+
+        platforms = self.client.get("/api/messaging/platforms").json()["platforms"]
+        wecom = next(platform for platform in platforms if platform["id"] == "wecom")
+        preview = next(field for field in wecom["env_vars"] if field["key"] == key)["redacted_value"]
+        assert preview == redact_key(secret)
+
+        response = self.client.put("/api/messaging/platforms/wecom", json={"env": {key: preview}})
+        assert response.status_code == 200
+        assert key not in load_env(), "a display preview must not be materialized into .env"
+
+        replacement = "replacement-wecom-secret-1234567890"
+        response = self.client.put("/api/messaging/platforms/wecom", json={"env": {key: replacement}})
+        assert response.status_code == 200
+        assert load_env()[key] == replacement
+
     def test_custom_endpoint_response_reports_a_key_held_in_env(self):
         """has_api_key must follow key_env, not just a plaintext api_key.
 
