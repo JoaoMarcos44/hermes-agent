@@ -677,9 +677,11 @@ class SessionSessionsMixin:
         self, session_id: str, model: str, provider: Optional[str] = None, *,
         base_url: Optional[str] = None, api_mode: Optional[str] = None,
     ) -> None:
-        """Set the model after a mid-session /model switch (unconditionally), null system_prompt so
-        stale Model:/Provider: footers rebuild, and drop any Browser runtime lock (lineage markers
-        survive).
+        """Set the model after a mid-session /model switch (unconditionally) and drop any Browser
+        runtime lock (lineage markers survive).
+
+        The stored prompt stays intact. The next restore validates its runtime identity and rebuilds
+        only when the route actually changed, so same-route commits keep the provider cache prefix.
 
         When *provider* is given the whole route is written, in both shapes resume reads (top-level
         keys for the TUI/Desktop, ``gateway_runtime`` for the CLI), so a later resume recombines the
@@ -698,8 +700,7 @@ class SessionSessionsMixin:
             route = {"provider": provider, "base_url": base_url or None, "api_mode": api_mode or None}
             patch.update(route, gateway_runtime=route)
         self._write_model_config_patch(
-            session_id, patch, "UPDATE sessions SET model = ?, model_config = ?, "
-            "system_prompt = NULL, system_prompt_hash = NULL WHERE id = ?",
+            session_id, patch, "UPDATE sessions SET model = ?, model_config = ? WHERE id = ?",
             lambda merged: (model, merged, session_id),
         )
 
@@ -709,14 +710,12 @@ class SessionSessionsMixin:
         params: Optional[Callable[[Optional[str]], tuple]] = None,
     ) -> None:
         """Merge ``patch`` into model_config then run ``sql`` with ``params(merged)`` in one write
-        transaction; no-op when the row doesn't exist. Custom ``sql`` (prompt-nulling) also GCs prompts."""
+        transaction; no-op when the row doesn't exist."""
         def _do(conn):
             merged = self._merge_model_config_json(conn, session_id, patch)
             if merged is _MODEL_CONFIG_ROW_MISSING:
                 return
             conn.execute(sql, params(merged) if params else (merged, session_id))
-            if params is not None:
-                self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
     def _merge_model_config_json(
@@ -755,8 +754,8 @@ class SessionSessionsMixin:
         model_options: Optional[Dict[str, Any]] = None, route_source: Optional[str] = None,
         confirmed: bool = False,
     ) -> None:
-        """Persist a Browser / API-client runtime lock into model_config (lineage markers survive); null
-        system_prompt so cached footers cannot lie."""
+        """Persist a Browser / API-client runtime lock into model_config (lineage markers survive).
+        Prompt validity is decided by the restore-time runtime-identity check."""
         lock = {
             "provider": provider or "", "model": model or "", "model_options": model_options or {},
             "route_source": route_source or "", "confirmed": bool(confirmed), "updated_at": time.time(),
@@ -765,9 +764,7 @@ class SessionSessionsMixin:
             session_id, {"browser_model_lock": lock},
             """UPDATE sessions SET
                    model_config = ?,
-                   model = COALESCE(?, model),
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
+                   model = COALESCE(?, model)
                    WHERE id = ?""",
             lambda merged: (merged, model, session_id),
         )

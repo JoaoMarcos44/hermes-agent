@@ -1692,8 +1692,16 @@ def _adopt_live_compression_child(
     agent.session_id = child_session_id
     _rebind_session_context(child_session_id)
     agent._session_db_created = True
-    if child.get("system_prompt"):
-        agent._cached_system_prompt = child["system_prompt"]
+    # The cache slot still belongs to the parent until adoption replaces it. Clear it first:
+    # if the child has no prompt or its bytes fail the runtime gate, turn setup must run the
+    # normal restore/rebuild path rather than serving the inherited parent prompt under child state.
+    agent._cached_system_prompt = None
+    child_prompt = child.get("system_prompt")
+    if child_prompt:
+        # Adoption bypasses the normal restore branch, so apply its identity gate here too.
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+        if _stored_prompt_matches_runtime(agent, child_prompt):
+            agent._cached_system_prompt = child_prompt
     agent._last_flushed_db_idx = len(recovered)
     agent._flushed_db_message_session_id = child_session_id
     agent._flushed_db_message_ids = {id(message) for message in recovered if isinstance(message, dict)}
