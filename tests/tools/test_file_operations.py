@@ -842,6 +842,33 @@ def test_binary_sample_ignores_login_and_xtrace_noise():
     assert sample == payload
 
 
+def test_exact_byte_reader_stays_usable_with_real_xtrace(tmp_path, monkeypatch):
+    from tools.file_operations import ShellFileOperations
+
+    payload = b"HEADER\nVERSION=1\n"
+    target = tmp_path / "file.txt"
+    target.write_bytes(payload)
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "0")
+
+    class Env:
+        cwd = str(tmp_path)
+
+        def execute(self, command, **_kwargs):
+            proc = subprocess.run(
+                ["bash", "-c", f"set -x; {command}"],
+                capture_output=True,
+                text=True,
+            )
+            return {
+                "output": proc.stdout + proc.stderr,
+                "returncode": proc.returncode,
+            }
+
+    data, error = ShellFileOperations(Env(), cwd=str(tmp_path))._read_exact_bytes(str(target))
+    assert error is None
+    assert data == payload
+
+
 class TestFramedBase64Transport:
     def test_marker_only_lines_ignore_shell_echo_noise(self):
         from tools.environments.base import decode_framed_base64
