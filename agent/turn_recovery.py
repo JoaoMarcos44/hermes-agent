@@ -1268,13 +1268,16 @@ def abort_turn_on_interrupt(
     """Announce ``abort_message``, close any open tool sequence with ``interrupt_text``,
     persist, clear the interrupt and return the ``interrupted`` result dict."""
     _vlines(agent, f"⚡ {abort_message}")
-    # Empty-response recovery may leave a synthetic assistant+nudge user pair after the
-    # executed tool result. Remove only that request-local scaffold *before* closing the
-    # interrupted turn, so the real interrupt_text becomes the durable assistant close.
-    # Persistence stays a storage boundary and never has to invent semantic transcript text.
-    agent._drop_trailing_empty_response_scaffolding(messages)
     close_interrupted_tool_sequence(messages, interrupt_text)
-    agent._persist_session(messages, conversation_history)
+    # If empty-response recovery scaffolding is still on the tail, the close above is
+    # intentionally a no-op because the synthetic nudge is last. Persistence removes that
+    # request-local scaffold and closes the exposed executed-tool tail with the same
+    # interrupt text, preserving both the side effect and the real exit reason.
+    agent._persist_session(
+        messages,
+        conversation_history,
+        empty_response_tail_close_text=interrupt_text,
+    )
     # The turn was stopped, not rebuilt: a pending steer was aimed at this turn's next
     # tool iteration, which will no longer happen — drop it (hard-cancel semantics).
     agent.clear_interrupt(hard_cancel=True)
