@@ -75,6 +75,27 @@ def test_unversioned_config_preserves_current_user_choices_and_migrates_legacy_k
     assert after["_config_version"] == DEFAULT_CONFIG["_config_version"]
 
 
+def test_unversioned_config_does_not_authorize_external_soul_migration(tmp_path, monkeypatch):
+    """A missing config stamp says nothing about the age or ownership of SOUL.md."""
+    from hermes_cli.config import migrate_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (tmp_path / "config.yaml").write_text("display:\n  personality: kawaii\n", encoding="utf-8")
+    soul = tmp_path / "SOUL.md"
+    original = (
+        "# Me\n\n"
+        "## Messaging other agents\n"
+        "This is user-authored text in a current SOUL, not migration evidence.\n\n"
+        "## Preferences\nKeep this too.\n"
+    )
+    soul.write_text(original, encoding="utf-8")
+
+    migrate_config(interactive=False, quiet=True)
+
+    assert soul.read_text(encoding="utf-8") == original
+
+
 def test_unversioned_runner_uses_step_metadata_instead_of_a_version_allowlist(monkeypatch):
     import hermes_cli.config_migrations as migrations
 

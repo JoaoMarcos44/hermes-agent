@@ -632,11 +632,11 @@ def _migrate_to_46(results: Dict[str, Any], quiet: bool) -> None:
 
 
 def _evidence_gated(step: Callable[[Dict[str, Any], bool], None]):
-    """Mark a step safe for a config with no version stamp.
+    """Mark a config-local step safe for a config with no version stamp.
 
-    These migrations only mutate when a retired key/artifact proves the config predates that
-    change. Value/default/absence-based migrations must remain unmarked: on a never-stamped
-    current-schema file those values are user choices, not evidence of an old schema.
+    The migration must both prove applicability from retired config data and keep its mutation
+    inside config.yaml. External artifacts have independent provenance and stay version-gated.
+    Value/default/absence-based migrations must remain unmarked.
     """
     setattr(step, "_runs_without_version_stamp", True)
     return step
@@ -648,8 +648,8 @@ def _evidence_gated(step: Callable[[Dict[str, Any], bool], None]):
 #: configs already AT v12 still get every step below; only configs BELOW 12 are refused by the
 #: floor gate in run_migrations()'s caller. Versions absent here (15, 18-20, 22, 24, 26-28, 30)
 #: only added a schema default that runtime merging supplies without a write. Steps wrapped in
-#: _evidence_gated() may also run on never-stamped configs because a legacy key/artifact is their
-#: own proof that the targeted shape predates the migration.
+#: _evidence_gated() may also run on never-stamped configs when retired config data is both the
+#: proof and the mutation target. External files keep their own version provenance.
 MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (12, _evidence_gated(_migrate_to_12)),
     (13, _migrate_to_13),
@@ -728,7 +728,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
         added="model_catalog.ttl_hours 1 → ttl_minutes 20 (default)",
         message="  ✓ Model catalog now refreshes every 20 minutes (model_catalog.ttl_minutes)",
         extra_guard=lambda raw: "ttl_minutes" not in raw)),
-    (41, _evidence_gated(_migrate_to_41)),
+    (41, _migrate_to_41),
     # 41 → 42: cron.model_drift_guard is gone. Unpinned jobs now run on their creation snapshot
     # instead of failing closed when the global model changes, so the toggle has nothing to gate.
     (42, _evidence_gated(functools.partial(
