@@ -1,5 +1,6 @@
 """Tests for tools/file_operations.py — deny list, result dataclasses, helpers."""
 
+import base64
 import os
 import pytest
 import subprocess
@@ -815,3 +816,23 @@ class TestEscapeNativeToolArg:
         assert node_cmds, f"no node command captured in: {commands}"
         assert "'C:/Users/alice/app/main.js'" in node_cmds[0]
         assert "/c/Users" not in node_cmds[0]
+
+
+class TestFramedBase64Transport:
+    def test_marker_only_lines_ignore_shell_echo_noise(self):
+        from tools.environments.base import decode_framed_base64
+        marker = "__HERMES_RAW_123456789abc__"
+        payload = b"HEADER\nVERSION=1\n"
+        encoded = base64.b64encode(payload).decode("ascii")
+        output = (
+            f"+ echo {marker}\n"
+            f"wrapper command mentions {marker} twice: {marker}\n"
+            f"{marker}\n{encoded}\n{marker}\n"
+        )
+        assert decode_framed_base64(output, marker) == payload
+
+    def test_rejects_ambiguous_marker_only_lines(self):
+        from tools.environments.base import decode_framed_base64
+        marker = "__HERMES_RAW_123456789abc__"
+        output = f"{marker}\nQQ==\n{marker}\n{marker}\n"
+        assert decode_framed_base64(output, marker) is None
