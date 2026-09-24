@@ -31,7 +31,8 @@ from agent.prompt_caching import (
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
-    identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
+    identity_line_value, note_inert_pinned_tools, runtime_host_value, split_runtime_boundary,
+    stage_surface_switch_note,
 )
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
@@ -855,6 +856,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
+    # The delimited runtime block identifies the current prompt layout. Legacy snapshots can
+    # predate Model:/Provider: trailers entirely, so keep their historical fail-open behavior;
+    # on a modern snapshot, a missing identity line is itself stale when the runtime has a value.
+    modern_layout = bool(split_runtime_boundary(prompt)[1])
     # Model/provider identity, then cwd drift.  A cwd change is a real content change (context
     # files, the workspace snapshot and the coding posture are all resolved from it), so it
     # still rebuilds; the runtime surface does not (agent/surface_switch.py).
@@ -862,6 +867,8 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
         stored = identity_line_value(prompt, label)
         current = str(getattr(agent, attr, "") or "").strip()
         if stored and current and stored != current:
+            return False
+        if current and modern_layout and not stored:
             return False
     # A prompt stamped for another session (a /branch child copies its parent's bytes) must not
     # tell the model a foreign Session ID.  Checked only when the trailer is on: with it off, a
