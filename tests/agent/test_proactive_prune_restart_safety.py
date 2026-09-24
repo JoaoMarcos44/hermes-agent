@@ -246,3 +246,50 @@ def test_patch_session_model_config_merge_and_delete(tmp_path: Path) -> None:
     db.patch_session_model_config(session_id, {})
 
 
+def _prune_case(tmp_path: Path, sid: str, *, row_ids: bool = True):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(sid, source="cli")
+    db.append_messages_batch(sid, _history())
+    agent = _build_agent(db, sid, platform="cli")
+    _configure_pruning(agent)
+    held = db.get_resume_conversations(sid)[0] if row_ids else db.get_messages_as_conversation(sid)
+    return db, agent, held
+
+
+def test_prune_preserves_turn_appended_after_loaded_snapshot(tmp_path: Path) -> None:
+    sid = "PRUNE_FOREIGN_TURN"
+    db, agent, held = _prune_case(tmp_path, sid)
+    foreign = "[from Telegram] the vault code is 7741"
+    db.append_message(sid, "user", foreign)
+
+    _result, count = agent.context_compressor.prune_tool_results_only(held, current_tokens=120_000)
+
+    assert count >= 1
+    live = [m["content"] for m in db.get_messages_as_conversation(sid)]
+    assert live[-1] == foreign
+    assert live.count(foreign) == 1
+
+
+@pytest.mark.parametrize("reason", ["lease", "row-id"])
+def test_prune_refuses_unprovable_source_without_mutation(tmp_path: Path, reason: str) -> None:
+    sid = f"PRUNE_REFUSE_{reason}"
+    db, agent, held = _prune_case(tmp_path, sid, row_ids=reason != "row-id")
+    before = [m["content"] for m in held]
+    if reason == "lease":
+        assert db.try_acquire_compression_lock(sid, "batch-winner") is True
+    else:
+        held[0]["_row_id"] = 999_999
+
+    try:
+        result, count = agent.context_compressor.prune_tool_results_only(
+            held, current_tokens=120_000,
+        )
+    finally:
+        if reason == "lease":
+            db.release_compression_lock(sid, "batch-winner")
+
+    assert result is held and count == 0
+    assert [m["content"] for m in db.get_messages_as_conversation(sid)] == before
+    if reason == "row-id":
+        assert held[0]["_row_id"] == 999_999
+

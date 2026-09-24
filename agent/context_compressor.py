@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import re
 import time
@@ -380,6 +381,37 @@ def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
         if isinstance(msg, dict):
             msg.pop(_DB_PERSISTED_MARKER, None)
 
+
+ARCHIVE_REWRITE_LEASE_TTL_SECONDS = 300.0
+
+
+def _begin_archive_rewrite_guard(
+    session_db: Any, session_id: str, messages: List[Dict[str, Any]], *, label: str,
+) -> Optional[Tuple[str, List[int], str]]:
+    """Acquire the rewrite lease and return ``(holder, prefix_ids, payload_digest)``."""
+    holder = f"pid={os.getpid()}:rewrite={label.replace(' ', '_')}:nonce={uuid.uuid4().hex}"
+    try:
+        if not session_db.try_acquire_compression_lock(
+            session_id, holder, ttl_seconds=ARCHIVE_REWRITE_LEASE_TTL_SECONDS,
+        ):
+            logger.info("%s skipped: another compression rewrite owns the session lease", label)
+            return None
+        proof = session_db.match_active_message_prefix_proof(session_id, messages)
+    except Exception:
+        logger.debug("%s rewrite admission failed", label, exc_info=True)
+        proof = None
+    if proof is not None:
+        return holder, proof[0], proof[1]
+    logger.warning("%s skipped: held durable prefix cannot be proved current", label)
+    with contextlib.suppress(Exception):
+        session_db.release_compression_lock(session_id, holder)
+    return None
+
+
+def _release_archive_rewrite_guard(session_db: Any, session_id: str, guard: Any) -> None:
+    if guard is not None:
+        with contextlib.suppress(Exception):
+            session_db.release_compression_lock(session_id, guard[0])
 
 def stamp_db_persisted_markers(messages: List[Dict[str, Any]]) -> None:
     """Fulfil the post-commit contract of ``SessionDB.archive_and_compact()``.
@@ -3271,14 +3303,26 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         runway = max(reclaimed, self.proactive_prune_tokens, self.proactive_prune_min_reclaim_tokens)
         next_rearm_tokens = after + runway
         if session_db and session_id:
+            guard = _begin_archive_rewrite_guard(
+                session_db, session_id, messages, label="proactive tool-result prune",
+            )
+            if guard is None:
+                self._warn_reclamation_no_op("prune:rewrite_guard_unavailable", current_tokens, before=before)
+                return messages, 0
+            holder, expected_ids, expected_digest = guard
             try:
                 session_db.archive_and_compact(
                     session_id, pruned_msgs,
                     model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens},
+                    expected_active_prefix_ids=expected_ids,
+                    expected_active_prefix_digest=expected_digest,
+                    lock_holder=holder,
                 )
             except Exception as exc:
                 logger.warning("Proactive tool-result prune DB commit failed; keeping the original transcript: %s", exc)
                 return messages, 0
+            finally:
+                _release_archive_rewrite_guard(session_db, session_id, guard)
             # Shared post-commit stamp site with the in-place commit and micro-compaction sync.
             # See #98450.
             stamp_db_persisted_markers(pruned_msgs)
