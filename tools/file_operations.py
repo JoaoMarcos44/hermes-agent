@@ -151,6 +151,7 @@ MISSING_SENTINEL = "__hermes_missing__"
 _READ_SENTINEL_PREFIX = "__HERMES_RF_"
 _WRITE_SENTINEL_PREFIX = "__HERMES_WF_"
 _BYTES_SENTINEL_PREFIX = "__HERMES_RB_"
+_HASH_SENTINEL_PREFIX = "__HERMES_SHA_"
 
 
 def _new_sentinel(prefix: str) -> str:
@@ -1289,14 +1290,22 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         return self._file_has_bom(path, pre_content), pre_content, ending
 
     def _verify_written_hash(self, path: str, content_bytes: bytes) -> tuple[Optional[bool], Optional[WriteResult]]:
-        """Compare the on-disk sha256 to the intended bytes: ``(verified, error)``.
-        The explicit flag saves the model a confirming re-read; a mismatch is a hard
-        error. ``verified`` is None when the hash could not be taken."""
+        """Verify one framed sha256sum result; surrounding shell output is never evidence."""
         try:
-            hash_result = self._exec(f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null")
-            if hash_result.exit_code == 0 and hash_result.stdout.strip():
-                disk_sha = hash_result.stdout.strip().split()[0]
-                if disk_sha != hashlib.sha256(content_bytes).hexdigest():
+            marker = _new_sentinel(_HASH_SENTINEL_PREFIX)
+            result = self._exec(
+                f"set +x 2>/dev/null; echo {marker}; "
+                f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null; "
+                f"__hs=$?; echo {marker}; exit $__hs")
+            payload = extract_framed_payload(result.stdout or "", marker) if result.exit_code == 0 else None
+            lines = [line.strip() for line in (payload or "").splitlines() if line.strip()]
+            matches = [
+                re.match(r"^([0-9a-fA-F]{64})(?:[ \t]+.*)?$", line)
+                for line in lines
+            ]
+            digests = [m.group(1).lower() for m in matches if m]
+            if len(digests) == 1:
+                if digests[0] != hashlib.sha256(content_bytes).hexdigest().lower():
                     return False, WriteResult(error=(
                         f"Post-write verification failed for {path}: on-disk "
                         "content hash differs from the intended write. The "

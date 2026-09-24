@@ -870,3 +870,45 @@ def test_v4a_preserves_marker_literal_and_terminal_bytes(tmp_path: Path):
     result = ops.patch_v4a(patch)
     assert result.success, result.error
     assert target.read_bytes() == original.replace(b"VERSION=1", b"VERSION=2")
+
+
+def test_hash_verification_ignores_digest_shaped_path_in_shell_noise():
+    import hashlib
+    import re
+    from tools.file_operations import ShellFileOperations
+
+    intended = b"intended"
+    expected = hashlib.sha256(intended).hexdigest()
+    actual = hashlib.sha256(b"different").hexdigest()
+
+    class Env:
+        cwd = "/tmp"
+        def execute(self, command, **_kwargs):
+            marker = re.search(r"__HERMES_SHA_[0-9a-f]+__", command).group(0)
+            return {
+                "output": f"+ sha256sum /tmp/{expected}\n{marker}\n{actual}  /tmp/{expected}\n{marker}\n",
+                "returncode": 0,
+            }
+
+    verified, error = ShellFileOperations(Env(), cwd="/tmp")._verify_written_hash(
+        f"/tmp/{expected}", intended)
+    assert verified is False
+    assert error is not None
+
+
+def test_hash_verification_accepts_one_framed_result_with_outer_noise():
+    import hashlib
+    import re
+    from tools.file_operations import ShellFileOperations
+
+    content = b"same"
+    digest = hashlib.sha256(content).hexdigest()
+
+    class Env:
+        cwd = "/tmp"
+        def execute(self, command, **_kwargs):
+            marker = re.search(r"__HERMES_SHA_[0-9a-f]+__", command).group(0)
+            return {"output": f"TERM\n{marker}\n{digest}  /tmp/f\n{marker}\nprompt\n", "returncode": 0}
+
+    verified, error = ShellFileOperations(Env(), cwd="/tmp")._verify_written_hash("/tmp/f", content)
+    assert verified is True and error is None
