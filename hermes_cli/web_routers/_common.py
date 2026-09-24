@@ -118,6 +118,14 @@ def require(value: Optional[str], detail: str) -> str:
     return stripped
 
 
+def unchanged_secret_preview(submitted: str, current: Any) -> bool:
+    """True only for the exact display preview of the current secret."""
+    if not current:
+        return False
+    from hermes_cli.config import redact_key
+    return submitted == redact_key(str(current))
+
+
 # Corrupt-store reporting for polled read endpoints. The dashboard polls analytics every few
 # seconds; a persistently malformed state.db once produced ~520K identical tracebacks in 24 h
 # (#96591). One WARNING per store per interval, then debug; the caller gets an explicit status

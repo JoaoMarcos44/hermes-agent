@@ -32,7 +32,7 @@ from hermes_cli.web_server_gateway import _restart_gateway_after
 from hermes_cli.web_server_messaging import (
     _TelegramOnboardingPairing, _WhatsAppOnboardingSession, _messaging_platform_catalog, _telegram_onboarding_error_message, _telegram_onboarding_lock, _telegram_onboarding_pairings, _whatsapp_onboarding_payload, _whatsapp_onboarding_sessions,
 )
-from hermes_cli.web_routers._common import http_failure
+from hermes_cli.web_routers._common import http_failure, unchanged_secret_preview
 from hermes_cli.web_models import (
     MessagingPlatformUpdate, TelegramOnboardingApply, TelegramOnboardingStart,
     WhatsAppOnboardingApply, WhatsAppOnboardingStart,
@@ -196,6 +196,11 @@ def _platform_enablement(
     return enabled, configured, home_channel
 
 
+def _messaging_env_value(key: str, env_on_disk: dict[str, str], *, scoped: bool) -> str:
+    """Credential source used by both the messaging GET and its write-back guard."""
+    return env_on_disk.get(key) or ("" if scoped else os.getenv(key, ""))
+
+
 def _messaging_platform_payload(
     entry: dict[str, Any], env_on_disk: dict[str, str], runtime: dict | None,
     scoped: bool = False, profile_home: Optional[Path] = None,
@@ -225,9 +230,7 @@ def _messaging_platform_payload(
         runtime_platform = {}
 
     def env_value(key: str) -> str:
-        # Profile-scoped: judge only the profile's own .env — the dashboard process's
-        # os.environ carries the ROOT install's .env and would report root credentials as the profile's.
-        return env_on_disk.get(key) or ("" if scoped else os.getenv(key, ""))
+        return _messaging_env_value(key, env_on_disk, scoped=scoped)
 
     env_vars = [
         {
@@ -871,7 +874,9 @@ async def update_messaging_platform(platform_id: str, body: MessagingPlatformUpd
             raise HTTPException(status_code=400, detail=f"{key} is not configurable for {entry['name']}")
 
     def _apply():
-        with _profile_scope(target_profile):
+        with _profile_scope(target_profile) as scoped_dir:
+            # Snapshot the same source the GET route renders before applying any mutation.
+            env_on_disk = load_env()
             for key in body.clear_env:
                 _check_allowed(key)
                 remove_env_value(key)
@@ -880,6 +885,9 @@ async def update_messaging_platform(platform_id: str, body: MessagingPlatformUpd
                 _check_allowed(key)
                 trimmed = value.strip()
                 if trimmed:
+                    current = _messaging_env_value(key, env_on_disk, scoped=scoped_dir is not None)
+                    if unchanged_secret_preview(trimmed, current):
+                        continue
                     _validate_messaging_env_value(platform_id, key, trimmed)
                     save_env_value(key, trimmed)
 

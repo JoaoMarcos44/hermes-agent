@@ -11,7 +11,7 @@ import asyncio
 import time
 import urllib.parse
 from fastapi import APIRouter
-from hermes_cli.web_routers._common import http_failure, scoped_to_thread
+from hermes_cli.web_routers._common import http_failure, scoped_to_thread, unchanged_secret_preview
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_config import (
     _apply_main_model_assignment, _denormalize_config_from_web, _normalize_config_for_web, _schema_with_dynamic_provider_options,
@@ -295,9 +295,12 @@ async def set_env_var(body: EnvVarUpdate, profile: Optional[str] = None):
     with _env_write_errors("PUT /api/env failed", http_passthrough=False):
         from hermes_cli.credential_lifecycle import save_provider_env_credential
 
-        return await scoped_to_thread(
-            body.profile or profile, lambda: save_provider_env_credential(body.key, body.value)
-        )
+        def _save():
+            if unchanged_secret_preview(body.value, load_env().get(body.key)):
+                return {"ok": True, "key": body.key, "preserved": True}
+            return save_provider_env_credential(body.key, body.value)
+
+        return await scoped_to_thread(body.profile or profile, _save)
 
 
 # Live credential probes keyed by env var: (url, auth) where auth is "bearer"
@@ -619,10 +622,12 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     # See #69449.
     env_var = custom_endpoint_key_env(endpoint_id)
     submitted_key = body.api_key.strip() if body.api_key is not None else None
+    current_preview = _api_key_display(entry)[1]
     if submitted_key:
-        save_env_value(env_var, submitted_key)
-        entry["key_env"] = env_var
-        entry.pop("api_key", None)
+        if submitted_key != current_preview:
+            save_env_value(env_var, submitted_key)
+            entry["key_env"] = env_var
+            entry.pop("api_key", None)
     elif submitted_key is not None:
         # Blank field means "clear the key", not "leave it alone".
         remove_env_value(env_var)
