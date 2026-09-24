@@ -1,0 +1,445 @@
+name: PR121907 production-shaped validation
+
+on:
+  push:
+    branches:
+      - validation/pr121907-prod-probe-ee59fd1
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout validation head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install test dependencies
+        run: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web --extra bedrock
+
+      - name: Targeted route/prompt/blob regression suites
+        run: |
+          source .venv/bin/activate
+          python -m pytest -q             tests/agent/test_route_prompt_snapshot.py             tests/gateway/test_empty_model_fallback.py             tests/gateway/test_empty_model_recovery.py             tests/agent/test_system_prompt_restore.py             tests/hermes_cli/test_session_system_prompt_dedup.py
+
+      - name: Lint touched Python
+        run: |
+          source .venv/bin/activate
+          ruff check             agent/conversation_loop.py             agent/conversation_compression.py             hermes_state_sessions.py             hermes_state_usage.py             tests/agent/test_route_prompt_snapshot.py             tests/hermes_cli/test_session_system_prompt_dedup.py
+
+      - name: Fetch exact competitor head
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+          git fetch --no-tags upstream pull/121843/head:refs/remotes/upstream/pr121843
+          test "$(git rev-parse refs/remotes/upstream/pr121843)" = "af35db6f713e1335712bb7bd1463e01ea03c7cf9"
+          git worktree add --detach /tmp/pr121843 refs/remotes/upstream/pr121843
+
+      - name: Write production-shaped A/B probe
+        shell: bash
+        run: |
+          cat > /tmp/route_prompt_probe.py <<'PY'
+          import os
+          import sqlite3
+          import sys
+          import tempfile
+          from pathlib import Path
+          from unittest.mock import patch
+
+          expected = sys.argv[1]
+          assert expected in {"red", "green"}
+
+          home = Path(tempfile.mkdtemp(prefix=f"hermes-{expected}-"))
+          os.environ["HERMES_HOME"] = str(home)
+          os.environ["OPENROUTER_API_KEY"] = ""
+          os.environ["OPENAI_API_KEY"] = ""
+          os.environ["NOUS_API_KEY"] = ""
+
+          from gateway.run import GatewayRunner
+          from hermes_state import SessionDB
+          from run_agent import AIAgent
+          from agent.conversation_loop import _restore_or_build_system_prompt
+
+          # Production gateway resolver state already pinned upstream by
+          # tests/gateway/test_empty_model_fallback.py::test_empty_model_no_provider_stays_empty.
+          runner = object.__new__(GatewayRunner)
+          runner._session_model_overrides = {}
+          with patch("gateway.run._resolve_gateway_model", return_value=""), patch(
+              "gateway.run._resolve_runtime_agent_kwargs",
+              return_value={
+                  "provider": "",
+                  "api_key": "offline",
+                  "base_url": "http://127.0.0.1:9/v1",
+                  "api_mode": "chat_completions",
+              },
+          ):
+              model, runtime = runner._resolve_session_agent_runtime()
+          assert model == ""
+          assert (runtime.get("provider") or "") == ""
+
+          db_path = home / "state.db"
+          db = SessionDB(db_path=db_path)
+          sid = "prod-route-probe"
+
+          # Real AIAgent + real renderer + real lazy session persistence. No provider request is made.
+          first = AIAgent(
+              model=model,
+              provider=runtime.get("provider") or "",
+              base_url=runtime.get("base_url"),
+              api_key="offline",
+              api_mode="chat_completions",
+              session_id=sid,
+              session_db=db,
+              platform="discord",
+              enabled_toolsets=["terminal"],
+              quiet_mode=True,
+              skip_context_files=True,
+              skip_memory=True,
+              skip_background_review=True,
+          )
+          first._cached_system_prompt = first._build_system_prompt(None)
+          first._ensure_db_session()
+
+          stored_before = db.get_session(sid)["system_prompt"]
+          assert stored_before == first._cached_system_prompt
+          assert "\nModel:" not in stored_before
+          assert "\nProvider:" not in stored_before
+          assert "Execution discipline" not in stored_before
+
+          raw_before = db._conn.execute(
+              "SELECT system_prompt, system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          hash_before = raw_before["system_prompt_hash"]
+          assert raw_before["system_prompt"] is None
+          assert hash_before
+          assert db._conn.execute(
+              "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_before,)
+          ).fetchone()[0] == 1
+
+          # User selects a real route after the empty-route turn.
+          chosen_model = "deepseek/deepseek-v4-flash"
+          chosen_provider = "openrouter"
+          db.update_session_model(
+              sid,
+              chosen_model,
+              provider=chosen_provider,
+              base_url="https://openrouter.ai/api/v1",
+              api_mode="chat_completions",
+          )
+
+          raw_after_route = db._conn.execute(
+              "SELECT system_prompt, system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          assert raw_after_route["system_prompt"] is None
+          assert raw_after_route["system_prompt_hash"] == hash_before
+          assert db.get_session(sid)["system_prompt"] == stored_before
+
+          # Fresh agent models the next gateway turn after config-signature invalidation.
+          resumed = AIAgent(
+              model=chosen_model,
+              provider=chosen_provider,
+              base_url="https://openrouter.ai/api/v1",
+              api_key="offline",
+              api_mode="chat_completions",
+              session_id=sid,
+              session_db=db,
+              platform="discord",
+              enabled_toolsets=["terminal"],
+              quiet_mode=True,
+              skip_context_files=True,
+              skip_memory=True,
+              skip_background_review=True,
+          )
+          resumed._cached_system_prompt = None
+          _restore_or_build_system_prompt(
+              resumed, None, [{"role": "user", "content": "production-shaped restore probe"}]
+          )
+
+          hydrated_after = db.get_session(sid)["system_prompt"]
+          raw_after_restore = db._conn.execute(
+              "SELECT system_prompt, system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          hash_after = raw_after_restore["system_prompt_hash"]
+
+          result = {
+              "expected": expected,
+              "reused_old_bytes": resumed._cached_system_prompt == stored_before,
+              "has_model": f"Model: {chosen_model}" in resumed._cached_system_prompt,
+              "has_provider": f"Provider: {chosen_provider}" in resumed._cached_system_prompt,
+              "has_execution_guidance": "Execution discipline" in resumed._cached_system_prompt,
+              "hash_changed": hash_after != hash_before,
+              "old_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_before,)
+              ).fetchone()[0],
+              "new_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_after,)
+              ).fetchone()[0],
+              "tool_names_hash": db._conn.execute(
+                  "SELECT tool_names FROM sessions WHERE id = ?", (sid,)
+              ).fetchone()["tool_names"],
+              "blob_rows": db._conn.execute("SELECT COUNT(*) FROM system_prompts").fetchone()[0],
+              "hydrated_matches_cache": hydrated_after == resumed._cached_system_prompt,
+          }
+          print(result)
+
+          if expected == "red":
+              # Exact #121843 behavior: absence is a wildcard, so stale pre-route bytes survive.
+              assert result["reused_old_bytes"] is True
+              assert result["has_model"] is False
+              assert result["has_provider"] is False
+              assert result["has_execution_guidance"] is False
+              assert result["hash_changed"] is False
+              assert result["old_prompt_blob_present"] == 1
+              assert result["new_prompt_blob_present"] == 1
+          else:
+              # #121907 behavior: modern missing identity is stale and uses the existing rebuild path.
+              assert result["reused_old_bytes"] is False
+              assert result["has_model"] is True
+              assert result["has_provider"] is True
+              assert result["has_execution_guidance"] is True
+              assert result["hash_changed"] is True
+              # The old prompt blob is collected. The table may also contain the tools[] pin,
+              # which intentionally shares this content-addressed store.
+              assert result["old_prompt_blob_present"] == 0
+              assert result["new_prompt_blob_present"] == 1
+              assert result["hydrated_matches_cache"] is True
+
+          db.close()
+          PY
+
+      - name: Exact competitor RED
+        run: |
+          cd /tmp/pr121843
+          PYTHONPATH=. "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/route_prompt_probe.py red
+
+      - name: Current PR GREEN
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          PYTHONPATH=. .venv/bin/python /tmp/route_prompt_probe.py green
+
+      - name: Write wire-level A/B probe
+        shell: bash
+        run: |
+          cat > /tmp/route_prompt_wire_probe.py <<'PY'
+          import json
+          import os
+          import sys
+          import tempfile
+          import threading
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from pathlib import Path
+
+          expected = sys.argv[1]
+          assert expected in {"red", "green"}
+
+          home = Path(tempfile.mkdtemp(prefix=f"hermes-wire-{expected}-"))
+          os.environ["HERMES_HOME"] = str(home)
+          os.environ["OPENROUTER_API_KEY"] = ""
+          os.environ["OPENAI_API_KEY"] = ""
+          os.environ["NOUS_API_KEY"] = ""
+          os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+
+          from gateway.run import _build_gateway_agent_history
+          from hermes_state import SessionDB
+          from run_agent import AIAgent
+
+          captures = []
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *_args):
+                  pass
+
+              def do_POST(self):
+                  body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                  captures.append({"path": self.path, "body": body})
+                  if not body.get("model"):
+                      payload = {"error": {"message": "model is required", "type": "invalid_request_error"}}
+                      self.send_response(400)
+                      self.send_header("Content-Type", "application/json")
+                      self.end_headers()
+                      self.wfile.write(json.dumps(payload).encode())
+                      return
+
+                  reply = {
+                      "id": "wire-probe",
+                      "object": "chat.completion",
+                      "created": 0,
+                      "model": body["model"],
+                      "choices": [{
+                          "index": 0,
+                          "message": {"role": "assistant", "content": "WIRE_OK"},
+                          "finish_reason": "stop",
+                      }],
+                      "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                  }
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(json.dumps(reply).encode())
+
+          server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+          threading.Thread(target=server.serve_forever, daemon=True).start()
+          url = f"http://127.0.0.1:{server.server_port}/v1"
+
+          db = SessionDB(db_path=home / "state.db")
+          sid = "wire-route-probe"
+
+          # First gateway-shaped turn: no model/provider. Turn setup persists the user row
+          # and renderer-owned system prompt BEFORE the provider call, then the endpoint 400s.
+          first = AIAgent(
+              model="",
+              provider="",
+              base_url=url,
+              api_key="offline",
+              api_mode="chat_completions",
+              session_id=sid,
+              session_db=db,
+              platform="discord",
+              enabled_toolsets=["terminal"],
+              quiet_mode=True,
+              skip_context_files=True,
+              skip_memory=True,
+              skip_background_review=True,
+              max_iterations=1,
+          )
+          first._disable_streaming = True
+          first_result = first.run_conversation(
+              "first turn while route resolution is empty",
+              conversation_history=[],
+              task_id=sid,
+          )
+          assert captures and captures[-1]["body"].get("model") in ("", None)
+          assert isinstance(first_result, dict)
+          stored_before = db.get_session(sid)["system_prompt"]
+          assert stored_before
+          assert "\nModel:" not in stored_before
+          assert "\nProvider:" not in stored_before
+          assert "Execution discipline" not in stored_before
+
+          persisted = db.get_messages_as_conversation(sid, repair_alternation=True)
+          agent_history, _observed = _build_gateway_agent_history(persisted)
+          assert agent_history, "failed first turn did not persist replayable history"
+          assert any(m.get("role") == "user" for m in agent_history)
+
+          raw_before = db._conn.execute(
+              "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          hash_before = raw_before["system_prompt_hash"]
+          assert hash_before
+
+          # /model switches the route. #121843 preserves the pre-route prompt hash.
+          chosen_model = "deepseek/deepseek-v4-flash"
+          db.update_session_model(
+              sid,
+              chosen_model,
+              provider="openrouter",
+              base_url=url,
+              api_mode="chat_completions",
+          )
+          assert db._conn.execute(
+              "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()["system_prompt_hash"] == hash_before
+
+          # Fresh agent models the gateway config-signature change, and receives the
+          # persisted transcript just like TurnRunner._load_turn_history().
+          resumed = AIAgent(
+              model=chosen_model,
+              provider="openrouter",
+              base_url=url,
+              api_key="offline",
+              api_mode="chat_completions",
+              session_id=sid,
+              session_db=db,
+              platform="discord",
+              enabled_toolsets=["terminal"],
+              quiet_mode=True,
+              skip_context_files=True,
+              skip_memory=True,
+              skip_background_review=True,
+              max_iterations=1,
+          )
+          resumed._disable_streaming = True
+          second_result = resumed.run_conversation(
+              "second turn after selecting a route",
+              conversation_history=agent_history,
+              task_id=sid,
+          )
+          assert isinstance(second_result, dict)
+          assert len(captures) >= 2
+          body = captures[-1]["body"]
+          messages = body.get("messages") or []
+          system_text = "\n".join(
+              str(m.get("content") or "")
+              for m in messages
+              if m.get("role") in {"system", "developer"}
+          )
+
+          raw_after = db._conn.execute(
+              "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          hash_after = raw_after["system_prompt_hash"]
+          observation = {
+              "expected": expected,
+              "requests": len(captures),
+              "path": captures[-1]["path"],
+              "model_on_wire": body.get("model"),
+              "has_model_identity": f"Model: {chosen_model}" in system_text,
+              "has_provider_identity": "Provider: openrouter" in system_text,
+              "has_execution_guidance": "Execution discipline" in system_text,
+              "hash_changed": hash_after != hash_before,
+              "old_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_before,)
+              ).fetchone()[0],
+              "new_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_after,)
+              ).fetchone()[0],
+              "history_rows": len(persisted),
+          }
+          print(observation)
+
+          assert observation["model_on_wire"] == chosen_model
+          if expected == "red":
+              assert observation["has_model_identity"] is False
+              assert observation["has_provider_identity"] is False
+              assert observation["has_execution_guidance"] is False
+              assert observation["hash_changed"] is False
+              assert observation["old_prompt_blob_present"] == 1
+          else:
+              assert observation["has_model_identity"] is True
+              assert observation["has_provider_identity"] is True
+              assert observation["has_execution_guidance"] is True
+              assert observation["hash_changed"] is True
+              assert observation["old_prompt_blob_present"] == 0
+              assert observation["new_prompt_blob_present"] == 1
+
+          resumed.close()
+          first.close()
+          db.close()
+          server.shutdown()
+          server.server_close()
+          PY
+
+      - name: Exact competitor wire RED
+        run: |
+          cd /tmp/pr121843
+          PYTHONPATH=. "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/route_prompt_wire_probe.py red
+
+      - name: Current PR wire GREEN
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          PYTHONPATH=. .venv/bin/python /tmp/route_prompt_wire_probe.py green
