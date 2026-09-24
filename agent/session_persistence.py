@@ -343,7 +343,13 @@ class SessionPersistenceMixin:
         if platform_id is not None:  # load-bearing for restart drain-window recovery dedup (has_platform_message_id)
             msg["platform_message_id"] = platform_id
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(
+        self,
+        messages: List[Dict],
+        conversation_history: List[Dict] = None,
+        *,
+        empty_response_tail_close_text: Optional[str] = None,
+    ):
         """Save to SQLite on any exit path. Trailing empty-response scaffolding is dropped from
         the live list; the persist override is applied to the DB row only.
 
@@ -352,8 +358,14 @@ class SessionPersistenceMixin:
         list used by the API call (#48677 is thus closed for every persist caller, not just this one).
         """
         from agent.agent_runtime_helpers import note_turn_persisted
+        from agent.message_sanitization import close_interrupted_tool_sequence
         with _persist_lock(self):
-            self._drop_trailing_empty_response_scaffolding(messages)
+            # Empty-response recovery scaffolding is request-local. If removing it
+            # exposes an already-executed tool result, preserve that durable pair and
+            # close the turn instead of rewinding history. This runs at the shared
+            # persistence boundary so every early-exit caller gets the same invariant.
+            if self._drop_trailing_empty_response_scaffolding(messages):
+                close_interrupted_tool_sequence(messages, empty_response_tail_close_text)
             self._session_messages = messages
             self._flush_messages_to_session_db(messages, conversation_history)
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
@@ -361,19 +373,22 @@ class SessionPersistenceMixin:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
 
-    def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
+    def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> bool:
         """Pop only private empty-response recovery scaffolding from the live tail.
 
         Executed assistant(tool_calls) / tool rows are durable history, not scaffolding:
-        removing them makes the next turn forget a side effect that already happened. Tail
-        closure belongs to the turn-exit owner, which still has the real completion or
-        interrupt text; generic persistence and shutdown snapshots must not invent one.
+        removing them makes the next turn forget a side effect that already happened.
+        Returns whether any recovery scaffolding was removed so the persistence owner can
+        close an exposed tool tail without deleting the executed tool pair.
         """
         def tail(*keys: str) -> bool:
             return bool(messages) and isinstance(messages[-1], dict) and any(messages[-1].get(k) for k in keys)
 
+        dropped = False
         while tail("_empty_recovery_synthetic", "_empty_terminal_sentinel"):
             messages.pop()
+            dropped = True
+        return dropped
 
     _repair_message_sequence = _forward("agent.agent_runtime_helpers", "repair_message_sequence")
 
