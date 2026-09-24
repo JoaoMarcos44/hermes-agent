@@ -895,6 +895,11 @@ def test_micro_compaction_preserves_append_that_lands_during_summary(tmp_path):
     result = cc._micro_compact(messages)
 
     assert result is not messages
+    model_live = [str(m["content"]) for m in result]
+    assert model_live[-1] == foreign
+    assert sum(foreign in content for content in model_live) == 1
+    assert db.match_active_message_prefix_proof(sid, result) is not None
+
     live = [str(m["content"]) for m in db.get_messages_as_conversation(sid)]
     assert live[-1] == foreign
     assert sum(foreign in content for content in live) == 1

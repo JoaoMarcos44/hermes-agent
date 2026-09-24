@@ -262,9 +262,14 @@ def test_prune_preserves_turn_appended_after_loaded_snapshot(tmp_path: Path) -> 
     foreign = "[from Telegram] the vault code is 7741"
     db.append_message(sid, "user", foreign)
 
-    _result, count = agent.context_compressor.prune_tool_results_only(held, current_tokens=120_000)
+    result, count = agent.context_compressor.prune_tool_results_only(held, current_tokens=120_000)
 
     assert count >= 1
+    model_live = [m["content"] for m in result]
+    assert model_live[-1] == foreign
+    assert model_live.count(foreign) == 1
+    assert db.match_active_message_prefix_proof(sid, result) is not None
+
     live = [m["content"] for m in db.get_messages_as_conversation(sid)]
     assert live[-1] == foreign
     assert live.count(foreign) == 1

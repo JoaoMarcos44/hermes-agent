@@ -836,7 +836,9 @@ class SessionMessagesMixin:
         *expected_active_prefix_ids* plus *expected_active_prefix_digest* form a transaction-local
         source-generation CAS: with a live *lock_holder*, both the active row ids and their persisted
         replay/display payload must still match what the caller observed. Later ids are preserved as
-        the concurrent tail. An empty list proves an empty durable source.
+        the concurrent tail. An empty list proves an empty durable source. Guarded CAS commits also
+        publish that preserved tail back into *compacted_messages* after commit so the caller's live
+        model history stays aligned with the durable active generation.
         *lock_holder*: verified
         in-txn so a reclaimed lease fails instead of clobbering the winner. *tail_count*: the LAST N compacted
         rows are the verbatim carried tail; *carried_messages* names exact durable originals carried forward
@@ -859,6 +861,7 @@ class SessionMessagesMixin:
         # transaction-local so a later SQLite failure cannot publish rolled-back row ids
         # into the caller's live transcript.
         pending_messages = [dict(message) for message in compacted_messages]
+        published_tail: List[Dict[str, Any]] = []
         def _do(conn):
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
@@ -914,6 +917,15 @@ class SessionMessagesMixin:
             tail_ids, tail_tool_calls = ([], 0) if effective_watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(effective_watermark)))
+            if expected_active_prefix_ids is not None and tail_ids:
+                tail_rows = conn.execute(
+                    f"SELECT * FROM messages WHERE session_id = ? AND id IN ({_placeholders(tail_ids)}) ORDER BY id",
+                    (session_id, *tail_ids),
+                ).fetchall()
+                published_tail.extend(self._rows_to_conversation(
+                    tail_rows, session_id=session_id, include_ancestors=False,
+                    repair_alternation=False, include_row_ids=False, include_summary_markers=True,
+                ))
             # Rewind targets sit AT/BELOW the watermark (all the compressor saw); unbounded, a
             # concurrent append would steal a LIMIT slot.
             rewind_ids: list[int] = self._resolve_carried_row_ids(
@@ -946,6 +958,8 @@ class SessionMessagesMixin:
             live["timestamp"] = committed["timestamp"]
             if "_row_id" in committed:
                 live["_row_id"] = committed["_row_id"]
+        if published_tail:
+            compacted_messages.extend(published_tail)
         return inserted
 
     def _message_column_names(self, conn) -> List[str]:
