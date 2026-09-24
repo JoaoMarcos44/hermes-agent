@@ -116,8 +116,8 @@ def test_empty_retry_interrupt_closes_with_the_real_interrupt_reason():
     """The durable close must preserve the exit owner's specific interrupt text.
 
     Closing before scaffold cleanup sees the synthetic user nudge and is a no-op.
-    Persistence must therefore carry the exit owner's text through scaffold cleanup
-    instead of replacing it with a generic close.
+    The Stop owner therefore removes that request-local scaffold before closing the
+    executed-tool tail with the actual interrupt reason.
     """
     agent = _agent_with_stubbed_persistence()
     agent.log_prefix = ""
@@ -183,9 +183,6 @@ def test_persist_session_keeps_unmarked_terminal_empty_response():
         {"role": "assistant", "content": "(empty)"},
     ]
     assert agent.flushed_session_db_messages[-1] == messages
-
-
-
 
 
 
@@ -304,9 +301,13 @@ def _assert_executed_tool_pair_is_live_and_durable(loop, result):
     durable_calls, durable_results = _tool_pair_ids(durable)
     live_calls, live_results = _tool_pair_ids(result["messages"])
 
-    assert "call_write" in durable_calls == durable_results
+    assert durable_calls == durable_results
+    assert "call_write" in durable_calls
     assert durable_calls <= live_calls
     assert durable_results <= live_results
+    assert [msg.get("role") for msg in result["messages"]] == [
+        msg.get("role") for msg in durable
+    ]
     assert result["messages"][-1]["role"] != "tool"
     assert durable[-1]["role"] != "tool"
 
