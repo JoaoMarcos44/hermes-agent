@@ -1,9 +1,10 @@
 """Tests for pre-API-call message-sequence repair.
 
-Covers ``_repair_message_sequence`` and the extended
-``_drop_trailing_empty_response_scaffolding`` behavior that rewinds past
-orphan tool-result tails. Together these prevent the self-reinforcing empty-
-response loop observed in session 20260507_044111_fa7e65, where a tool-result
+Covers ``_repair_message_sequence`` and
+``_drop_trailing_empty_response_scaffolding``, which removes only synthetic
+recovery rows while retaining already-executed tool history. Together these
+prevent the self-reinforcing empty-response loop observed in session
+20260507_044111_fa7e65, where a tool-result
 followed directly by a user message produced silent empty responses from
 providers (violating role alternation), which retriggered the empty-retry
 recovery every turn.
@@ -18,22 +19,24 @@ def _bare_agent():
 
 # ── _drop_trailing_empty_response_scaffolding ──────────────────────────────
 
-def test_drop_scaffolding_rewinds_orphan_tool_tail():
-    """When scaffolding is stripped, also rewind the orphan assistant+tool pair."""
+def test_drop_scaffolding_keeps_executed_tool_pair():
+    """Synthetic recovery rows are disposable; an executed tool pair is durable history."""
     agent = _bare_agent()
-    messages = [
+    executed = [
         {"role": "user", "content": "task"},
         {"role": "assistant", "content": "",
          "tool_calls": [{"id": "t1", "type": "function",
                          "function": {"name": "f", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "t1", "content": "out"},
+    ]
+    messages = executed + [
         {"role": "assistant", "content": "(empty)",
          "_empty_terminal_sentinel": True},
     ]
 
     AIAgent._drop_trailing_empty_response_scaffolding(agent, messages)
 
-    assert messages == [{"role": "user", "content": "task"}]
+    assert messages == executed
 
 
 # ── _repair_message_sequence ───────────────────────────────────────────────
