@@ -2,7 +2,7 @@
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,6 +20,37 @@ def _prompt(model: str = "model-a", provider: str = "openrouter") -> str:
         f"Model: {model}\n"
         f"Provider: {provider}"
     )
+
+
+def _render_route_prompt(model: str, provider: str) -> str:
+    """Render the real modern prompt shape without depending on external files."""
+    from agent.system_prompt import build_system_prompt_parts
+
+    agent = SimpleNamespace(
+        load_soul_identity=False,
+        skip_context_files=True,
+        valid_tool_names=["terminal"],
+        _task_completion_guidance=False,
+        _tool_use_enforcement=False,
+        _execution_guidance="auto",
+        _environment_probe=False,
+        _kanban_worker_guidance="",
+        _memory_store=None,
+        _memory_manager=None,
+        model=model,
+        provider=provider,
+        platform="discord",
+        pass_session_id=False,
+        session_id=SESSION_ID,
+        _emit_status=lambda *_args, **_kwargs: None,
+    )
+    with (
+        patch("agent.prompt_builder.load_soul_md", return_value=""),
+        patch("agent.prompt_builder.build_environment_hints", return_value="Host: test"),
+        patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
+    ):
+        parts = build_system_prompt_parts(agent)
+    return "\n\n".join(parts.values())
 
 
 @pytest.fixture()
@@ -187,3 +218,42 @@ def test_genuinely_missing_snapshot_keeps_the_warning(db, caplog):
         and "update_system_prompt write path" in warning.getMessage()
         for warning in warnings
     )
+
+
+def test_first_model_selection_rebuilds_prompt_persisted_without_route_identity(db, caplog):
+    """A first gateway turn can persist model/provider-less modern prompt bytes.
+
+    tests/gateway/test_empty_model_fallback.py pins that the resolver can return model="" when
+    both model and provider are unavailable. The turn builds/persists its prompt before the API
+    request, so a later /model selection must not reuse those bytes merely because the identity
+    lines are absent.
+    """
+    selected_model = "deepseek/deepseek-v4-flash"
+    stored = _render_route_prompt("", "")
+    rebuilt = _render_route_prompt(selected_model, "openrouter")
+
+    assert "\nModel:" not in stored
+    assert "\nProvider:" not in stored
+    assert "Execution discipline" not in stored
+    assert "Execution discipline" in rebuilt
+
+    db.create_session(SESSION_ID, source="discord", model="", system_prompt=stored)
+    db.update_session_model(
+        SESSION_ID,
+        selected_model,
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    agent, warnings = _restore_next_turn(
+        db,
+        model=selected_model,
+        provider="openrouter",
+        rebuilt=rebuilt,
+        caplog=caplog,
+    )
+
+    agent._build_system_prompt.assert_called_once()
+    assert agent._cached_system_prompt == rebuilt
+    assert db.get_session(SESSION_ID)["system_prompt"] == rebuilt
+    assert warnings == []
