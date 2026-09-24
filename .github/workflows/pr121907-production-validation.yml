@@ -243,7 +243,6 @@ jobs:
           import threading
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
           from pathlib import Path
-          from unittest.mock import patch
 
           expected = sys.argv[1]
           assert expected in {"red", "green"}
@@ -255,7 +254,7 @@ jobs:
           os.environ["NOUS_API_KEY"] = ""
           os.environ["NO_PROXY"] = "127.0.0.1,localhost"
 
-          from gateway.run import GatewayRunner
+          from gateway.run import _build_gateway_agent_history
           from hermes_state import SessionDB
           from run_agent import AIAgent
 
@@ -268,11 +267,19 @@ jobs:
               def do_POST(self):
                   body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                   captures.append({"path": self.path, "body": body})
+                  if not body.get("model"):
+                      payload = {"error": {"message": "model is required", "type": "invalid_request_error"}}
+                      self.send_response(400)
+                      self.send_header("Content-Type", "application/json")
+                      self.end_headers()
+                      self.wfile.write(json.dumps(payload).encode())
+                      return
+
                   reply = {
                       "id": "wire-probe",
                       "object": "chat.completion",
                       "created": 0,
-                      "model": body.get("model") or "fixture",
+                      "model": body["model"],
                       "choices": [{
                           "index": 0,
                           "message": {"role": "assistant", "content": "WIRE_OK"},
@@ -289,26 +296,13 @@ jobs:
           threading.Thread(target=server.serve_forever, daemon=True).start()
           url = f"http://127.0.0.1:{server.server_port}/v1"
 
-          runner = object.__new__(GatewayRunner)
-          runner._session_model_overrides = {}
-          with patch("gateway.run._resolve_gateway_model", return_value=""), patch(
-              "gateway.run._resolve_runtime_agent_kwargs",
-              return_value={
-                  "provider": "",
-                  "api_key": "offline",
-                  "base_url": url,
-                  "api_mode": "chat_completions",
-              },
-          ):
-              model, runtime = runner._resolve_session_agent_runtime()
-          assert model == ""
-          assert (runtime.get("provider") or "") == ""
-
           db = SessionDB(db_path=home / "state.db")
           sid = "wire-route-probe"
 
+          # First gateway-shaped turn: no model/provider. Turn setup persists the user row
+          # and renderer-owned system prompt BEFORE the provider call, then the endpoint 400s.
           first = AIAgent(
-              model=model,
+              model="",
               provider="",
               base_url=url,
               api_key="offline",
@@ -321,15 +315,34 @@ jobs:
               skip_context_files=True,
               skip_memory=True,
               skip_background_review=True,
-              max_iterations=2,
+              max_iterations=1,
           )
-          first._cached_system_prompt = first._build_system_prompt(None)
-          first._ensure_db_session()
+          first._disable_streaming = True
+          first_result = first.run_conversation(
+              "first turn while route resolution is empty",
+              conversation_history=[],
+              task_id=sid,
+          )
+          assert captures and captures[-1]["body"].get("model") in ("", None)
+          assert isinstance(first_result, dict)
           stored_before = db.get_session(sid)["system_prompt"]
+          assert stored_before
           assert "\nModel:" not in stored_before
           assert "\nProvider:" not in stored_before
           assert "Execution discipline" not in stored_before
 
+          persisted = db.get_messages_as_conversation(sid, repair_alternation=True)
+          agent_history, _observed = _build_gateway_agent_history(persisted)
+          assert agent_history, "failed first turn did not persist replayable history"
+          assert any(m.get("role") == "user" for m in agent_history)
+
+          raw_before = db._conn.execute(
+              "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          hash_before = raw_before["system_prompt_hash"]
+          assert hash_before
+
+          # /model switches the route. #121843 preserves the pre-route prompt hash.
           chosen_model = "deepseek/deepseek-v4-flash"
           db.update_session_model(
               sid,
@@ -338,7 +351,12 @@ jobs:
               base_url=url,
               api_mode="chat_completions",
           )
+          assert db._conn.execute(
+              "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()["system_prompt_hash"] == hash_before
 
+          # Fresh agent models the gateway config-signature change, and receives the
+          # persisted transcript just like TurnRunner._load_turn_history().
           resumed = AIAgent(
               model=chosen_model,
               provider="openrouter",
@@ -353,13 +371,16 @@ jobs:
               skip_context_files=True,
               skip_memory=True,
               skip_background_review=True,
-              max_iterations=2,
+              max_iterations=1,
           )
           resumed._disable_streaming = True
-          result = resumed.run_conversation("wire-level production-shaped probe")
-          assert result is not None
-          assert captures, "no provider request captured"
-
+          second_result = resumed.run_conversation(
+              "second turn after selecting a route",
+              conversation_history=agent_history,
+              task_id=sid,
+          )
+          assert isinstance(second_result, dict)
+          assert len(captures) >= 2
           body = captures[-1]["body"]
           messages = body.get("messages") or []
           system_text = "\n".join(
@@ -367,27 +388,44 @@ jobs:
               for m in messages
               if m.get("role") in {"system", "developer"}
           )
+
+          raw_after = db._conn.execute(
+              "SELECT system_prompt_hash FROM sessions WHERE id = ?", (sid,)
+          ).fetchone()
+          hash_after = raw_after["system_prompt_hash"]
           observation = {
               "expected": expected,
+              "requests": len(captures),
               "path": captures[-1]["path"],
               "model_on_wire": body.get("model"),
               "has_model_identity": f"Model: {chosen_model}" in system_text,
               "has_provider_identity": "Provider: openrouter" in system_text,
               "has_execution_guidance": "Execution discipline" in system_text,
-              "system_chars": len(system_text),
+              "hash_changed": hash_after != hash_before,
+              "old_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_before,)
+              ).fetchone()[0],
+              "new_prompt_blob_present": db._conn.execute(
+                  "SELECT COUNT(*) FROM system_prompts WHERE hash = ?", (hash_after,)
+              ).fetchone()[0],
+              "history_rows": len(persisted),
           }
           print(observation)
 
+          assert observation["model_on_wire"] == chosen_model
           if expected == "red":
-              assert observation["model_on_wire"] == chosen_model
               assert observation["has_model_identity"] is False
               assert observation["has_provider_identity"] is False
               assert observation["has_execution_guidance"] is False
+              assert observation["hash_changed"] is False
+              assert observation["old_prompt_blob_present"] == 1
           else:
-              assert observation["model_on_wire"] == chosen_model
               assert observation["has_model_identity"] is True
               assert observation["has_provider_identity"] is True
               assert observation["has_execution_guidance"] is True
+              assert observation["hash_changed"] is True
+              assert observation["old_prompt_blob_present"] == 0
+              assert observation["new_prompt_blob_present"] == 1
 
           resumed.close()
           first.close()
