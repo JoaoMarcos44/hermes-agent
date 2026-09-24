@@ -46,11 +46,11 @@ def _agent_with_stubbed_persistence():
     return agent
 
 
-def test_persist_session_strips_only_trailing_empty_recovery_scaffolding():
+def test_persist_session_strips_scaffolding_and_closes_exposed_tool_tail():
     """Persistence removes request-local recovery rows without erasing executed tools.
 
-    A generic persistence boundary is also used by shutdown and intermediate snapshots,
-    so it must not synthesize a conversational close. Turn-exit owners close the tail.
+    When cleanup exposes the executed tool result, the shared persistence boundary closes
+    it so every early-exit caller returns an alternation-safe live history.
     """
     agent = _agent_with_stubbed_persistence()
     messages = [
@@ -79,8 +79,9 @@ def test_persist_session_strips_only_trailing_empty_recovery_scaffolding():
 
     AIAgent._persist_session(agent, messages, conversation_history=[])
 
-    assert [msg["role"] for msg in messages] == ["user", "assistant", "tool"]
+    assert [msg["role"] for msg in messages] == ["user", "assistant", "tool", "assistant"]
     assert messages[1]["tool_calls"][0]["id"] == messages[2]["tool_call_id"] == "call_1"
+    assert messages[-1]["content"] == "Operation interrupted."
     assert agent.flushed_session_db_messages[-1] == messages
     assert all(not msg.get("_empty_recovery_synthetic") for msg in messages)
 
