@@ -452,6 +452,39 @@ class TestSpillover:
         # Host canonical copy exists regardless.
         assert (get_spillover_dir() / "tc_remote_2.txt").exists()
 
+    @pytest.mark.parametrize(
+        "remote_setup",
+        [
+            [
+                {"output": "", "returncode": 1},
+                {"output": "", "returncode": 1},
+            ],
+            [
+                {"output": "", "returncode": 1},
+                {"output": "1001\n", "returncode": 0},
+                {"output": "", "returncode": 1},
+            ],
+        ],
+        ids=["uid_lookup_refused", "results_dir_refused"],
+    )
+    def test_remote_storage_refusal_preserves_completed_result(self, remote_setup):
+        env = MagicMock()
+        env.execute.side_effect = remote_setup
+        env.get_temp_dir.return_value = "/tmp"
+        content = "SYNTHETIC_COMPLETED_TOOL_OUTPUT\n" * 200
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="read_file",
+            tool_use_id="tc_remote_refusal",
+            env=env,
+            threshold=50,
+        )
+
+        assert "SYNTHETIC_COMPLETED_TOOL_OUTPUT" in result
+        assert "Full output could not be saved to sandbox." in result
+        assert (get_spillover_dir() / "tc_remote_refusal.txt").read_text(encoding="utf-8") == content
+
     def test_spillover_write_failure_falls_back_to_inline(self, monkeypatch):
         import tools.tool_result_storage as trs
         monkeypatch.setattr(trs, "_write_to_spillover", lambda *a, **k: None)
