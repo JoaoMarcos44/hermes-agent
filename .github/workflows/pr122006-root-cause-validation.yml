@@ -1,0 +1,188 @@
+name: PR122006 root-cause validation
+
+on:
+  push:
+    branches:
+      - validation/pr122006-root-cause
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.14
+
+      - name: Install test dependencies
+        run: uv sync --locked --python 3.14 --group dev --group test
+
+      - name: Install legacy-head probe compatibility
+        run: uv pip install --python .venv/bin/python "PyYAML==6.0.3"
+
+      - name: Root-cause regression suites
+        run: |
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/hermes_cli/test_plugins_cmd_catalog.py \
+            tests/hermes_cli/test_plugin_update_transaction.py \
+            tests/hermes_cli/test_plugin_install_ref.py
+
+      - name: Lint touched Python
+        run: |
+          source .venv/bin/activate
+          ruff check \
+            hermes_cli/plugins_cmd_catalog.py \
+            hermes_cli/plugins_transaction.py \
+            hermes_cli/plugins_cmd_update.py \
+            tests/hermes_cli/test_plugins_cmd_catalog.py
+
+      - name: Fetch exact competitor head
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+          git fetch --no-tags upstream pull/122007/head:refs/remotes/upstream/pr122007
+          test "$(git rev-parse refs/remotes/upstream/pr122007)" = "65372ad9a81e2794edac88e5866a3d6cbcda217d"
+          git worktree add --detach /tmp/pr122007 refs/remotes/upstream/pr122007
+
+      - name: Write adversarial carry-over probe
+        run: |
+          cat > /tmp/plugin_carry_probe.py <<'PY'
+          import os
+          import sys
+          import tempfile
+          from pathlib import Path
+          from types import SimpleNamespace
+          from unittest.mock import patch
+
+          expected = sys.argv[1]
+          assert expected in {"competitor", "ours"}
+
+          root = Path(tempfile.mkdtemp(prefix=f"carry-{expected}-"))
+          os.environ["HERMES_HOME"] = str(root / "home")
+
+          from hermes_cli import plugins_cmd as pc
+          from hermes_cli import plugins_cmd_catalog as cat
+
+          # 1) No-git type clash: preserving a user file at a path that the new revision
+          # turned into a directory must never silently discard the file.
+          old = root / "old-clash"
+          new = root / "new-clash"
+          old.mkdir()
+          new.mkdir()
+          (old / "data").write_text("user data")
+          (new / "data").mkdir()
+          clash_exc = None
+          try:
+              cat._carry_user_files(old, new, None)
+          except Exception as exc:
+              clash_exc = exc
+          clash = {
+              "raised": type(clash_exc).__name__ if clash_exc else None,
+              "old_user_data_intact": (old / "data").read_text() == "user data",
+              "new_path_is_dir": (new / "data").is_dir(),
+          }
+
+          # 2) No-git stale source: v1 shipped utils/ package, v2 ships utils.py.
+          # Carrying removed .py source revives the old package beside the new module.
+          old_code = root / "old-code"
+          new_code = root / "new-code"
+          (old_code / "utils").mkdir(parents=True)
+          new_code.mkdir()
+          (old_code / "utils" / "__init__.py").write_text("VALUE='old'\n")
+          (new_code / "utils.py").write_text("VALUE='new'\n")
+          cat._carry_user_files(old_code, new_code, None)
+          stale_code = {
+              "old_package_revived": (new_code / "utils" / "__init__.py").exists(),
+              "new_module_present": (new_code / "utils.py").is_file(),
+          }
+
+          # 3) A real checkout whose git status fails must not be reclassified as a
+          # no-git subtree and then force-replaced on a guess.
+          git_tree = root / "git-tree"
+          (git_tree / ".git").mkdir(parents=True)
+          failed = SimpleNamespace(returncode=1, stdout="", stderr="index unreadable")
+          inspect_exc = None
+          inspect_result = "not-called"
+          with (
+              patch.object(pc, "_resolve_git_executable", return_value="git"),
+              patch.object(pc, "_run_plugin_git", return_value=failed),
+          ):
+              try:
+                  inspect_result = cat._local_changes(git_tree)
+              except Exception as exc:
+                  inspect_exc = exc
+          inspection = {
+              "raised": type(inspect_exc).__name__ if inspect_exc else None,
+              "result": inspect_result,
+          }
+
+          # 4) A staged symlink ancestor must not redirect preserved user data outside the tree.
+          old_link = root / "old-link"
+          new_link = root / "new-link"
+          outside = root / "outside"
+          (old_link / "data").mkdir(parents=True)
+          new_link.mkdir()
+          outside.mkdir()
+          (old_link / "data" / "index.db").write_text("user data")
+          (new_link / "data").symlink_to(outside, target_is_directory=True)
+          link_exc = None
+          try:
+              cat._carry_user_files(old_link, new_link, None)
+          except Exception as exc:
+              link_exc = exc
+          symlink_escape = {
+              "raised": type(link_exc).__name__ if link_exc else None,
+              "outside_written": (outside / "index.db").exists(),
+          }
+
+          result = {
+              "expected": expected,
+              "clash": clash,
+              "stale_code": stale_code,
+              "inspection": inspection,
+              "symlink_escape": symlink_escape,
+          }
+          print(result)
+
+          if expected == "competitor":
+              assert clash["raised"] is None
+              assert clash["old_user_data_intact"] is True
+              assert stale_code["old_package_revived"] is True
+              assert inspection["raised"] is None
+              assert inspection["result"] is None
+              assert symlink_escape["raised"] is None
+              assert symlink_escape["outside_written"] is True
+          else:
+              assert clash["raised"] == "PluginOperationError"
+              assert clash["old_user_data_intact"] is True
+              assert stale_code["old_package_revived"] is False
+              assert stale_code["new_module_present"] is True
+              assert inspection["raised"] == "PluginOperationError"
+              assert symlink_escape["raised"] == "PluginOperationError"
+              assert symlink_escape["outside_written"] is False
+
+          PY
+
+      - name: Exact competitor residual REDs
+        run: |
+          cd /tmp/pr122007
+          PYTHONPATH=. "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/plugin_carry_probe.py competitor
+
+      - name: Current branch GREEN
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          PYTHONPATH=. .venv/bin/python /tmp/plugin_carry_probe.py ours
