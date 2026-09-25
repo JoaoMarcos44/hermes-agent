@@ -1,0 +1,158 @@
+name: PR122207 final validation
+
+on:
+  push:
+    branches:
+      - validation/pr122207-final
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.12.13"
+
+      - name: Set up Python 3.14
+        run: uv python install 3.14
+
+      - name: Install test dependencies
+        run: uv sync --locked --python 3.14 --group dev --group test
+
+      - name: Install legacy-head probe compatibility
+        run: uv pip install --python .venv/bin/python "PyYAML==6.0.3"
+
+      - name: Plugin update regression suites
+        run: |
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/hermes_cli/test_plugins_cmd_catalog.py \
+            tests/hermes_cli/test_plugin_update_transaction.py \
+            tests/hermes_cli/test_plugin_install_ref.py
+
+      - name: Lint touched Python
+        run: |
+          source .venv/bin/activate
+          ruff check \
+            hermes_cli/plugins_cmd_catalog.py \
+            hermes_cli/plugins_transaction.py \
+            hermes_cli/plugins_cmd_update.py \
+            tests/hermes_cli/test_plugins_cmd_catalog.py
+
+      - name: Fetch exact competitor head
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+          git fetch --no-tags upstream pull/122007/head:refs/remotes/upstream/pr122007
+          test "$(git rev-parse refs/remotes/upstream/pr122007)" = "65372ad9a81e2794edac88e5866a3d6cbcda217d"
+          git worktree add --detach /tmp/pr122007 refs/remotes/upstream/pr122007
+
+      - name: Write exact-head adversarial probe
+        run: |
+          cat > /tmp/plugin_carry_probe.py <<'PY'
+          import os
+          import sys
+          import tempfile
+          from pathlib import Path
+          from types import SimpleNamespace
+          from unittest.mock import patch
+
+          expected = sys.argv[1]
+          root = Path(tempfile.mkdtemp(prefix=f"carry-{expected}-"))
+          os.environ["HERMES_HOME"] = str(root / "home")
+
+          from hermes_cli import plugins_cmd as pc
+          from hermes_cli import plugins_cmd_catalog as cat
+
+          old = root / "old-clash"
+          new = root / "new-clash"
+          old.mkdir(); new.mkdir()
+          (old / "data").write_text("user data")
+          (new / "data").mkdir()
+          clash_exc = None
+          try:
+              cat._carry_user_files(old, new, None)
+          except Exception as exc:
+              clash_exc = exc
+
+          old_code = root / "old-code"
+          new_code = root / "new-code"
+          (old_code / "utils").mkdir(parents=True)
+          new_code.mkdir()
+          (old_code / "utils" / "__init__.py").write_text("VALUE='old'\n")
+          (new_code / "utils.py").write_text("VALUE='new'\n")
+          cat._carry_user_files(old_code, new_code, None)
+
+          git_tree = root / "git-tree"
+          (git_tree / ".git").mkdir(parents=True)
+          failed = SimpleNamespace(returncode=1, stdout="", stderr="index unreadable")
+          inspection_exc = None
+          inspection_result = "not-called"
+          with (
+              patch.object(pc, "_resolve_git_executable", return_value="git"),
+              patch.object(pc, "_run_plugin_git", return_value=failed),
+          ):
+              try:
+                  inspection_result = cat._local_changes(git_tree)
+              except Exception as exc:
+                  inspection_exc = exc
+
+          old_link = root / "old-link"
+          new_link = root / "new-link"
+          outside = root / "outside"
+          (old_link / "data").mkdir(parents=True)
+          new_link.mkdir(); outside.mkdir()
+          (old_link / "data" / "index.db").write_text("user data")
+          (new_link / "data").symlink_to(outside, target_is_directory=True)
+          link_exc = None
+          try:
+              cat._carry_user_files(old_link, new_link, None)
+          except Exception as exc:
+              link_exc = exc
+
+          result = {
+              "expected": expected,
+              "type_clash_error": type(clash_exc).__name__ if clash_exc else None,
+              "old_user_data_intact": (old / "data").read_text() == "user data",
+              "old_package_revived": (new_code / "utils" / "__init__.py").exists(),
+              "new_module_present": (new_code / "utils.py").is_file(),
+              "inspection_error": type(inspection_exc).__name__ if inspection_exc else None,
+              "inspection_result": inspection_result,
+              "symlink_error": type(link_exc).__name__ if link_exc else None,
+              "outside_written": (outside / "index.db").exists(),
+          }
+          print(result)
+
+          if expected == "competitor":
+              assert result["type_clash_error"] is None
+              assert result["old_package_revived"] is True
+              assert result["inspection_error"] is None
+              assert result["inspection_result"] is None
+              assert result["symlink_error"] is None
+              assert result["outside_written"] is True
+          else:
+              assert result["type_clash_error"] == "PluginOperationError"
+              assert result["old_user_data_intact"] is True
+              assert result["old_package_revived"] is False
+              assert result["new_module_present"] is True
+              assert result["inspection_error"] == "PluginOperationError"
+              assert result["symlink_error"] == "PluginOperationError"
+              assert result["outside_written"] is False
+          PY
+
+      - name: Exact competitor residual REDs
+        run: |
+          cd /tmp/pr122007
+          PYTHONPATH=. "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/plugin_carry_probe.py competitor
+
+      - name: Current PR GREEN
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          PYTHONPATH=. .venv/bin/python /tmp/plugin_carry_probe.py ours
