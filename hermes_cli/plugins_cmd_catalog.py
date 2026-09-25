@@ -359,6 +359,19 @@ def _carry_user_files(old: Path, new: Path, local: Optional[list[str]]) -> None:
                 continue
 
             dst = new / rel
+            try:
+                staged_root = new.resolve()
+                resolved_parent = dst.parent.resolve()
+            except OSError as exc:
+                raise PluginOperationError(
+                    f"Cannot preserve user file '{rel}': its destination cannot be resolved safely. "
+                    "The installed plugin was left unchanged."
+                ) from exc
+            if not resolved_parent.is_relative_to(staged_root):
+                raise PluginOperationError(
+                    f"Cannot preserve user file '{rel}': its destination escapes the staged plugin tree. "
+                    "The installed plugin was left unchanged."
+                )
             if os.path.lexists(dst):
                 if dst.is_dir() and not dst.is_symlink():
                     raise PluginOperationError(

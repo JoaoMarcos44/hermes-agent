@@ -297,6 +297,23 @@ def test_carry_user_files_fails_closed_on_type_clashes(tmp_path, shape):
         assert (new / "data").read_text() == "new upstream file"
 
 
+
+def test_carry_user_files_refuses_symlink_ancestor_escape(tmp_path):
+    """A staged symlink must never redirect a carried user file outside the replacement tree."""
+    old, new, outside = tmp_path / "old", tmp_path / "new", tmp_path / "outside"
+    (old / "data").mkdir(parents=True)
+    new.mkdir()
+    outside.mkdir()
+    (old / "data" / "index.db").write_text("user data")
+    (new / "data").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(pc.PluginOperationError, match="escapes the staged plugin tree"):
+        cat._carry_user_files(old, new, None)
+
+    assert not (outside / "index.db").exists()
+    assert (old / "data" / "index.db").read_text() == "user data"
+
+
 def test_local_change_inspection_failure_aborts_instead_of_guessing(tmp_path, monkeypatch):
     """A git checkout is never force-replaced when Hermes cannot classify its local changes."""
     target = tmp_path / "plugin"
