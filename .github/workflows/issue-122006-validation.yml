@@ -1,0 +1,216 @@
+name: issue-122006 validation
+
+on:
+  push:
+    branches:
+      - validation/122006-user-files
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout current-main overlay
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: "0.12.13"
+
+      - name: Set up Python 3.14
+        run: uv python install 3.14
+
+      - name: Install test dependencies
+        run: uv sync --locked --python 3.14 --group dev --group test
+
+      - name: GREEN plugin update and PM suites
+        run: |
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/hermes_cli/test_plugins_cmd_catalog.py \
+            tests/hermes_cli/test_plugin_update_transaction.py \
+            tests/pm/test_plugin_survival_contract.py \
+            tests/pm/test_plugin_declarations.py
+
+      - name: Lint touched Python
+        run: |
+          source .venv/bin/activate
+          ruff check \
+            hermes_cli/plugins_cmd_catalog.py \
+            hermes_cli/plugins_transaction.py \
+            hermes_cli/plugins_cmd_update.py \
+            tests/hermes_cli/test_plugins_cmd_catalog.py
+
+      - name: Fetch exact main and competitor
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+          git fetch --no-tags upstream 2ef41d2b585c47144b9e19f0694e832856e62b00
+          git fetch --no-tags upstream pull/122007/head:refs/remotes/upstream/pr122007
+          test "$(git rev-parse refs/remotes/upstream/pr122007)" = "65372ad9a81e2794edac88e5866a3d6cbcda217d"
+          git worktree add --detach /tmp/base 2ef41d2b585c47144b9e19f0694e832856e62b00
+          git worktree add --detach /tmp/pr122007 refs/remotes/upstream/pr122007
+
+      - name: RED issue reproductions on exact main
+        run: |
+          cp tests/hermes_cli/test_plugins_cmd_catalog.py /tmp/base/tests/hermes_cli/test_plugins_cmd_catalog.py
+          cd /tmp/base
+          set +e
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest -q \
+            tests/hermes_cli/test_plugins_cmd_catalog.py::test_update_of_a_subdir_install_keeps_files_the_user_created_or_edited \
+            tests/hermes_cli/test_plugins_cmd_catalog.py::test_repin_keeps_a_wholly_ignored_data_dir_in_a_git_checkout \
+            --junitxml=/tmp/base-red.xml
+          code=$?
+          set -e
+          test "$code" -ne 0
+          "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse("/tmp/base-red.xml").getroot()
+          suites = list(root.iter("testsuite"))
+          failures = sum(int(s.attrib.get("failures", "0")) + int(s.attrib.get("errors", "0")) for s in suites)
+          tests = sum(int(s.attrib.get("tests", "0")) for s in suites)
+          print({"base_failures": failures, "tests": tests})
+          assert tests == 3
+          assert failures == 3
+          PY
+
+      - name: Compare carry safety with PR 122007
+        run: |
+          cat > /tmp/carry_probe.py <<'PY'
+          import ast
+          import os
+          import shutil
+          import sys
+          import tempfile
+          from pathlib import Path
+          from typing import Optional
+
+          expected, checkout = sys.argv[1], Path(sys.argv[2])
+          source = (checkout / "hermes_cli/plugins_cmd_catalog.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          nodes = {
+              item.name: item for item in tree.body
+              if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+          }
+          wanted = [name for name in ("_revision_owned_without_git", "_carry_user_files") if name in nodes]
+          module = ast.Module(body=[nodes[name] for name in wanted], type_ignores=[])
+          ast.fix_missing_locations(module)
+          ns = {
+              "os": os, "shutil": shutil, "Path": Path, "Optional": Optional,
+              "_PRESERVE_SKIP": ("__pycache__", ".git", ".hermes-catalog.json"),
+              "_NO_GIT_REVISION_FILES": frozenset({
+                  "plugin.yaml", "plugin.yml", "plugin.json", "mcp.json",
+                  "pyproject.toml", "package.json", "package-lock.json", "uv.lock",
+              }),
+              "_NO_GIT_REVISION_DIRS": frozenset({"desktop", "skills", "sidecar", "node_modules"}),
+          }
+          exec(compile(module, str(checkout / "hermes_cli/plugins_cmd_catalog.py"), "exec"), ns)
+          carry = ns["_carry_user_files"]
+
+          root = Path(tempfile.mkdtemp(prefix=f"carry-{expected}-"))
+          old, new = root / "old", root / "new"
+          old.mkdir(); new.mkdir()
+          (old / "config.yaml").write_text("mine\n")
+          (old / "data").mkdir(); (old / "data" / "state.db").write_text("data")
+          (old / "legacy.py").write_text("OLD=True\n")
+          (old / ".git").write_text("gitdir: /tmp/foreign\n")
+          (old / "file-to-dir").write_text("old")
+          (new / "file-to-dir").mkdir(); (new / "file-to-dir" / "current.txt").write_text("new")
+          (old / "dir-to-file").mkdir(); (old / "dir-to-file" / "state.db").write_text("old")
+          (new / "dir-to-file").write_text("new")
+          outside = root / "outside"; outside.mkdir()
+          (old / "escape").mkdir(); (old / "escape" / "state.db").write_text("do-not-escape")
+          (new / "escape").symlink_to(outside, target_is_directory=True)
+
+          error = None
+          try:
+              carry(old, new, None)
+          except Exception as exc:
+              error = type(exc).__name__
+
+          result = {
+              "error": error,
+              "config_preserved": (new / "config.yaml").is_file(),
+              "data_preserved": (new / "data" / "state.db").is_file(),
+              "legacy_python_present": (new / "legacy.py").exists(),
+              "git_metadata_present": (new / ".git").exists(),
+              "outside_written": (outside / "state.db").exists(),
+              "dir_to_file_is_file": (new / "dir-to-file").is_file(),
+              "file_to_dir_children": sorted(p.name for p in (new / "file-to-dir").iterdir()),
+          }
+          print({"expected": expected, **result})
+          unsafe = (
+              error is not None or result["legacy_python_present"] or result["git_metadata_present"]
+              or result["outside_written"] or not result["dir_to_file_is_file"]
+              or result["file_to_dir_children"] != ["current.txt"]
+          )
+          assert unsafe if expected == "red" else not unsafe
+          if expected == "green":
+              assert result["config_preserved"] and result["data_preserved"]
+          PY
+
+          "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/carry_probe.py red /tmp/pr122007
+          "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/carry_probe.py green "$GITHUB_WORKSPACE"
+
+      - name: Compare removed code surfaces with PR 122007
+        run: |
+          cat > /tmp/surface_probe.py <<'PY'
+          import ast
+          import os
+          import shutil
+          import sys
+          import tempfile
+          from pathlib import Path
+          from typing import Optional
+
+          expected, checkout = sys.argv[1], Path(sys.argv[2])
+          source = (checkout / "hermes_cli/plugins_cmd_catalog.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          nodes = {
+              item.name: item for item in tree.body
+              if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+          }
+          wanted = [name for name in ("_revision_owned_without_git", "_carry_user_files") if name in nodes]
+          module = ast.Module(body=[nodes[name] for name in wanted], type_ignores=[])
+          ast.fix_missing_locations(module)
+          ns = {
+              "os": os, "shutil": shutil, "Path": Path, "Optional": Optional,
+              "_PRESERVE_SKIP": ("__pycache__", ".git", ".hermes-catalog.json"),
+              "_NO_GIT_REVISION_FILES": frozenset({
+                  "plugin.yaml", "plugin.yml", "plugin.json", "mcp.json",
+                  "pyproject.toml", "package.json", "package-lock.json", "uv.lock",
+              }),
+              "_NO_GIT_REVISION_DIRS": frozenset({"desktop", "skills", "sidecar", "node_modules"}),
+          }
+          exec(compile(module, str(checkout / "hermes_cli/plugins_cmd_catalog.py"), "exec"), ns)
+          carry = ns["_carry_user_files"]
+          root = Path(tempfile.mkdtemp(prefix=f"surface-{expected}-"))
+          old, new = root / "old", root / "new"
+          old.mkdir(); new.mkdir()
+          (old / "config.yaml").write_text("mine\n")
+          (old / "desktop").mkdir()
+          (old / "desktop" / "plugin.js").write_text("export default {id:'stale'}\n")
+          (old / "skills").mkdir(); (old / "skills" / "stale").mkdir()
+          (old / "skills" / "stale" / "SKILL.md").write_text("# stale\n")
+          (old / "mcp.json").write_text('{"mcpServers":{"stale":{"type":"stdio","command":"./stale"}}}\n')
+          (old / "pyproject.toml").write_text('[project]\nname="stale"\nversion="1"\n')
+          carry(old, new, None)
+          result = {
+              "config": (new / "config.yaml").exists(),
+              "desktop": (new / "desktop" / "plugin.js").exists(),
+              "skills": (new / "skills").exists(),
+              "mcp": (new / "mcp.json").exists(),
+              "pyproject": (new / "pyproject.toml").exists(),
+          }
+          print({"expected": expected, **result})
+          assert result["config"] is True
+          stale = any(result[k] for k in ("desktop", "skills", "mcp", "pyproject"))
+          assert stale if expected == "red" else not stale
+          PY
+          "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/surface_probe.py red /tmp/pr122007
+          "$GITHUB_WORKSPACE/.venv/bin/python" /tmp/surface_probe.py green "$GITHUB_WORKSPACE"
