@@ -131,7 +131,7 @@ class ModalEnvironment(BaseEnvironment):
     """Modal cloud execution via native Modal sandboxes: spawn-per-call via _ThreadedProcessHandle
     wrapping async SDK calls, cancel_fn wired to sandbox.terminate for interrupt support."""
 
-    _stdin_mode = "heredoc"
+    _stdin_mode = "staged"
     _snapshot_timeout = 60  # Modal cold starts can be slow
     # Modal SDK stdin buffer limit: the command-router path allows 16 MB but the legacy server
     # path caps at 2 MB, so chunks stay under 2 MB and each is flushed individually via drain().
@@ -213,6 +213,15 @@ class ModalEnvironment(BaseEnvironment):
                 raise RuntimeError(f"Modal {fail_label} failed (exit {exit_code}){detail}")
             return data
         return self._worker.run_coroutine(_run(), timeout=timeout)
+
+    def _upload_stdin_file(self, host_path: str, remote_path: str) -> None:
+        parent = remote_path.rsplit("/", 1)[0]
+        self._exec(f"umask 077; mkdir -p {shlex.quote(parent)}", timeout=15, fail_label="stdin staging")
+        self._modal_upload(host_path, remote_path)
+
+    def _cleanup_stdin_file(self, remote_path: str) -> None:
+        parent = remote_path.rsplit("/", 1)[0]
+        self._exec(f"rm -rf {shlex.quote(parent)}", timeout=15)
 
     def _modal_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via base64 piped through stdin."""

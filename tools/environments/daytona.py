@@ -28,7 +28,7 @@ class DaytonaEnvironment(BaseEnvironment):
     is wired to sandbox.stop() for interrupts. Shell timeout wrapper kept (SDK timeout unreliable).
     """
 
-    _stdin_mode = "heredoc"
+    _stdin_mode = "staged"
 
     def __init__(self, image: str, cwd: str = "/home/daytona", timeout: int = 60, cpu: int = 1,
                  memory: int = 5120, disk: int = 10240, persistent_filesystem: bool = True,
@@ -89,6 +89,17 @@ class DaytonaEnvironment(BaseEnvironment):
             bulk_upload_fn=self._daytona_bulk_upload, bulk_download_fn=self._daytona_bulk_download)
         self._sync_manager.sync(force=True)
         self.init_session()
+
+    def _upload_stdin_file(self, host_path: str, remote_path: str) -> None:
+        parent = remote_path.rsplit("/", 1)[0]
+        response = self._sandbox.process.exec(f"umask 077; mkdir -p {shlex.quote(parent)}")
+        if response.exit_code != 0:
+            raise RuntimeError(f"Daytona stdin staging failed: {response.result}")
+        self._sandbox.fs.upload_file(host_path, remote_path)
+
+    def _cleanup_stdin_file(self, remote_path: str) -> None:
+        parent = remote_path.rsplit("/", 1)[0]
+        self._sandbox.process.exec(f"rm -rf {shlex.quote(parent)}")
 
     def _daytona_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via Daytona SDK."""

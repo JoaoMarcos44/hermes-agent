@@ -12,6 +12,7 @@ import logging
 import os
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -227,8 +228,9 @@ class BaseEnvironment(ABC):
     implement ``_run_bash()`` and ``cleanup()``; the base provides ``execute()`` with
     snapshot sourcing, CWD tracking, interrupt handling and timeout enforcement."""
 
-    # Subclasses that embed stdin as a heredoc (Modal, Daytona) set this.
-    _stdin_mode: str = "pipe"  # "pipe" or "heredoc"
+    # Remote SDKs without process stdin use "staged": bytes travel through the
+    # backend's native file transport, never through bash source or argv.
+    _stdin_mode: str = "pipe"  # "pipe", "heredoc" (compat), or "staged"
 
     # True only when commands execute on the SAME host as the Hermes process
     # (LocalEnvironment); controller-host facts then describe the execution target.
@@ -276,6 +278,14 @@ class BaseEnvironment(ABC):
     ) -> ProcessHandle:
         """Spawn a bash process to run *cmd_string*; every backend overrides this."""
         raise NotImplementedError(f"{type(self).__name__} must implement _run_bash()")
+
+    def _upload_stdin_file(self, host_path: str, remote_path: str) -> None:
+        """Upload one transient stdin file for a backend using staged stdin."""
+        raise NotImplementedError(f"{type(self).__name__} must implement _upload_stdin_file()")
+
+    def _cleanup_stdin_file(self, remote_path: str) -> None:
+        """Best-effort cleanup after a staged-stdin upload/spawn failure."""
+        raise NotImplementedError(f"{type(self).__name__} must implement _cleanup_stdin_file()")
 
     @abstractmethod
     def cleanup(self):
@@ -421,9 +431,45 @@ class BaseEnvironment(ABC):
 
     @staticmethod
     def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:
-        """Append stdin_data as a shell heredoc to the command string (SDK backends)."""
+        """Append stdin_data as a shell heredoc to the command string (legacy/plugin compat)."""
         delimiter = f"HERMES_STDIN_{uuid.uuid4().hex[:12]}"
         return f"{command} << '{delimiter}'\n{stdin_data}\n{delimiter}"
+
+    def _stage_stdin_file(self, stdin_data: str) -> str:
+        """Upload stdin bytes outside argv and return the sandbox path."""
+        temp_dir = self.get_temp_dir().rstrip("/") or "/"
+        remote_dir = f"{temp_dir}/.hermes-stdin-{uuid.uuid4().hex}"
+        remote_path = f"{remote_dir}/payload"
+        fd, host_path = tempfile.mkstemp(prefix="hermes-stdin-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(stdin_data.encode("utf-8", "surrogateescape"))
+            try:
+                self._upload_stdin_file(host_path, remote_path)
+            except Exception:
+                try:
+                    self._cleanup_stdin_file(remote_path)
+                except Exception:
+                    logger.debug("staged stdin cleanup failed after upload error", exc_info=True)
+                raise
+        finally:
+            try:
+                os.unlink(host_path)
+            except OSError:
+                pass
+        return remote_path
+
+    @staticmethod
+    def _attach_staged_stdin(wrapped: str, remote_path: str) -> str:
+        """Open staged stdin, unlink it immediately, then run the unchanged wrapper."""
+        quoted = shlex.quote(remote_path)
+        parent = shlex.quote(remote_path.rsplit("/", 1)[0])
+        return (
+            f"exec < {quoted} || exit 125\n"
+            f"rm -f {quoted} || :\n"
+            f"rmdir {parent} 2>/dev/null || :\n"
+            f"{wrapped}"
+        )
 
     # --- Process lifecycle ---
     def _wait_for_process(
@@ -612,11 +658,18 @@ class BaseEnvironment(ABC):
 
         # Merge sudo stdin with caller stdin.
         effective_stdin = sudo_stdin + (stdin_data or "") if sudo_stdin is not None else stdin_data
-        if effective_stdin and self._stdin_mode == "heredoc":
-            exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
-            effective_stdin = None
+        staged_stdin: str | None = None
+        if effective_stdin:
+            if self._stdin_mode == "heredoc":
+                exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
+                effective_stdin = None
+            elif self._stdin_mode == "staged":
+                staged_stdin = self._stage_stdin_file(effective_stdin)
+                effective_stdin = None
 
         wrapped = self._wrap_command(exec_command, effective_cwd)
+        if staged_stdin is not None:
+            wrapped = self._attach_staged_stdin(wrapped, staged_stdin)
 
         # Login shell if the snapshot failed (so the user's profile still
         # loads), unless login itself is broken — then non-login is the only path.
@@ -636,9 +689,18 @@ class BaseEnvironment(ABC):
                 return {"output": "[host is exiting: command not started]", "returncode": 130}
             spawned = None
             try:
-                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
-            finally:
-                fenced = _leave_foreground_spawn(self, spawned)
+                try:
+                    spawned = self._run_bash(
+                        wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
+                finally:
+                    fenced = _leave_foreground_spawn(self, spawned)
+            except BaseException:
+                if staged_stdin is not None:
+                    try:
+                        self._cleanup_stdin_file(staged_stdin)
+                    except Exception:
+                        logger.debug("staged stdin cleanup failed after spawn error", exc_info=True)
+                raise
             proc_holder.append(spawned)
             if fenced:  # the hard-exit kill may have stopped waiting for us before we registered
                 self._force_kill_process(spawned)

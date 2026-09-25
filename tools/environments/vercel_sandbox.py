@@ -162,7 +162,7 @@ def _is_terminal(status: Any) -> bool:
 class VercelSandboxEnvironment(BaseEnvironment):
     """Vercel cloud sandbox backend."""
 
-    _stdin_mode = "heredoc"
+    _stdin_mode = "staged"
 
     def __init__(self, runtime: str | None = None, cwd: str = DEFAULT_VERCEL_CWD, timeout: int = 60,
                  cpu: float = 1, memory: int = 5120, disk: int = _DEFAULT_CONTAINER_DISK_MB,
@@ -306,6 +306,15 @@ class VercelSandboxEnvironment(BaseEnvironment):
         if returncode != 0:
             raise RuntimeError(f"Vercel {label} failed: {output.strip()}")
 
+    def _upload_stdin_file(self, host_path: str, remote_path: str) -> None:
+        parent = remote_path.rsplit("/", 1)[0]
+        self._run_checked(f"umask 077; mkdir -p {shlex.quote(parent)}", "stdin staging")
+        self._vercel_bulk_upload([(host_path, remote_path)])
+
+    def _cleanup_stdin_file(self, remote_path: str) -> None:
+        parent = remote_path.rsplit("/", 1)[0]
+        self._run_checked(f"rm -rf {shlex.quote(parent)}", "stdin cleanup")
+
     def _vercel_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         if not files:
             return
@@ -339,7 +348,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120, stdin_data: str | None = None):
         """``timeout`` is enforced by the base ``_wait_for_process`` via ``cancel_fn`` (the SDK has no
-        per-exec timeout); ``stdin_data`` is already embedded as a heredoc by the base ``execute()``."""
+        per-exec timeout); staged stdin is redirected by the base wrapper before this call."""
         del timeout, stdin_data
         sandbox, workspace_root, lock = self._require_sandbox(), self._workspace_root, self._lock
 
