@@ -227,8 +227,8 @@ class BaseEnvironment(ABC):
     implement ``_run_bash()`` and ``cleanup()``; the base provides ``execute()`` with
     snapshot sourcing, CWD tracking, interrupt handling and timeout enforcement."""
 
-    # Subclasses that embed stdin as a heredoc (Modal, Daytona) set this.
-    _stdin_mode: str = "pipe"  # "pipe" or "heredoc"
+    # ``heredoc`` uses the shared file-sync boundary; ``payload`` is consumed by API adapters.
+    _stdin_mode: str = "pipe"  # pipe | heredoc | payload
 
     # True only when commands execute on the SAME host as the Hermes process
     # (LocalEnvironment); controller-host facts then describe the execution target.
@@ -419,12 +419,6 @@ class BaseEnvironment(ABC):
             snapshot_ready=self._snapshot_ready,
             **self._snapshot_script_kwargs(cwd))
 
-    @staticmethod
-    def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:
-        """Append stdin_data as a shell heredoc to the command string (SDK backends)."""
-        delimiter = f"HERMES_STDIN_{uuid.uuid4().hex[:12]}"
-        return f"{command} << '{delimiter}'\n{stdin_data}\n{delimiter}"
-
     # --- Process lifecycle ---
     def _wait_for_process(
         self, proc: ProcessHandle, timeout: int = 120, *,
@@ -610,11 +604,22 @@ class BaseEnvironment(ABC):
         effective_timeout = timeout or self.timeout
         effective_cwd = cwd or self.cwd
 
-        # Merge sudo stdin with caller stdin.
+        # Merge sudo stdin with caller stdin. Pipe backends keep the existing direct path;
+        # SDK-only backends stage bytes through the private remote-file boundary.
         effective_stdin = sudo_stdin + (stdin_data or "") if sudo_stdin is not None else stdin_data
+        stdin_dir = None
         if effective_stdin and self._stdin_mode == "heredoc":
-            exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
+            from tools.environments.remote_file_delivery import stage_remote_stdin
+            stdin_dir, stdin_path = stage_remote_stdin(self, effective_stdin)
+            quoted_stdin_path = shlex.quote(stdin_path)
+            quoted_stdin_dir = shlex.quote(stdin_dir)
+            exec_command = (
+                f"exec < {quoted_stdin_path} || exit $?\n"
+                f"rm -rf {quoted_stdin_dir} || exit $?\n"
+                f"{exec_command}")
             effective_stdin = None
+        elif effective_stdin and self._stdin_mode != "pipe":
+            raise RuntimeError(f"{type(self).__name__} has no safe stdin delivery channel")
 
         wrapped = self._wrap_command(exec_command, effective_cwd)
 
@@ -677,6 +682,13 @@ class BaseEnvironment(ABC):
         except (KeyboardInterrupt, SystemExit):
             _on_timeout()
             raise
+        finally:
+            if stdin_dir is not None:
+                from tools.environments.remote_file_delivery import remove_private_remote_dir
+                try:
+                    remove_private_remote_dir(self, stdin_dir)
+                except Exception:
+                    logger.debug("Failed to clean up remote stdin staging directory", exc_info=True)
 
         if bounded.timed_out:
             suffix = f"\n[Command timed out after {effective_timeout}s]"
@@ -716,7 +728,7 @@ class BaseEnvironment(ABC):
             pass
 
     def _prepare_command(self, command: str) -> tuple[str, str | None]:
-        """Rewrite sudo for a piped password, or leave it alone when this backend has NOPASSWD."""
+        """Rewrite sudo for a stdin-delivered password, or leave it unchanged when NOPASSWD works."""
         from tools.terminal_tool_sudo import _transform_sudo_command
         return _transform_sudo_command(command, sudo_nopasswd_check=self._sudo_nopasswd_works)
 

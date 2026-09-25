@@ -210,6 +210,11 @@ class FileSyncManager:
         self._last_sync_time: float = 0.0  # monotonic; 0 ensures first sync runs
         self._sync_interval = sync_interval
 
+    def upload_file(self, host_path: str, remote_path: str) -> None:
+        """Upload one ephemeral file over the configured transport without tracking it as synced state."""
+        with self._transaction_lock:
+            self._upload_fn(host_path, remote_path)
+
     def sync(self, *, force: bool = False) -> None:
         """Run a sync cycle: upload changed files, delete removed files. Rate-limited to once
         per ``sync_interval`` unless *force* or ``HERMES_FORCE_FILE_SYNC=1``. Transactional:

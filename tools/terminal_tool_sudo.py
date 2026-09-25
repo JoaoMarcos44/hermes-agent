@@ -437,8 +437,9 @@ def _transform_sudo_command(
     execution environment). Returns ``(command, sudo_stdin)``: ``sudo_stdin`` is one password
     line per sudo invocation that the caller must PREPEND to the process stdin (sudo -S consumes
     exactly one line and passes the rest through, so it's safe alongside the caller's own
-    stdin_data). Backends that can't pipe stdin (modal, daytona, vercel_sandbox) embed the
-    password in the command string themselves. With no password available the command is
+    stdin_data). SDK-backed environments keep passwords out of command text by
+    staging heredoc-mode stdin in a private file or using the backend's stdin channel
+    (ManagedModal sends it as ``stdinData``). With no password available the command is
     returned unchanged and ``sudo_stdin`` is None, so it fails gracefully with "sudo: a password
     is required". Password sources, in order: configured SUDO_PASSWORD, the session cache, then
     an interactive prompt (45s timeout, cached on success) when a UI is reachable.

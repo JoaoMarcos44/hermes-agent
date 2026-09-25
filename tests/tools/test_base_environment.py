@@ -1,6 +1,6 @@
 """Tests for BaseEnvironment unified execution model.
 
-Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
+Tests _wrap_command(), _extract_cwd_from_output(),
 init_session() failure handling, and the CWD marker contract.
 """
 
@@ -175,6 +175,7 @@ class TestAtomicSnapshotWrite:
 class TestSnapshotFileModes:
     """Snapshot metadata files are private without changing user command umask."""
 
+    @pytest.mark.platforms("linux", "macos")
     def test_snapshot_and_cwd_files_are_0600(self, tmp_path):
         import os
         from pathlib import Path
@@ -239,18 +240,6 @@ class TestExtractCwdFromOutput:
         assert marker not in result["output"]
 
 
-
-
-class TestEmbedStdinHeredoc:
-
-    def test_unique_delimiter_each_call(self):
-        r1 = BaseEnvironment._embed_stdin_heredoc("cat", "data")
-        r2 = BaseEnvironment._embed_stdin_heredoc("cat", "data")
-
-        # Extract delimiters
-        d1 = r1.split("'")[1]
-        d2 = r2.split("'")[1]
-        assert d1 != d2  # UUID-based, should be unique
 
 
 class TestInitSessionFailure:

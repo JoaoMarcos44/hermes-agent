@@ -203,24 +203,37 @@ atexit.register(shutdown_all_remote_kernels)
 
 def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
                          sandbox_tools: frozenset, *, idle_exit: int) -> Optional[RemoteKernel]:
-    """Start a detached kernel runner on the remote. None on failure (dir removed)."""
+    """Start a detached kernel runner in an owner-private remote directory. None on failure."""
     from tools.code_execution_tool import (
-        MAX_STDOUT_BYTES, _ship_file_to_remote, _env_temp_dir, generate_hermes_tools_module,
+        MAX_STDOUT_BYTES, _ship_file_to_remote, generate_hermes_tools_module,
     )
-    kernel_dir = f"{_env_temp_dir(env)}/hermes_rkernel_{uuid.uuid4().hex[:12]}"
-    q_dir = shlex.quote(kernel_dir)
+    from tools.environments.remote_file_delivery import (
+        RPC_KERNEL_ENV_NAMES, create_private_remote_dir, remove_private_remote_dir, source_and_remove_env_file,
+    )
+    kernel_dir = None
     kernel = None
     try:
-        _sh(env, f"mkdir -p {q_dir}/cells {q_dir}/rpc")
+        kernel_dir = create_private_remote_dir(env, "hermes_rkernel", subdirs=("cells", "rpc"))
+        q_dir = shlex.quote(kernel_dir)
         rpc_token = secrets.token_urlsafe(32)
         _ship_file_to_remote(env, f"{kernel_dir}/kernel_runner.py", REMOTE_KERNEL_RUNNER_SOURCE.format(
             cell_source=RUNNER_CELL_SOURCE, capture_limit=MAX_STDOUT_BYTES, idle_exit=idle_exit))
         _ship_file_to_remote(env, f"{kernel_dir}/hermes_tools.py",
                              generate_hermes_tools_module(list(sandbox_tools), transport="file"))
-        env_prefix = (f"HERMES_KERNEL_DIR={q_dir} HERMES_RPC_DIR={shlex.quote(kernel_dir + '/rpc')} "
-                      f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} PYTHONDONTWRITEBYTECODE=1 PYTHONPATH={q_dir}")
-        started = _sh(env, f"cd {q_dir} && nohup env {env_prefix} python3 kernel_runner.py "
-                           f"> {q_dir}/runner.log 2>&1 & echo PID:$!", timeout=20)
+        env_file = f"{kernel_dir}/kernel.env"
+        env_content = (
+            f"export HERMES_KERNEL_DIR={shlex.quote(kernel_dir)}\n"
+            f"export HERMES_RPC_DIR={shlex.quote(f'{kernel_dir}/rpc')}\n"
+            f"export HERMES_RPC_TOKEN={shlex.quote(rpc_token)}\n"
+            f"export PYTHONDONTWRITEBYTECODE=1\n"
+            f"export PYTHONPATH={shlex.quote(kernel_dir)}\n")
+        _ship_file_to_remote(env, env_file, env_content)
+        launch = source_and_remove_env_file(
+            env_file,
+            f"nohup python3 kernel_runner.py > {q_dir}/runner.log 2>&1 & echo PID:$!",
+            unset_names=RPC_KERNEL_ENV_NAMES,
+        )
+        started = _sh(env, f"cd {q_dir} && {launch}", timeout=20)
         pid = next((line.strip()[4:].strip() for line in started.splitlines()
                     if line.strip().startswith("PID:")), "")
         if not pid.isdigit():
@@ -240,11 +253,11 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
                     pass
     except Exception:
         logger.warning("remote kernel spawn failed", exc_info=True)
-    if kernel is None:
+    if kernel is None and kernel_dir is not None:
         try:
-            _sh(env, f"rm -rf {q_dir}")
+            remove_private_remote_dir(env, kernel_dir)
         except Exception:
-            pass
+            logger.debug("remote kernel directory cleanup failed", exc_info=True)
     return kernel
 
 

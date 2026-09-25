@@ -1,9 +1,9 @@
 """Tool result persistence -- preserves large outputs instead of truncating. Layers against
 context overflow: (1) per-tool caps inside each tool; (2) ``maybe_persist_tool_result`` —
 output over the tool's threshold is persisted and replaced by a preview + path; canonical home
-is ALWAYS host-side ``$HERMES_HOME/cache/spillover/{id}.txt`` (works for sessions that never
+canonical home is ALWAYS host-side ``$HERMES_HOME/cache/spillover/{id}.txt`` (works for sessions that never
 ran a terminal), remote backends get the translated in-sandbox path (probed for readability)
-else a copy in the sandbox temp dir; (3) ``enforce_turn_budget``."""
+else a copy under a private, UID-scoped sandbox temp root; (3) ``enforce_turn_budget``."""
 
 import hashlib
 import logging
@@ -141,7 +141,7 @@ def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
 
 
 def _resolve_storage_dir(env) -> str:
-    """Return the best temp-backed storage dir for this environment."""
+    """Return this environment's private temp-backed storage directory."""
     get_temp_dir = getattr(env, "get_temp_dir", None)
     temp_dir = None
     if callable(get_temp_dir):
@@ -149,7 +149,14 @@ def _resolve_storage_dir(env) -> str:
             temp_dir = get_temp_dir()
         except Exception as exc:
             logger.debug("Could not resolve env temp dir: %s", exc)
-    return f"{temp_dir.rstrip('/') or '/'}/hermes-results" if temp_dir else STORAGE_DIR
+    if not isinstance(temp_dir, str) or not temp_dir.strip():
+        if _is_host_side_env(env):
+            return STORAGE_DIR
+        raise RuntimeError("remote backend has no absolute private scratch directory")
+    if _is_host_side_env(env):
+        return f"{temp_dir.rstrip('/') or '/'}/hermes-results"
+    from tools.environments.remote_file_delivery import ensure_owner_scoped_results_dir
+    return ensure_owner_scoped_results_dir(env, temp_dir)
 
 
 def _safe_result_filename(tool_use_id: str) -> str:
@@ -182,8 +189,7 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     a zero exit from ``cat`` does not prove the bytes landed (quota/ENOSPC races, API-body
     truncation on payload backends). A measured mismatch removes the archive and fails closed;
     an unprobeable backend (no ``wc``, exec error, unparseable output) stays best-effort success.
-    Heredoc-mode backends append exactly one trailing newline by construction
-    (``BaseEnvironment._embed_stdin_heredoc``), so one extra byte is accepted there."""
+    Heredoc-mode backends preserve the exact UTF-8 payload through the file-sync channel."""
     storage_dir = os.path.dirname(remote_path)
     cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
     if env.execute(cmd, timeout=30, stdin_data=content).get("returncode", 1) != 0:
@@ -202,10 +208,6 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
         return True
     persisted_size = int(raw[-1])
     if persisted_size == expected:
-        return True
-    # Only heredoc mode may be +1; the payload backend (managed_modal) delivers stdin verbatim, so
-    # it is expected byte-exact and any drift there is a real loss.
-    if persisted_size == expected + 1 and getattr(env, "_stdin_mode", None) == "heredoc":
         return True
     logger.warning("Sandbox spill for %s is not lossless (%d bytes in sandbox, expected %d) — discarding archive",
                    remote_path, persisted_size, expected)

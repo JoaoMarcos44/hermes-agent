@@ -132,17 +132,22 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
             def execute(self, command, cwd=None, timeout=None):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
-                    return {"output": "OK\n"}
+                    return {"output": "OK\n", "returncode": 0}
                 if "python3 script.py" in command:
                     return {"output": "hello\n", "returncode": 0}
-                return {"output": ""}
+                return {"output": "", "returncode": 0}
 
         env = FakeEnv()
         fake_thread = MagicMock()
 
+        uploaded_files = {}
+
+        def capture_remote_file(_env, remote_path, content):
+            uploaded_files[remote_path] = content
+
         with patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}), \
              patch("tools.code_execution_tool._get_or_create_env", return_value=(env, "ssh")), \
-             patch("tools.code_execution_tool._ship_file_to_remote"), \
+             patch("tools.code_execution_tool._ship_file_to_remote", side_effect=capture_remote_file), \
              patch("tools.code_execution_tool.threading.Thread", return_value=fake_thread):
             result = json.loads(_execute_remote("print('hello')", "task-1", ["terminal"]))
 
@@ -151,17 +156,68 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertFalse(result["stdout_truncated"])
         self.assertEqual(result["stdout_bytes_total"], len("hello\n".encode("utf-8")))
         # The session-kernel path runs first and fails open on this fake env
-        # (no PID from nohup), so search for the per-call sandbox commands
-        # rather than pinning positions.
-        mkdir_cmd = next(cmd for cmd, _, _ in env.commands
-                         if "mkdir -p" in cmd and "hermes_exec_" in cmd)
+        # (no PID from nohup), so check the per-call paths by their relationships.
+        from shlex import split as split_shell_words
+
         run_cmd = next(cmd for cmd, _, _ in env.commands if "python3 script.py" in cmd)
-        cleanup_cmd = next(cmd for cmd, _, _ in env.commands
-                           if "rm -rf" in cmd and "hermes_exec_" in cmd)
-        self.assertIn("mkdir -p /data/data/com.termux/files/usr/tmp/hermes_exec_", mkdir_cmd)
-        self.assertIn("HERMES_RPC_DIR=/data/data/com.termux/files/usr/tmp/hermes_exec_", run_cmd)
-        self.assertIn("rm -rf /data/data/com.termux/files/usr/tmp/hermes_exec_", cleanup_cmd)
-        self.assertNotIn("mkdir -p /tmp/hermes_exec_", mkdir_cmd)
+        sandbox_env_files = [
+            (path, content) for path, content in uploaded_files.items()
+            if path.endswith("/sandbox.env")
+        ]
+        self.assertEqual(len(sandbox_env_files), 1, "Expected one staged sandbox environment file")
+        sandbox_env_path, sandbox_env = sandbox_env_files[0]
+        sandbox_dir = sandbox_env_path.rpartition("/")[0]
+        rpc_assignment = next(
+            (line.partition("=")[2] for line in sandbox_env.splitlines()
+             if line.startswith("export HERMES_RPC_DIR=")),
+            None,
+        )
+        self.assertIsNotNone(rpc_assignment, "Staged sandbox environment must set HERMES_RPC_DIR")
+        rpc_dir = rpc_assignment.strip("'\\\"")
+
+        backend_temp_dir = env.get_temp_dir()
+        self.assertEqual(
+            sandbox_dir.rpartition("/")[0], backend_temp_dir,
+            f"Sandbox directory {sandbox_dir!r} must be directly under backend temp dir {backend_temp_dir!r}",
+        )
+        self.assertFalse(
+            sandbox_dir == "/tmp" or sandbox_dir.startswith("/tmp/"),
+            f"Sandbox directory must not use the default /tmp: {sandbox_dir!r}",
+        )
+
+        run_prefix = run_cmd.partition(" && ")[0]
+        run_words = split_shell_words(run_prefix)
+        run_dir = run_words[1] if len(run_words) == 2 and run_words[0] == "cd" else None
+        self.assertEqual(
+            run_dir, sandbox_dir,
+            f"Run command must execute in sandbox directory {sandbox_dir!r}, got {run_dir!r}",
+        )
+        self.assertIn(
+            sandbox_env_path, run_cmd,
+            f"Run command must source the sandbox environment file {sandbox_env_path!r}",
+        )
+
+        mkdir_commands = [cmd for cmd, _, _ in env.commands if "mkdir " in cmd]
+        created_sandbox_paths = {
+            path
+            for command in mkdir_commands
+            for path in split_shell_words(command)
+            if path == sandbox_dir or path.startswith(f"{sandbox_dir}/")
+        }
+        self.assertIn(
+            sandbox_dir, created_sandbox_paths,
+            f"Sandbox directory {sandbox_dir!r} must be created by the backend",
+        )
+        self.assertIn(
+            rpc_dir, created_sandbox_paths,
+            f"HERMES_RPC_DIR {rpc_dir!r} must reference a directory created inside sandbox {sandbox_dir!r}",
+        )
+
+        cleanup_commands = [cmd for cmd, _, _ in env.commands if "rm -rf" in cmd]
+        self.assertTrue(
+            any(sandbox_dir in split_shell_words(command) for command in cleanup_commands),
+            f"Cleanup command must remove sandbox directory {sandbox_dir!r}",
+        )
 
     def test_timezone_shell_quoted_in_remote_execution(self):
         """HERMES_TIMEZONE must be shell-quoted in remote env_prefix to prevent injection."""
@@ -175,10 +231,10 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
             def execute(self, command, cwd=None, timeout=None):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
-                    return {"output": "OK\n"}
+                    return {"output": "OK\n", "returncode": 0}
                 if "python3 script.py" in command:
                     return {"output": "hello\n", "returncode": 0}
-                return {"output": ""}
+                return {"output": "", "returncode": 0}
 
         env = FakeEnv()
         fake_thread = MagicMock()
@@ -744,10 +800,10 @@ class TestHeadTailTruncation(unittest.TestCase):
             def execute(self, command, cwd=None, timeout=None):
                 self.commands.append((command, cwd, timeout))
                 if "command -v python3" in command:
-                    return {"output": "OK\n"}
+                    return {"output": "OK\n", "returncode": 0}
                 if "python3 script.py" in command:
                     return {"output": "HEAD\n" + ("x" * 80_000) + "\nTAIL\n", "returncode": 0}
-                return {"output": ""}
+                return {"output": "", "returncode": 0}
 
         fake_thread = MagicMock()
 

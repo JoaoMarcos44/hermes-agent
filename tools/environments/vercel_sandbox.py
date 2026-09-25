@@ -339,7 +339,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120, stdin_data: str | None = None):
         """``timeout`` is enforced by the base ``_wait_for_process`` via ``cancel_fn`` (the SDK has no
-        per-exec timeout); ``stdin_data`` is already embedded as a heredoc by the base ``execute()``."""
+        per-exec timeout); ``stdin_data`` is staged privately so the SDK command never carries it."""
         del timeout, stdin_data
         sandbox, workspace_root, lock = self._require_sandbox(), self._workspace_root, self._lock
 

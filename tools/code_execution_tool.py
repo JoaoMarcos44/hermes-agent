@@ -11,7 +11,6 @@ per-call script ship, tool calls as request files polled via env.execute()
 scrubbing, interpreter/cwd), tools/code_execution_rpc.py (RPC servers).
 """
 
-import base64
 import json
 import logging
 import os
@@ -19,7 +18,6 @@ import re
 import secrets
 import shlex
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -451,25 +449,9 @@ def _get_or_create_env(task_id: str):
 
 
 def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
-    """Write *content* to *remote_path* via ``echo … | base64 -d`` — some backends (Modal) don't
-    reliably deliver stdin_data to chained commands; base64 is shell-safe inside single quotes."""
-    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    env.execute(f"echo '{encoded}' | base64 -d > {shlex.quote(remote_path)}", cwd="/", timeout=30)
-
-
-def _env_temp_dir(env: Any) -> str:
-    """Return a writable temp dir for env-backed execute_code sandboxes."""
-    temp_dir = None
-    get_temp_dir = getattr(env, "get_temp_dir", None)
-    if callable(get_temp_dir):
-        try:
-            temp_dir = get_temp_dir()
-        except Exception as exc:
-            logger.debug("Could not resolve execute_code env temp dir: %s", exc)
-    for candidate in (temp_dir, tempfile.gettempdir()):
-        if isinstance(candidate, str) and candidate.startswith("/"):
-            return candidate.rstrip("/") or "/"
-    return tempfile.gettempdir()
+    """Stage remote content through stdin or the configured file-sync channel, never command text."""
+    from tools.environments.remote_file_delivery import deliver_remote_file
+    deliver_remote_file(env, remote_path, content)
 
 
 def _format_interrupted_output(stdout_text: str) -> str:
@@ -561,18 +543,24 @@ def _sandbox_tools_for(enabled_tools: Optional[List[str]]) -> frozenset:
 def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
                          sandbox_tools: frozenset, *, timeout: int, max_tool_calls: int,
                          exec_start: float) -> str:
-    """Per-call script ship: stage hermes_tools.py + script.py in a fresh remote sandbox dir,
-    serve file-RPC from a polling thread, run, clean up."""
-    sandbox_dir = f"{_env_temp_dir(env)}/hermes_exec_{uuid.uuid4().hex[:12]}"
-    quoted_sandbox_dir = shlex.quote(sandbox_dir)
-    quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
+    """Per-call script ship: stage files in an owner-private remote dir, serve file-RPC, run, clean up."""
+    from tools.environments.remote_file_delivery import (
+        RPC_KERNEL_ENV_NAMES, create_private_remote_dir, remove_private_remote_dir, source_and_remove_env_file,
+    )
+    sandbox_dir = None
     tool_call_counter, stop_event, rpc_thread = [0], threading.Event(), None
     try:
-        env.execute(f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10)
+        sandbox_dir = create_private_remote_dir(env, "hermes_exec", subdirs=("rpc",))
+        quoted_sandbox_dir = shlex.quote(sandbox_dir)
         rpc_token = secrets.token_urlsafe(32)
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py",
                              generate_hermes_tools_module(list(sandbox_tools), transport="file"))
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
+        env_file = f"{sandbox_dir}/sandbox.env"
+        env_content = (
+            f"export HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')}\n"
+            f"export HERMES_RPC_TOKEN={shlex.quote(rpc_token)}\n")
+        _ship_file_to_remote(env, env_file, env_content)
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (tools.thread_context) — else sandbox RPC tool calls lose approval routing.
         # See #30882.
@@ -581,14 +569,15 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
             args=(env, f"{sandbox_dir}/rpc", effective_task_id, [], tool_call_counter,
                   max_tool_calls, sandbox_tools, stop_event, rpc_token))
         rpc_thread.start()
-        env_prefix = (f"HERMES_RPC_DIR={quoted_rpc_dir} HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
-                      "PYTHONDONTWRITEBYTECODE=1")
         tz = get_timezone_name()  # routed profile's timezone, not the bridged default's
+        python_command = "PYTHONDONTWRITEBYTECODE=1"
         if tz:
-            env_prefix += f" TZ={shlex.quote(tz)}"
+            python_command += f" TZ={shlex.quote(tz)}"
+        python_command += " python3 script.py"
+        source_command = source_and_remove_env_file(
+            env_file, python_command, unset_names=RPC_KERNEL_ENV_NAMES[:2])
         logger.info("Executing code on %s backend (task %s)...", env_type, effective_task_id[:8])
-        script_result = env.execute(f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
-                                    timeout=timeout)
+        script_result = env.execute(f"cd {quoted_sandbox_dir} && {source_command}", timeout=timeout)
         stdout_text = script_result.get("output", "") or ""
         exit_code = script_result.get("returncode", -1)
         # Backend exit codes: 124 = timeout wrapper, 130 = SIGINT.
@@ -599,10 +588,11 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         stop_event.set()
         if rpc_thread is not None:
             rpc_thread.join(timeout=5)
-        try:
-            env.execute(f"rm -rf {quoted_sandbox_dir}", cwd="/", timeout=15)
-        except Exception:
-            logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
+        if sandbox_dir is not None:
+            try:
+                remove_private_remote_dir(env, sandbox_dir)
+            except Exception:
+                logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
     result = _remote_result(status, stdout_text, exec_start,
                             {"exit_code": exit_code, "tool_calls_made": tool_call_counter[0]})
     if status == "timeout":

@@ -1,6 +1,7 @@
 """Tests for tools/tool_result_storage.py -- 3-layer tool result persistence."""
 
 import pytest
+import shlex
 from unittest.mock import MagicMock, patch
 
 from tools.budget_config import (
@@ -99,15 +100,15 @@ class TestWriteToSandbox:
         [
             ("pipe", 512, False),      # short write: bytes lost
             ("pipe", 171, False),      # pipe backends must be exact
-            ("heredoc", 171, True),    # heredoc appends exactly one newline
+            ("heredoc", 171, False),   # SDK file-sync delivery is byte-exact
             ("host", 3, False),        # host spillover: os.stat says only 3 bytes landed
             ("host", None, True),      # host spillover: real write, real stat
         ],
     )
     def test_size_probe_decides_lossless(self, stdin_mode, probed, ok):
-        """An archive that is not byte-exact (modulo the heredoc newline) is discarded — never
-        referenced to the model (port of lobehub/lobehub#18258). Multibyte content pins the
-        comparison to UTF-8 bytes (170 here, 130 chars), on both the sandbox and host paths."""
+        """An archive that is not byte-exact is discarded — never referenced to the model
+        (port of lobehub/lobehub#18258). Multibyte content pins the comparison to UTF-8 bytes
+        (170 here, 130 chars), on both the sandbox and host paths."""
         import os
 
         from tools.tool_result_storage import _write_to_spillover
@@ -158,10 +159,16 @@ class TestResolveStorageDir:
     def test_defaults_to_storage_dir_without_env(self):
         assert _resolve_storage_dir(None) == STORAGE_DIR
 
-    def test_uses_env_temp_dir_when_available(self):
+    def test_uses_private_uid_scoped_dir_when_available(self):
         env = MagicMock()
         env.get_temp_dir.return_value = "/var/host/tmp"
-        assert _resolve_storage_dir(env) == "/var/host/tmp/hermes-results"
+        owner_id = "1001"
+        env.execute.side_effect = [
+            {"output": f"{owner_id}\n", "returncode": 0},
+            {"output": "", "returncode": 0},
+        ]
+        assert _resolve_storage_dir(env) == f"/var/host/tmp/hermes-results-{owner_id}"
+        assert env.execute.call_count == 2
 
 class TestSafeResultFilename:
     def test_preserves_normal_tool_call_id(self):
@@ -225,14 +232,17 @@ class TestMaybePersistToolResult:
         """Content is persisted verbatim — no JSON extraction."""
         import json
         env = MagicMock()
-        # Readability probe fails -> falls back to the in-sandbox write,
+        remote_uid = "1001"
+        # Readability probe fails -> the private remote results root receives the in-sandbox write,
         # whose size probe returns unparseable output (best-effort success).
         env.execute.side_effect = [
-            {"output": "", "returncode": 1},
-            {"output": "", "returncode": 0},
+            {"output": "", "returncode": 1},  # spillover probe
+            {"output": f"{remote_uid}\n", "returncode": 0},  # remote OS user id
+            {"output": "", "returncode": 0},  # owner-private results directory
+            {"output": "", "returncode": 0},  # in-sandbox write
             {"output": "", "returncode": 1},  # wc -c size probe: no answer
         ]
-        env.get_temp_dir.return_value = ""
+        env.get_temp_dir.return_value = "/tmp"
         raw = "line1\nline2\n" * 5_000
         content = json.dumps({"output": raw, "exit_code": 0, "error": None})
         result = maybe_persist_tool_result(
@@ -245,17 +255,20 @@ class TestMaybePersistToolResult:
         assert PERSISTED_OUTPUT_TAG in result
         # Content is delivered through stdin (no longer embedded in the
         # command string — see test_large_content_via_stdin for why).
-        assert env.execute.call_args_list[1][1]["stdin_data"] == content
+        assert env.execute.call_args_list[3][1]["stdin_data"] == content
 
     def test_tool_use_id_cannot_escape_storage_dir(self):
         env = MagicMock()
         # Readability probe fails -> in-sandbox write is the reference path.
+        owner_id = "1001"
         env.execute.side_effect = [
-            {"output": "", "returncode": 1},
-            {"output": "", "returncode": 0},
+            {"output": "", "returncode": 1},  # spillover probe
+            {"output": f"{owner_id}\n", "returncode": 0},  # remote OS user id
+            {"output": "", "returncode": 0},  # owner-private results directory
+            {"output": "", "returncode": 0},  # in-sandbox write
             {"output": "", "returncode": 1},  # wc -c size probe: no answer
         ]
-        env.get_temp_dir.return_value = ""
+        env.get_temp_dir.return_value = "/tmp"
         content = "x" * 60_000
         result = maybe_persist_tool_result(
             content=content,
@@ -264,14 +277,13 @@ class TestMaybePersistToolResult:
             env=env,
             threshold=30_000,
         )
-        cmd = env.execute.call_args_list[1][0][0]
-        target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
+        cmd = env.execute.call_args_list[3][0][0]
+        target = shlex.split(cmd.split("cat > ", 1)[1])[0]
 
-        from tools.tool_result_storage import STORAGE_DIR
-
-        assert f"Full output saved to: {STORAGE_DIR}/outside_whoami_x_" in result
-        assert f"{STORAGE_DIR}/../" not in result
-        assert target.startswith(f"{STORAGE_DIR}/outside_whoami_x_")
+        remote_root = f"/tmp/hermes-results-{owner_id}"
+        assert f"Full output saved to: {remote_root}/outside_whoami_x_" in result
+        assert f"{remote_root}/../" not in result
+        assert target.startswith(f"{remote_root}/outside_whoami_x_")
         assert "/../" not in target
         assert "$(whoami)" not in target
         assert ";" not in target
@@ -419,7 +431,9 @@ class TestSpillover:
         readable in-sandbox copy."""
         env = MagicMock()
         env.execute.side_effect = [
-            {"output": "", "returncode": 1},  # probe: not readable
+            {"output": "", "returncode": 1},  # spillover probe: not readable
+            {"output": "1001\n", "returncode": 0},  # remote OS user id
+            {"output": "", "returncode": 0},  # owner-private results directory
             {"output": "", "returncode": 0},  # cat > sandbox path
             {"output": "60000\n", "returncode": 0},  # wc -c verification
         ]
@@ -433,8 +447,8 @@ class TestSpillover:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        assert "/tmp/hermes-results/tc_remote_2.txt" in result
-        assert env.execute.call_count == 3
+        assert "/tmp/hermes-results-1001/tc_remote_2.txt" in result
+        assert env.execute.call_count == 5
         # Host canonical copy exists regardless.
         assert (get_spillover_dir() / "tc_remote_2.txt").exists()
 
