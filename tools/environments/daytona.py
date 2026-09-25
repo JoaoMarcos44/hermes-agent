@@ -142,14 +142,30 @@ class DaytonaEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None):
         sandbox, lock = self._sandbox, self._lock
-        staged_stdin = {"path": None}
+        cancel_requested = threading.Event()
 
         def cancel():
+            # The worker owns staged-file cleanup. Stopping here is intentionally
+            # independent of upload progress so kill() never waits on a blocked upload.
+            cancel_requested.set()
+            with lock, contextlib.suppress(Exception):
+                sandbox.stop()
+
+        def cleanup_staged_stdin(remote_stdin: str) -> None:
+            try:
+                sandbox.fs.delete_file(remote_stdin, request_timeout=5)
+                return
+            except Exception:
+                if not cancel_requested.is_set():
+                    return
+            # cancel() may have stopped a persistent sandbox while upload_file()
+            # was still in flight. Once that upload has quiesced, resume only
+            # long enough to remove the secret and stop the sandbox again.
             with lock:
-                remote_stdin = staged_stdin["path"]
-                if remote_stdin:
-                    with contextlib.suppress(Exception):
-                        sandbox.fs.delete_file(remote_stdin, request_timeout=5)
+                with contextlib.suppress(Exception):
+                    sandbox.start()
+                with contextlib.suppress(Exception):
+                    sandbox.fs.delete_file(remote_stdin, request_timeout=5)
                 with contextlib.suppress(Exception):
                     sandbox.stop()
 
@@ -161,12 +177,13 @@ class DaytonaEnvironment(BaseEnvironment):
                 if stdin_data is not None:
                     temp_dir = self.get_temp_dir().rstrip("/") or "/"
                     remote_stdin = f"{temp_dir}/.hermes-stdin-{uuid.uuid4().hex}"
-                    staged_stdin["path"] = remote_stdin
                     with tempfile.NamedTemporaryFile(delete=False) as staged:
                         local_stdin = staged.name
                         staged.write(stdin_data.encode("utf-8", "surrogateescape"))
                     sandbox.fs.upload_file(local_stdin, remote_stdin)
                     sandbox.fs.set_file_permissions(remote_stdin, mode="600")
+                    if cancel_requested.is_set():
+                        return "", 130
                     quoted_stdin = shlex.quote(remote_stdin)
                     command = (
                         f"exec 0< {quoted_stdin} || exit $?\n"
@@ -181,9 +198,7 @@ class DaytonaEnvironment(BaseEnvironment):
                     with contextlib.suppress(OSError):
                         os.unlink(local_stdin)
                 if remote_stdin:
-                    with contextlib.suppress(Exception):
-                        sandbox.fs.delete_file(remote_stdin, request_timeout=5)
-                    staged_stdin["path"] = None
+                    cleanup_staged_stdin(remote_stdin)
 
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
 

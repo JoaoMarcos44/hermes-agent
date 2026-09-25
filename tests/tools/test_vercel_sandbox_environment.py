@@ -553,6 +553,42 @@ class TestExecute:
         assert len(user_calls) == 1
         assert len(sandbox.stop_calls) == 1
 
+    def test_cancel_during_upload_removes_late_staged_file(
+        self, make_env, vercel_sdk
+    ):
+        env = make_env()
+        sandbox = vercel_sdk.current
+        sandbox.run_command_calls.clear()
+        sandbox.write_files_calls.clear()
+        sandbox.stop_calls.clear()
+        upload_started = threading.Event()
+        release_upload = threading.Event()
+
+        def blocking_upload(_files):
+            upload_started.set()
+            release_upload.wait(timeout=5)
+
+        sandbox.write_files_side_effects.append(blocking_upload)
+        handle = env._run_bash("cat > /tmp/payload.txt", stdin_data="secret")
+        assert upload_started.wait(timeout=1)
+
+        handle.kill()
+        release_upload.set()
+
+        assert handle.wait(timeout=2) == 130
+        user_calls = [
+            (cmd, args) for cmd, args, _ in sandbox.run_command_calls
+            if cmd == "bash" and len(args) > 1 and "cat > /tmp/payload.txt" in args[1]
+        ]
+        assert user_calls == []
+        cleanup_calls = [
+            (cmd, args) for cmd, args, _ in sandbox.run_command_calls
+            if cmd == "bash" and len(args) > 1 and "rm -f --" in args[1]
+            and ".hermes-stdin-" in args[1]
+        ]
+        assert len(cleanup_calls) == 1
+        assert len(sandbox.stop_calls) >= 2
+
     def test_large_stdin_is_staged_outside_command_argv(
         self, make_env, vercel_sdk
     ):

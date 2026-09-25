@@ -343,17 +343,22 @@ class VercelSandboxEnvironment(BaseEnvironment):
         per-exec timeout). Payload stdin is staged through the SDK so it never becomes a shell argv."""
         del timeout
         sandbox, workspace_root, lock = self._require_sandbox(), self._workspace_root, self._lock
+        cancel_requested = threading.Event()
 
         def cancel() -> None:
             # Do not dispatch a second command here: the pinned 0.7.2 SDK has no
             # per-command timeout, so cleanup could block the synchronous kill path.
             # Once the staged file is opened below it is unlinked before user code;
-            # stopping the captured sandbox contains the pre-dispatch race.
+            # stopping the captured sandbox contains the running-command path;
+            # any raced staged file is removed by the worker after the SDK call
+            # quiesces, never from this synchronous kill callback.
+            cancel_requested.set()
             with lock:
                 self._stop_sandbox(sandbox)
 
         def exec_fn() -> tuple[str, int]:
             remote_stdin = None
+            failed = False
             try:
                 command = cmd_string
                 if stdin_data is not None:
@@ -368,6 +373,8 @@ class VercelSandboxEnvironment(BaseEnvironment):
                         }]),
                         attempts=_WRITE_RETRY_ATTEMPTS,
                     )
+                    if cancel_requested.is_set():
+                        return "", 130
                     quoted_stdin = shlex.quote(remote_stdin)
                     command = (
                         f"exec 0< {quoted_stdin} || exit $?\n"
@@ -378,11 +385,24 @@ class VercelSandboxEnvironment(BaseEnvironment):
                     "bash", ["-lc" if login else "-c", command], cwd=workspace_root)
                 return _result_parts(result)
             except Exception:
-                # If dispatch failed before the shell could open+unlink the staging
-                # file, fail closed by stopping this captured sandbox. Hermes never
-                # reuses a terminal Vercel sandbox on the next execute.
-                self._stop_sandbox(sandbox)
+                failed = True
                 raise
+            finally:
+                if failed or cancel_requested.is_set():
+                    # Vercel stop() can persist filesystem state. If cancellation
+                    # raced write_files()/dispatch, wait for that SDK call to
+                    # quiesce, then use the captured sandbox to remove the staged
+                    # secret before stopping it again. This runs on the worker,
+                    # not inside kill(), so cancellation itself stays bounded.
+                    with lock:
+                        if remote_stdin:
+                            quoted_stdin = shlex.quote(remote_stdin)
+                            with contextlib.suppress(Exception):
+                                sandbox.run_command(
+                                    "bash", ["-lc", f"rm -f -- {quoted_stdin}"],
+                                    cwd=workspace_root,
+                                )
+                        self._stop_sandbox(sandbox)
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
 
     def cleanup(self):

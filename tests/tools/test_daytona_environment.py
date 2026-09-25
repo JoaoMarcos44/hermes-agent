@@ -220,6 +220,43 @@ class TestExecute:
         assert sandbox.fs.delete_file.call_args.kwargs["request_timeout"] == 5
         sandbox.stop.assert_called()
 
+    def test_cancel_during_upload_removes_late_staged_file(self, make_env):
+        env = make_env()
+        sandbox = env._sandbox
+        sandbox.process.exec.reset_mock()
+        sandbox.stop.reset_mock()
+        sandbox.start.reset_mock()
+        sandbox.fs.delete_file.reset_mock()
+        upload_started = threading.Event()
+        release_upload = threading.Event()
+
+        def blocking_upload(_host_path, _remote_path):
+            upload_started.set()
+            release_upload.wait(timeout=5)
+
+        sandbox.fs.upload_file.side_effect = blocking_upload
+        # Model the first delete seeing the stopped sandbox; recovery must
+        # restart, delete the late-arriving file, then stop again.
+        sandbox.fs.delete_file.side_effect = [RuntimeError("stopped"), None]
+
+        handle = env._run_bash("cat > /tmp/payload.txt", stdin_data="secret")
+        assert upload_started.wait(timeout=1)
+
+        handle.kill()
+        release_upload.set()
+
+        assert handle.wait(timeout=2) == 130
+        assert sandbox.fs.delete_file.call_count == 2
+        deleted_paths = [call.args[0] for call in sandbox.fs.delete_file.call_args_list]
+        assert len(set(deleted_paths)) == 1
+        assert ".hermes-stdin-" in deleted_paths[0]
+        sandbox.start.assert_called_once()
+        assert sandbox.stop.call_count >= 2
+        assert not any(
+            "cat > /tmp/payload.txt" in call.args[0]
+            for call in sandbox.process.exec.call_args_list
+        )
+
     def test_large_stdin_is_staged_outside_command_argv(self, make_env):
         env = make_env()
         sandbox = env._sandbox
