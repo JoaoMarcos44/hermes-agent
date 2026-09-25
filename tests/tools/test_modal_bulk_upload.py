@@ -6,6 +6,7 @@ import io
 import tarfile
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 
 from tools.environments import modal as modal_env
 
@@ -41,7 +42,7 @@ def _make_mock_stdin():
     return stdin
 
 
-def _wire_async_exec(env, exec_calls=None):
+def _wire_async_exec(env, exec_calls=None, *, exit_code=0):
     """Wire mock sandbox.exec.aio and a real run_coroutine on the env.
 
     Optionally captures exec call args into *exec_calls* list.
@@ -56,7 +57,7 @@ def _wire_async_exec(env, exec_calls=None):
         exec_calls.append(args)
         proc = MagicMock()
         proc.wait = MagicMock()
-        proc.wait.aio = AsyncMock(return_value=0)
+        proc.wait.aio = AsyncMock(return_value=exit_code)
         proc.stdin = stdin_mock
         proc.stderr = MagicMock()
         proc.stderr.read = MagicMock()
@@ -127,6 +128,28 @@ class TestModalBulkUpload:
 
         # Verify stdin was closed
         stdin_mock.write_eof.assert_called_once()
+
+
+    def test_single_upload_requires_successful_decoder_exit(self, monkeypatch, tmp_path):
+        env = _make_mock_modal_env(monkeypatch, tmp_path)
+        src = tmp_path / "payload.bin"
+        src.write_bytes(b"complete-payload")
+        _, _, stdin_mock = _wire_async_exec(env, exit_code=153)
+
+        with pytest.raises(RuntimeError, match=r"Modal upload failed \\(exit 153\\)"):
+            env._modal_upload(str(src), "/root/.hermes/payload.bin")
+
+        assert base64.b64decode("".join(stdin_mock._written_chunks)) == b"complete-payload"
+
+    def test_single_upload_accepts_successful_decoder_exit(self, monkeypatch, tmp_path):
+        env = _make_mock_modal_env(monkeypatch, tmp_path)
+        src = tmp_path / "payload.bin"
+        src.write_bytes(b"complete-payload")
+        _, _, stdin_mock = _wire_async_exec(env, exit_code=0)
+
+        env._modal_upload(str(src), "/root/.hermes/payload.bin")
+
+        assert base64.b64decode("".join(stdin_mock._written_chunks)) == b"complete-payload"
 
 
     def test_stdin_chunked_for_large_payloads(self, monkeypatch, tmp_path):
