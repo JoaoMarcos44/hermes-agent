@@ -2589,3 +2589,47 @@ def test_run_backup_prunes_older_default_named_zips_but_not_others(tmp_path, mon
     kept = sorted(p.name for p in tmp_path.glob("hermes-backup-*.zip"))
     assert len(kept) == 2 and kept[0] == "hermes-backup-2026-01-04-000000.zip"
     assert (tmp_path / "my-archive.zip").exists()
+
+
+def test_snapshot_restore_handler_reports_refused_restore_not_not_found(tmp_path, monkeypatch, capsys):
+    """/snapshot restore must not claim 'Snapshot not found' when the snapshot
+    exists but its restore was refused, and must not claim success either —
+    the refused file is reported as a failed/incomplete restore (#122868)."""
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Live state.db with a row that must survive the refused restore.
+    conn = sqlite3.connect(home / "state.db")
+    conn.execute("CREATE TABLE evidence (value TEXT)")
+    conn.execute("INSERT INTO evidence VALUES ('live')")
+    conn.commit()
+    conn.close()
+    # An existing snapshot whose state.db copy is corrupt: the restore must be
+    # refused, and the handler must say so instead of blaming a missing id.
+    snap_id = "20260925-120000"
+    snap = home / "state-snapshots" / snap_id
+    snap.mkdir(parents=True)
+    (snap / "manifest.json").write_text(
+        json.dumps({"id": snap_id, "files": {"state.db": {}, "config.yaml": {}}})
+    )
+    (snap / "state.db").write_bytes(b"this is not a sqlite database")
+    (snap / "config.yaml").write_text("mode: snapshot\n")
+
+    class _Stub(CLICommandsMixin):
+        def __init__(self):
+            self.agent = None
+
+    _Stub()._snapshot_restore(["snapshot", "restore", snap_id])
+    out = capsys.readouterr().out
+    assert "Snapshot not found" not in out, (
+        "existing snapshot whose restore was refused was reported as missing"
+    )
+    assert "Restored state from" not in out, (
+        "refused restore was reported as a success"
+    )
+    assert "incomplete" in out.lower(), (
+        f"refused restore was not reported as a failed/incomplete restore: {out!r}"
+    )
