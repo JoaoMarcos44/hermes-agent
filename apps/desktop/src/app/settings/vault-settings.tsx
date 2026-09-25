@@ -25,7 +25,7 @@ import { $activeConnectionId } from '@/store/connections'
 import { requestGatewayForAgent } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $gatewayState } from '@/store/session'
-import { $settingsScopeProfile } from '@/store/settings-scope'
+import { $settingsRequestProfile, $settingsScopeProfile } from '@/store/settings-scope'
 
 import { CONTROL_TEXT } from './constants'
 import { ListRow, Pill, SectionHeading, SettingsContent } from './primitives'
@@ -168,6 +168,7 @@ export function VaultSettings({ subpage }: VaultSettingsProps = {}) {
   // remounts it: dialogs close and drafts (including a typed master password) are gone by
   // construction rather than by cleanup code.
   const scopeProfile = useStore($settingsScopeProfile)
+  const requestProfile = useStore($settingsRequestProfile)
   const connectionId = useStore($activeConnectionId)
   const owner = vaultOwnerKey(connectionId, scopeProfile)
 
@@ -177,14 +178,14 @@ export function VaultSettings({ subpage }: VaultSettingsProps = {}) {
         connectionId,
         scopeProfile,
         method,
-        { ...params, profile: scopeProfile },
+        requestProfile === undefined ? params : { ...params, profile: requestProfile },
         undefined,
         undefined,
         {
           spawnPriority: 'foreground'
         }
       ),
-    [connectionId, scopeProfile]
+    [connectionId, requestProfile, scopeProfile]
   )
 
   const VAULT_QUERY_KEY = useMemo(() => vaultQueryKey(owner), [owner])
