@@ -160,6 +160,10 @@ catalog moved (via a reviewed PR), prepares and dependency-validates the new SHA
 before publishing it. Your
 enabled/disabled state is preserved, and so are files the plugin's repo does
 not track (the `config.yaml` created from its `.example`, data files, `.env`).
+For monorepo/subdirectory installs, which do not carry a local Git checkout,
+update preserves user-state files the new revision does not ship. Plugin code and
+control surfaces (Python, Desktop/skills, manifests/MCP and dependency metadata)
+remain revision-owned and are not resurrected from the old install.
 Edits you made to *tracked* files are not carried onto the new code; copies are
 saved under `~/.hermes/plugins-backup/<name>-<sha>/` and the update warns you.
 If the new pin renames the plugin's manifest, the old directory is removed and
