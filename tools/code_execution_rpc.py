@@ -6,7 +6,6 @@ local UDS/TCP socket, ``_rpc_poll_loop`` polls a remote filesystem for request
 files via ``env.execute()``.
 """
 
-import base64
 import json
 import logging
 import secrets
@@ -166,15 +165,19 @@ def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_ca
                     max_tool_calls=max_tool_calls, dispatch=dispatch, tool_call_log=tool_call_log,
                     call_start=call_start, where="remote sandbox",
                 )
-                # Write the response atomically (tmp + rename) via echo piping —
-                # Modal doesn't reliably deliver stdin_data to chained commands.
-                quoted_res_file = shlex.quote(f"{rpc_dir}/res_{request.get('seq', 0):06d}")
-                encoded_result = base64.b64encode(tool_result.encode("utf-8")).decode("ascii")
-                env.execute(
-                    f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
-                    f" && mv {quoted_res_file}.tmp {quoted_res_file}",
-                    cwd="/", timeout=60,
+                # Stage the response through the same non-argv delivery boundary as
+                # launch secrets, then publish it atomically after a checked rename.
+                from tools.environments.remote_file_delivery import deliver_remote_file
+                res_file = f"{rpc_dir}/res_{request.get('seq', 0):06d}"
+                tmp_file = f"{res_file}.tmp"
+                deliver_remote_file(env, tmp_file, tool_result)
+                publish = env.execute(
+                    f"mv -f {shlex.quote(tmp_file)} {shlex.quote(res_file)}",
+                    cwd="/", timeout=10,
                 )
+                if not isinstance(publish, dict) or publish.get("returncode") != 0:
+                    env.execute(f"rm -f {shlex.quote(tmp_file)}", cwd="/", timeout=5)
+                    raise RuntimeError("remote RPC response publish failed")
                 env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
         except Exception as e:
             if not stop_event.is_set():
