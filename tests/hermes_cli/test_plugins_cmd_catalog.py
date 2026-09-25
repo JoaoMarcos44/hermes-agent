@@ -215,6 +215,22 @@ def test_carry_user_files_without_git_preserves_data_but_not_old_code_or_type_cl
     (old / "data").mkdir()
     (old / "data" / "state.db").write_text("user data")
     (old / "legacy.py").write_text("OLD = True\n")
+    (old / ".git").write_text("gitdir: /tmp/foreign-worktree\\n")
+    (old / "desktop").mkdir()
+    (old / "desktop" / "plugin.js").write_text("export default { id: \"stale\" }\n")
+    (old / "skills").mkdir()
+    (old / "skills" / "stale").mkdir()
+    (old / "skills" / "stale" / "SKILL.md").write_text("# stale\n")
+    (old / "mcp.json").write_text('{"mcpServers":{"stale":{"type":"stdio","command":"./stale"}}}\n')
+    (old / "pyproject.toml").write_text('[project]\nname="stale"\nversion="1"\n')
+    (old / "package.json").write_text('{"name":"stale"}\n')
+    outside_leaf = tmp_path / "outside-leaf.txt"
+    outside_leaf.write_text("outside")
+    old_link = old / "user-link"
+    try:
+        old_link.symlink_to(outside_leaf)
+    except OSError:
+        old_link = None
 
     # old=file/new=dir: the new directory owns the path.
     (old / "file-to-dir").write_text("old user file")
@@ -226,14 +242,67 @@ def test_carry_user_files_without_git_preserves_data_but_not_old_code_or_type_cl
     (old / "dir-to-file" / "state.db").write_text("old nested data")
     (new / "dir-to-file").write_text("new tree file")
 
+    # A new revision may contain symlinks. Carry must never follow a staged-tree parent link
+    # and write user data outside the transaction before the scanner gets a chance to reject it.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (old / "escape").mkdir()
+    (old / "escape" / "state.db").write_text("must stay inside old tree")
+    symlink_parent = new / "escape"
+    try:
+        symlink_parent.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        symlink_parent = None
+
     cat._carry_user_files(old, new, None)
 
     assert (new / "config.yaml").read_text() == "endpoint: mine\n"
     assert (new / "data" / "state.db").read_text() == "user data"
     assert not (new / "legacy.py").exists()
+    assert not (new / ".git").exists()
+    assert not (new / "desktop").exists()
+    assert not (new / "skills").exists()
+    assert not (new / "mcp.json").exists()
+    assert not (new / "pyproject.toml").exists()
+    assert not (new / "package.json").exists()
+    if old_link is not None:
+        assert not (new / "user-link").exists()
     assert (new / "file-to-dir" / "current.txt").read_text() == "new tree"
     assert sorted(path.name for path in (new / "file-to-dir").iterdir()) == ["current.txt"]
     assert (new / "dir-to-file").read_text() == "new tree file"
+    if symlink_parent is not None:
+        assert not (outside / "state.db").exists()
+
+
+
+def test_carry_user_files_fails_closed_when_source_tree_cannot_be_walked(tmp_path, monkeypatch):
+    """Unreadable user state aborts replacement instead of being silently omitted."""
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+
+    def denied_walk(_path, *, onerror=None, **_kwargs):
+        assert onerror is not None
+        onerror(PermissionError("denied"))
+        return ()
+
+    monkeypatch.setattr(cat.os, "walk", denied_walk)
+    with pytest.raises(pc.PluginOperationError, match="Could not preserve user files.*denied"):
+        cat._carry_user_files(old, new, None)
+
+
+def test_git_checkout_update_fails_closed_when_local_changes_cannot_be_inspected(world, monkeypatch):
+    """A destructive re-pin must not guess ownership when a real git checkout cannot be inspected."""
+    target = cat.install_catalog_entry(pc_cat.get_live_catalog_entry("cat-plugin"), force=False)[0]
+    assert (target / ".git").exists()
+    monkeypatch.setattr(pc, "_resolve_git_executable", lambda: None)
+    world["state"]["pin"] = world["sha2"]
+
+    with pytest.raises(pc.PluginOperationError, match="git executable is unavailable"):
+        cat.repin_catalog_plugin(target, cat.read_catalog_sidecar(target))
+
+    assert _head(target) == world["sha1"]
 
 
 @pytest.mark.parametrize("via", ["url", "catalog"])
@@ -245,6 +314,8 @@ def test_update_of_a_subdir_install_keeps_files_the_user_created_or_edited(world
     (src / "plugin.yaml").write_text("name: sub-plugin\nversion: 1.0.0\ndescription: d\n")
     (src / "__init__.py").write_text("def register(ctx):\n    pass\n")
     (src / "config.yaml.example").write_text("endpoint: default\n")
+    (src / "desktop").mkdir()
+    (src / "desktop" / "plugin.js").write_text("export default { id: \"v1\" }\n")
     sp.run(["git", "init", "-q"], cwd=mono, check=True, env=_GIT_ENV)
     pin = {"sha": _commit(mono, "v1")}
 
@@ -271,12 +342,14 @@ def test_update_of_a_subdir_install_keeps_files_the_user_created_or_edited(world
 
     (src / "plugin.yaml").write_text("name: sub-plugin\nversion: 2.0.0\ndescription: d\n")
     (src / "config.yaml.example").write_text("endpoint: new-default\n")
+    shutil.rmtree(src / "desktop")
     pin["sha"] = _commit(mono, "v2")
     assert pc.dashboard_update_user_plugin("sub-plugin")["ok"] is True
 
     assert "version: 2.0.0" in (target / "plugin.yaml").read_text()
     assert (target / "config.yaml").read_text() == "endpoint: mine\n"
     assert (target / "data" / "state.json").read_text() == "{}"
+    assert not (target / "desktop").exists()
 
 
 def test_repin_keeps_a_wholly_ignored_data_dir_in_a_git_checkout(world):
