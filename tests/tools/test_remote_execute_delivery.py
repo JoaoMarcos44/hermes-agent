@@ -5,6 +5,8 @@ import json
 import re
 import secrets
 import shlex
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -67,6 +69,32 @@ class _RemoteEnv:
 
     def execute(self, command, cwd=None, timeout=None, stdin_data=None, **_kwargs):
         self.commands.append(command)
+        if command.startswith("ls -1 ") and "/req_*" in command:
+            req_files = sorted(
+                path for path in self.remote_files
+                if "/req_" in path and not path.endswith(".tmp")
+            )
+            return {"output": "\n".join(req_files) + ("\n" if req_files else ""), "returncode": 0}
+        if command.startswith("cat "):
+            path = shlex.split(command)[1]
+            payload = self.remote_files.get(path)
+            return {
+                "output": payload.decode("utf-8") if payload is not None else "",
+                "returncode": 0 if payload is not None else 1,
+            }
+        if command.startswith("mv -f "):
+            _, _, source, target = shlex.split(command)
+            if source not in self.remote_files:
+                return {"output": "", "returncode": 1}
+            self.remote_files[target] = self.remote_files.pop(source)
+            if source in self.remote_modes:
+                self.remote_modes[target] = self.remote_modes.pop(source)
+            return {"output": "", "returncode": 0}
+        if command.startswith("rm -f "):
+            for path in shlex.split(command)[2:]:
+                self.remote_files.pop(path, None)
+                self.remote_modes.pop(path, None)
+            return {"output": "", "returncode": 0}
         if "id -u" in command:
             return {"output": f"{self.uid}\n", "returncode": 0}
         mkdir_command = command.split(" ||", 1)[0].rsplit("&& ", 1)[-1]
@@ -234,6 +262,55 @@ def test_per_call_token_file_is_removed_on_transport_failure(monkeypatch, stdin_
     assert len(env.sourced_env_files) == 1, "transport failure must occur after env-file sourcing"
     assert not any(path.endswith("/sandbox.env") for path in env.remote_files)
     assert any(command.startswith("rm -rf ") for command in env.commands)
+
+
+@pytest.mark.parametrize("stdin_mode", ["pipe", "heredoc"])
+def test_rpc_response_payload_never_enters_command_argv(monkeypatch, stdin_mode):
+    import tools.code_execution_rpc as rpc
+
+    env = _RemoteEnv(stdin_mode)
+    rpc_dir = "/tmp/hermes-rpc"
+    request_path = f"{rpc_dir}/req_000001"
+    response_path = f"{rpc_dir}/res_000001"
+    response = "synthetic-private-tool-result-121932-never-a-real-secret"
+    env.remote_files[request_path] = json.dumps({
+        "seq": 1,
+        "token": SYNTHETIC_TOKEN,
+        "tool": "read_file",
+        "args": {"path": "/private/example.txt"},
+    }).encode("utf-8")
+    monkeypatch.setattr(
+        rpc,
+        "_default_dispatch",
+        lambda _task_id: lambda _tool, _args: response,
+    )
+
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=rpc._rpc_poll_loop,
+        args=(
+            env,
+            rpc_dir,
+            "task",
+            [],
+            [0],
+            2,
+            frozenset({"read_file"}),
+            stop_event,
+            SYNTHETIC_TOKEN,
+        ),
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 2
+    while response_path not in env.remote_files and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop_event.set()
+    worker.join(timeout=1)
+
+    assert env.remote_files[response_path].decode("utf-8") == response
+    assert request_path not in env.remote_files
+    _assert_secret_absent_from_argv(env.commands, response)
 
 
 def test_sdk_file_delivery_detects_base64_argv_leaks():
