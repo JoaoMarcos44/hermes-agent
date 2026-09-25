@@ -686,6 +686,11 @@ class BaseEnvironment(ABC):
             if parent_activity_cb is not None:
                 set_activity_callback(parent_activity_cb)
             if not _enter_foreground_spawn():
+                if staged_stdin is not None:
+                    try:
+                        self._cleanup_stdin_file(staged_stdin)
+                    except Exception:
+                        logger.debug("staged stdin cleanup failed behind exit fence", exc_info=True)
                 return {"output": "[host is exiting: command not started]", "returncode": 130}
             spawned = None
             try:
@@ -718,6 +723,11 @@ class BaseEnvironment(ABC):
         def _on_timeout() -> None:
             if proc_holder:
                 self._kill_spawned_tree(proc_holder[0])
+            if staged_stdin is not None:
+                try:
+                    self._cleanup_stdin_file(staged_stdin)
+                except Exception:
+                    logger.debug("staged stdin cleanup failed after timeout", exc_info=True)
 
         # Hard wall-clock backstop: ``_wait_for_process`` polls to ``effective_timeout`` on the
         # tool thread; if that is the event-loop thread, or the wait never returns (Windows
