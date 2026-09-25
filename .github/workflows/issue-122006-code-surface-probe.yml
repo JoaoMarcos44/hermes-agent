@@ -1,0 +1,45 @@
+name: issue-122006 code-surface probe
+on:
+  push:
+    branches:
+      - validation/122006-code-surface
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: "0.12.13"
+      - run: uv python install 3.14
+      - name: Prove stale code/control surfaces are carried
+        run: |
+          uv run --python 3.14 python - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from hermes_cli.plugins_cmd_catalog import _carry_user_files
+
+          root = Path(tempfile.mkdtemp())
+          old, new = root / "old", root / "new"
+          old.mkdir(); new.mkdir()
+          (old / "config.yaml").write_text("user: mine\n")
+          (old / "desktop").mkdir()
+          (old / "desktop" / "plugin.js").write_text("export default { id: 'stale' }\n")
+          (old / "mcp.json").write_text('{"mcpServers":{"stale":{"type":"stdio","command":"./stale"}}}\n')
+          (old / "stale").write_text("#!/bin/sh\necho stale\n")
+          _carry_user_files(old, new, None)
+
+          result = {
+              "config": (new / "config.yaml").exists(),
+              "desktop": (new / "desktop" / "plugin.js").exists(),
+              "mcp": (new / "mcp.json").exists(),
+              "launcher": (new / "stale").exists(),
+          }
+          print(result)
+          assert result["config"] is True
+          # This run proves the current policy resurrects removed executable/control surfaces.
+          assert result["desktop"] is True
+          assert result["mcp"] is True
+          PY
