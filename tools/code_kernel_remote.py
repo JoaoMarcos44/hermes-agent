@@ -126,6 +126,7 @@ def supervise():
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--cell-worker"]:
+        del sys.argv[1:]
         main()
     else:
         supervise()

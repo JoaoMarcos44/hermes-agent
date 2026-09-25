@@ -54,7 +54,7 @@ def test_remote_disposal_stops_descendants_and_preserves_other_owner(tmp_path, m
         )
 
     try:
-        assert run("sentinel = 41", "other")["status"] == "success"
+        assert run("import sys; assert len(sys.argv) == 1; sentinel = 41", "other")["status"] == "success"
         assert run(code)["status"] == "success"
         runner_pids = [int(k.pid) for k in remote._REMOTE_KERNELS.values()]
         assert _wait_for(marker.exists), "descendant did not start"
