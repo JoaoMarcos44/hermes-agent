@@ -6,8 +6,10 @@ surrogateescape is the inverse of the decode that produced the content) and
 the always-close / error-capture guarantees of the writer thread.
 """
 import shlex
+import shutil
 import subprocess
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -80,6 +82,63 @@ class TestPipeStdinSurrogates:
         assert proc.returncode == 0
         assert out.read_bytes() == b"hello\nworld\n"
         assert proc._hermes_stdin_errors == []
+
+
+class _StagedLocalEnvironment(LocalEnvironment):
+    """Exercise the SDK staged-stdin contract with the local filesystem as transport."""
+
+    _stdin_mode = "staged"
+
+    def __init__(self, cwd: str, temp_dir: Path):
+        self._staged_temp_dir = str(temp_dir)
+        self.spawn_commands: list[str] = []
+        super().__init__(cwd=cwd, timeout=15)
+
+    def get_temp_dir(self) -> str:
+        return self._staged_temp_dir
+
+    def _upload_stdin_file(self, host_path: str, remote_path: str) -> None:
+        parent = Path(remote_path).parent
+        parent.mkdir(parents=True, mode=0o700)
+        shutil.copyfile(host_path, remote_path)
+
+    def _cleanup_stdin_file(self, remote_path: str) -> None:
+        shutil.rmtree(Path(remote_path).parent, ignore_errors=True)
+
+    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+        self.spawn_commands.append(cmd_string)
+        return super()._run_bash(cmd_string, login=login, timeout=timeout, stdin_data=stdin_data)
+
+
+@pytest.mark.platforms("posix")
+def test_staged_stdin_write_is_byte_exact_beyond_argv_limit(tmp_path):
+    """Large/NUL/surrogateescape content never enters bash -c argv (#122011)."""
+    env = _StagedLocalEnvironment(str(tmp_path), tmp_path)
+    ops = ShellFileOperations(env, cwd=str(tmp_path))
+    raw = (b"A" * (160 * 1024)) + b"\x00\xff\xfeTAIL"
+    content = raw.decode("utf-8", "surrogateescape")
+    target = tmp_path / "large-binary-like.bin"
+
+    result = ops.write_file(str(target), content)
+
+    assert result.error is None and result.verified is True
+    assert result.bytes_written == len(raw)
+    assert target.read_bytes() == raw
+    assert max(len(command.encode("utf-8")) for command in env.spawn_commands) < 128 * 1024
+    assert not list(tmp_path.glob(".hermes-stdin-*"))
+
+
+@pytest.mark.platforms("posix")
+def test_staged_stdin_feeds_compound_reads_and_preserves_status(tmp_path):
+    env = _StagedLocalEnvironment(str(tmp_path), tmp_path)
+    result = env.execute(
+        "IFS= read -r first; IFS= read -r second; printf '<%s|%s>' \"$first\" \"$second\"; exit 7",
+        stdin_data="pw\npayload",
+    )
+
+    assert result["returncode"] == 7
+    assert "<pw|payload>" in result["output"]
+    assert not list(tmp_path.glob(".hermes-stdin-*"))
 
 
 @pytest.fixture
