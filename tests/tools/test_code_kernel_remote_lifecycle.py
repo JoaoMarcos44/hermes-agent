@@ -1,6 +1,7 @@
 """Remote kernel disposal owns the whole cell process group, not just its children."""
 import json
 import shlex
+import subprocess
 import time
 
 import psutil
@@ -81,3 +82,40 @@ def test_remote_disposal_stops_descendants_and_preserves_other_owner(tmp_path, m
             # The failing baseline reparents these test-owned workers to init.
             env.execute("kill -KILL " + " ".join(shlex.quote(str(pid)) for pid in pids + runner_pids) + " 2>/dev/null; true")
         env.cleanup()
+
+@pytest.mark.platforms("linux", "macos")
+@pytest.mark.parametrize("marker_matches", [True, False])
+def test_stopping_marker_only_fences_matching_kernel_identity(tmp_path, monkeypatch, marker_matches):
+    """Only this kernel instance's terminal marker may suppress the stored-PID signal."""
+    env = LocalEnvironment(cwd=str(tmp_path))
+    monkeypatch.setattr(env, "get_temp_dir", lambda: str(tmp_path))
+    kernel_dir = tmp_path / "hermes_rkernel_stale"
+    kernel_dir.mkdir()
+    marker_value = kernel_dir.name if marker_matches else "another-kernel"
+    (kernel_dir / "stopping").write_text(marker_value, encoding="utf-8")
+    bystander = subprocess.Popen(["sleep", "120"])
+
+    try:
+        stale = remote.RemoteKernel(
+            env=env,
+            env_type="ssh",
+            kernel_dir=str(kernel_dir),
+            pid=str(bystander.pid),
+            rpc_token="stale",
+            owner="stale-owner",
+        )
+
+        stale.kill()
+
+        if marker_matches:
+            time.sleep(0.1)
+            assert bystander.poll() is None, "matching terminal proof must not signal a recycled PID"
+        else:
+            assert _wait_for(lambda: bystander.poll() is not None), "foreign marker must not suppress teardown"
+        assert not kernel_dir.exists()
+    finally:
+        if bystander.poll() is None:
+            bystander.kill()
+        bystander.wait(timeout=5)
+        env.cleanup()
+

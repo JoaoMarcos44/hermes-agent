@@ -118,8 +118,8 @@ def supervise():
         # We still lead the group, so its ID cannot be recycled between the
         # worker's exit and this signal. Retire ourselves with the descendants.
         try:
-            with open(os.path.join(KDIR, "stopping"), "w", encoding="utf-8"):
-                pass
+            with open(os.path.join(KDIR, "stopping"), "w", encoding="utf-8") as marker:
+                marker.write(os.path.basename(KDIR))
         finally:
             os.killpg(os.getpgrp(), signal.SIGKILL)  # windows-footgun: ok - generated code runs on POSIX remote target
 
@@ -175,12 +175,14 @@ class RemoteKernel:
         """Best-effort kill of the runner and its subprocesses, then rm -rf."""
         q_pid = shlex.quote(self.pid)
         stopping = shlex.quote(f"{self.kernel_dir}/stopping")
+        stopping_id = shlex.quote(self.kernel_dir.rstrip("/").rsplit("/", 1)[-1])
+        stopped = f'[ "$(cat {stopping} 2>/dev/null)" = {stopping_id} ]'
         for cmd, failure in (
-            # The supervisor owns the worker group; keep the dir until it has
-            # reached its final group signal. No ps/pkill dependency on minimal images.
-            (f"kill {q_pid} 2>/dev/null; "
+            # A matching marker means this exact supervisor reached its final group
+            # signal. Never send a stale numeric PID to a process the OS may have recycled.
+            (f"if ! {stopped}; then kill {q_pid} 2>/dev/null; fi; "
              f"for attempt in 1 2 3 4 5 6 7 8 9 10; do "
-             f"[ -f {stopping} ] && break; kill -0 {q_pid} 2>/dev/null || break; sleep 1; done; true",
+             f"{stopped} && break; kill -0 {q_pid} 2>/dev/null || break; sleep 1; done; true",
              "remote kernel kill failed (transport?)"),
             (f"rm -rf {shlex.quote(self.kernel_dir)}", "remote kernel dir cleanup failed"),
         ):
