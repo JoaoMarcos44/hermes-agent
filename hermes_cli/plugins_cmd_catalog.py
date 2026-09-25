@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -284,17 +285,24 @@ def refuse_if_installed_removed(name: str, plugin_dir) -> None:
 _PRESERVE_SKIP = ("__pycache__", CATALOG_SIDECAR)
 
 
-def _local_changes(target: Path) -> tuple[list[str], list[str]]:
-    """``(untracked_or_ignored, modified_tracked)`` relative paths in a git checkout; empty for a
-    non-git tree (subdir installs carry no ``.git``, so nothing can be told apart from the clone)."""
-    from hermes_cli.plugins_cmd import _resolve_git_executable, _run_plugin_git
+def _local_changes(target: Path) -> Optional[tuple[list[str], list[str]]]:
+    """Return git-local files and tracked edits, or ``None`` only for a tree with no checkout.
+
+    A real git checkout that cannot be inspected fails closed: replacing it without knowing which
+    files are user-owned would recreate the data-loss class this helper exists to prevent.
+    """
+    from hermes_cli.plugins_cmd import PluginOperationError, _resolve_git_executable, _run_plugin_git
+
+    if not (target / ".git").exists():
+        return None
     git_exe = _resolve_git_executable()
-    if not git_exe or not (target / ".git").exists():
-        return [], []
+    if not git_exe:
+        raise PluginOperationError(f"Could not inspect local changes in '{target.name}': git is unavailable.")
     status = _run_plugin_git(git_exe, target, "status", "--porcelain", "--ignored", "-z", "--untracked-files=all",
                              "--ignored=matching", timeout=30)
     if status.returncode != 0:
-        return [], []
+        detail = str(status.stderr or status.stdout or "git status failed").strip()
+        raise PluginOperationError(f"Could not inspect local changes in '{target.name}': {detail}")
     local, modified = [], []
     for item in status.stdout.split("\0"):
         if len(item) < 4:
@@ -307,12 +315,70 @@ def _local_changes(target: Path) -> tuple[list[str], list[str]]:
 
 
 def _stash_local_files(target: Path, rels: list[str], stash: Path) -> None:
+    """Copy tracked edits to the external backup tree."""
     for rel in rels:
         src = target / rel
         if src.is_file():
             dst = stash / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
+
+
+def _carry_user_files(old: Path, new: Path, local: Optional[list[str]]) -> None:
+    """Carry user-owned files from *old* into a staged replacement *new*.
+
+    ``local`` is git's ``??``/``!!`` set. Directory entries select their descendants.
+    ``None`` means a subdirectory install with no checkout metadata; in that conservative mode,
+    only paths absent from the new tree are carried and stale Python source is never resurrected.
+    Any file/directory type clash aborts before publication so preserving data can never silently
+    change the updated plugin's import layout.
+    """
+    from hermes_cli.plugins_cmd import PluginOperationError
+
+    selected = {Path(rel.rstrip("/")) for rel in (local or ())}
+    no_git = local is None
+
+    def _selected(rel: Path) -> bool:
+        return any(candidate == rel or candidate in rel.parents for candidate in selected)
+
+    for dirpath, dirnames, filenames in os.walk(old, followlinks=False):
+        here = Path(dirpath)
+        symlink_dirs = [name for name in dirnames if (here / name).is_symlink()]
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in symlink_dirs and name != ".git" and name not in _PRESERVE_SKIP
+        ]
+        for name in (*filenames, *symlink_dirs):
+            src = here / name
+            rel = src.relative_to(old)
+            if any(part in _PRESERVE_SKIP or part.endswith(".pyc") for part in rel.parts):
+                continue
+            if no_git and rel.suffix in {".py", ".pyi"}:
+                continue
+            if not no_git and not _selected(rel):
+                continue
+
+            dst = new / rel
+            if os.path.lexists(dst):
+                if dst.is_dir() and not dst.is_symlink():
+                    raise PluginOperationError(
+                        f"Cannot preserve user file '{rel}': the updated plugin now has a directory there. "
+                        "The installed plugin was left unchanged."
+                    )
+                if no_git:
+                    # Without the old checkout metadata a same-path file may be upstream-owned.
+                    # Prefer the new tree; only files it does not ship are known-safe carry-overs.
+                    continue
+                dst.unlink()
+
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise PluginOperationError(
+                    f"Cannot preserve user file '{rel}': its destination conflicts with the updated plugin. "
+                    "The installed plugin was left unchanged."
+                ) from exc
+            shutil.copy2(src, dst, follow_symlinks=False)
 
 
 class RepinResult(NamedTuple):
@@ -408,7 +474,8 @@ def repin_catalog_plugin(
     if at_catalog_pin(sidecar, entry.sha):
         return RepinResult(entry.sha, False, target.name, [])
 
-    local, modified = _local_changes(target)
+    changes = _local_changes(target)
+    local, modified = changes if changes is not None else (None, [])
     old_sha8 = str(sidecar.get("sha") or "old")[:8]
     installed_surface = plugin_surface(_read_manifest(target), target)
 
@@ -427,32 +494,34 @@ def repin_catalog_plugin(
         preview_target = _resolve_subdir_within(preview_root, subdir) if subdir else preview_root
         _consent_gate(_read_manifest_for_install(preview_target), preview_target)
 
-    with tempfile.TemporaryDirectory(prefix=".repin-", dir=_plugins_dir()) as tmp:
-        stash = Path(tmp) / "local"
-        _stash_local_files(target, local, stash)
-        # Outside the plugins dir: the discovery scanners recurse into every subdirectory there.
-        backup = _plugins_dir().parent / "plugins-backup" / f"{target.name}-{old_sha8}"
-        _stash_local_files(target, modified, backup)
-        from hermes_cli.plugins_transaction import update_plugin
+    # Outside the plugins dir: the discovery scanners recurse into every subdirectory there.
+    backup = _plugins_dir().parent / "plugins-backup" / f"{target.name}-{old_sha8}"
+    _stash_local_files(target, modified, backup)
+    from hermes_cli.plugins_transaction import update_plugin
 
-        update_plugin(target, catalog_entry=entry, interactive=interactive, preserved_files=stash)
-        matches = []
-        for installed_name, row in _read_install_metadata().items():
-            if not isinstance(row, dict):
-                continue
-            block = row.get("catalog")
-            if (
-                isinstance(block, dict)
-                and block.get("name") == entry.name
-                and at_catalog_pin(block, entry.sha)
-            ):
-                matches.append(installed_name)
-        if len(matches) != 1:
-            raise PluginOperationError(
-                f"Catalog update published but its install record is ambiguous: {matches or 'missing'}."
-            )
-        installed_name = matches[0]
-        new_target = target.parent / installed_name
+    update_plugin(
+        target,
+        catalog_entry=entry,
+        interactive=interactive,
+        carry_user_files=lambda staged: _carry_user_files(target, staged, local),
+    )
+    matches = []
+    for installed_name, row in _read_install_metadata().items():
+        if not isinstance(row, dict):
+            continue
+        block = row.get("catalog")
+        if (
+            isinstance(block, dict)
+            and block.get("name") == entry.name
+            and at_catalog_pin(block, entry.sha)
+        ):
+            matches.append(installed_name)
+    if len(matches) != 1:
+        raise PluginOperationError(
+            f"Catalog update published but its install record is ambiguous: {matches or 'missing'}."
+        )
+    installed_name = matches[0]
+    new_target = target.parent / installed_name
     warnings: list[str] = []
     if modified:
         warnings.append(f"Local edits to {len(modified)} tracked file(s) were not carried over; copies are under "
