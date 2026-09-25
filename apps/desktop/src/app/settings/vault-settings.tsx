@@ -29,6 +29,7 @@ import { $settingsScopeProfile } from '@/store/settings-scope'
 
 import { CONTROL_TEXT } from './constants'
 import { ListRow, Pill, SectionHeading, SettingsContent } from './primitives'
+import { SettingsProfileScope } from './profile-scope'
 
 // Vault data is private to one (connection, profile); the cache key carries that owner so a
 // late response from profile A can never paint under profile B.
@@ -172,9 +173,17 @@ export function VaultSettings({ subpage }: VaultSettingsProps = {}) {
 
   const requestGateway = useCallback(
     <T,>(method: string, params: Record<string, unknown> = {}) =>
-      requestGatewayForAgent<T>(connectionId, scopeProfile, method, params, undefined, undefined, {
-        spawnPriority: 'foreground'
-      }),
+      requestGatewayForAgent<T>(
+        connectionId,
+        scopeProfile,
+        method,
+        { ...params, profile: scopeProfile },
+        undefined,
+        undefined,
+        {
+          spawnPriority: 'foreground'
+        }
+      ),
     [connectionId, scopeProfile]
   )
 
@@ -389,6 +398,7 @@ export function VaultSettings({ subpage }: VaultSettingsProps = {}) {
 
   return (
     <SettingsContent>
+      <SettingsProfileScope className="mb-5" />
       {(subpage === undefined || subpage === 'credentials') && (
         <>
           <SectionHeading

@@ -41,7 +41,7 @@ import { useStore } from '@nanostores/react'
 import { queryClient } from '@/lib/query-client'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
-import { $settingsScopeProfile } from '@/store/settings-scope'
+import { $settingsScopeOverride, $settingsScopeProfile, setSettingsScope } from '@/store/settings-scope'
 
 import { vaultOwnerKey, VaultSettings } from './vault-settings'
 
@@ -73,6 +73,7 @@ beforeEach(() => {
   calls.length = 0
   queryClient.clear()
   $activeGatewayProfile.set('default')
+  $settingsScopeOverride.set(null)
   $gatewayState.set('open')
   respond = async (_profile, method) =>
     method === 'vault.sources' ? { sources } : method === 'vault.list' ? { items: [] } : { ok: true }
@@ -81,6 +82,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   queryClient.clear()
+  $activeGatewayProfile.set('default')
+  $settingsScopeOverride.set(null)
 })
 
 it('a master-password draft is wiped on a profile switch and never submitted to the new owner', async () => {
@@ -166,4 +169,22 @@ it('vault.add secrets never enter the mutation cache', async () => {
         .map(m => m.state.variables)
     )
   ).not.toContain('fixture-retained-password')
+})
+
+it('sends the selected settings profile with vault reads and writes', async () => {
+  const selectedProfile = 'credentials-owner'
+  setSettingsScope(selectedProfile)
+  mount()
+
+  await waitFor(() => expect(calls.some(call => call.method === 'vault.list')).toBe(true))
+  fireEvent.click(await screen.findByRole('button', { name: 'Add' }))
+  fireEvent.change(screen.getByLabelText('Label'), { target: { value: 'Synthetic fixture' } })
+  fireEvent.change(screen.getByLabelText('Site origin'), { target: { value: 'https://example.invalid' } })
+  fireEvent.change(screen.getByLabelText('Identifier'), { target: { value: 'fixture@example.invalid' } })
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'synthetic-placeholder' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+  await waitFor(() => expect(calls.some(call => call.method === 'vault.add')).toBe(true))
+  expect.soft(calls.find(call => call.method === 'vault.list')?.params.profile).toBe(selectedProfile)
+  expect.soft(calls.find(call => call.method === 'vault.add')?.params.profile).toBe(selectedProfile)
 })
