@@ -105,6 +105,10 @@ def test_stopping_marker_only_fences_matching_kernel_identity(tmp_path, monkeypa
             owner="stale-owner",
         )
 
+        # The same terminal proof gates both liveness and destructive teardown:
+        # a recycled bystander must never make a self-reaped kernel reusable.
+        assert stale.is_alive() is (not marker_matches)
+
         stale.kill()
 
         if marker_matches:

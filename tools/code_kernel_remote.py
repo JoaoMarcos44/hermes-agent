@@ -162,21 +162,29 @@ class RemoteKernel:
     def sh(self, cmd: str, timeout: int = 15) -> str:
         return _sh(self.env, cmd, timeout)
 
+    def _stopped_shell_test(self) -> str:
+        """Shell predicate proving this exact supervisor reached terminal teardown."""
+        stopping = shlex.quote(f"{self.kernel_dir}/stopping")
+        stopping_id = shlex.quote(self.kernel_dir.rstrip("/").rsplit("/", 1)[-1])
+        return f'[ "$(cat {stopping} 2>/dev/null)" = {stopping_id} ]'
+
     def is_alive(self) -> bool:
-        """Bounded liveness probe: kill -0 through the transport. Any transport
-        failure counts as dead — a dropped ssh connection and a dead runner are
-        indistinguishable from here, and both have the same correct answer (respawn)."""
+        """Bounded liveness probe: a matching terminal marker wins over a recycled PID.
+        Otherwise kill -0 through the transport decides liveness. Any transport failure
+        counts as dead — both a dropped connection and a dead runner must respawn."""
+        q_pid = shlex.quote(self.pid)
+        stopped = self._stopped_shell_test()
         try:
-            return "ALIVE" in self.sh(f"kill -0 {shlex.quote(self.pid)} 2>/dev/null && echo ALIVE")
+            return "ALIVE" in self.sh(
+                f"if ! {stopped}; then kill -0 {q_pid} 2>/dev/null && echo ALIVE; fi"
+            )
         except Exception:
             return False
 
     def kill(self) -> None:
         """Best-effort kill of the runner and its subprocesses, then rm -rf."""
         q_pid = shlex.quote(self.pid)
-        stopping = shlex.quote(f"{self.kernel_dir}/stopping")
-        stopping_id = shlex.quote(self.kernel_dir.rstrip("/").rsplit("/", 1)[-1])
-        stopped = f'[ "$(cat {stopping} 2>/dev/null)" = {stopping_id} ]'
+        stopped = self._stopped_shell_test()
         for cmd, failure in (
             # A matching marker means this exact supervisor reached its final group
             # signal. Never send a stale numeric PID to a process the OS may have recycled.
