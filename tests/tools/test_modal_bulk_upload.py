@@ -136,7 +136,7 @@ class TestModalBulkUpload:
         src.write_bytes(b"complete-payload")
         _, _, stdin_mock = _wire_async_exec(env, exit_code=153)
 
-        with pytest.raises(RuntimeError, match=r"Modal upload failed \\(exit 153\\)"):
+        with pytest.raises(RuntimeError, match=r"Modal upload failed \(exit 153\)"):
             env._modal_upload(str(src), "/root/.hermes/payload.bin")
 
         assert base64.b64decode("".join(stdin_mock._written_chunks)) == b"complete-payload"
