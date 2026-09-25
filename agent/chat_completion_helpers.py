@@ -2798,6 +2798,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.managed_stream_holder = {"stream": None}
         # Per-attempt: single-writer token, request-local client, raw HTTP response (chat wire).
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
+        self._writer_superseded_logged = False
         # The route ``api_kwargs`` was assembled for; a retry must not replay it on another one.
         self._request_route = self._live_route()
 
@@ -2847,6 +2848,7 @@ class _StreamingCall(StreamingWaitMonitor):
             self.stream_attempt_state["current"] += 1
             attempt_id = int(self.stream_attempt_state["current"])
         self.provider_tool_in_flight["yes"] = False
+        self._writer_superseded_logged = False
         # Attempt-local like provider_tool_in_flight: a tool name from a stream that died
         # before any text must not label a later attempt's partial stub or its retry decision.
         self.result["partial_tool_names"] = []
@@ -2892,6 +2894,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self._quiet(self.on_first_delta)
 
     def _emit_text(self, text: str) -> None:
+        if not self._writer_still_current("Streaming"):
+            return
         self._fire_first_delta()
         self.agent._fire_stream_delta(text)
         self.deltas_were_sent["yes"] = True
@@ -2903,10 +2907,14 @@ class _StreamingCall(StreamingWaitMonitor):
         return bool((getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
 
     def _emit_reasoning(self, text: str) -> None:
+        if not self._writer_still_current("Streaming"):
+            return
         self._fire_first_delta()
         self.agent._fire_reasoning_delta(text)
 
     def _emit_tool_started(self, name: str) -> None:
+        if not self._writer_still_current("Streaming"):
+            return
         self._fire_first_delta()
         self.agent._fire_tool_gen_started(name)
 
@@ -2915,7 +2923,7 @@ class _StreamingCall(StreamingWaitMonitor):
         reasoning tags inside it must still reach the display: route through
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
-        if self.agent.stream_delta_callback:
+        if self.agent.stream_delta_callback and self._writer_still_current("Streaming"):
             self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
 
     def _new_diag(self) -> dict:
@@ -3042,21 +3050,25 @@ class _StreamingCall(StreamingWaitMonitor):
                 return True
         if not self._stream_attempt_is_active(stream_attempt_id):
             return False
-        if not self._writer_still_current("Streaming"):
-            return False
+        # Writer supersession only fences live callbacks. Keep consuming the provider
+        # stream so the caller retains the complete response; request retirement still
+        # stops transport consumption via the attempt-active check above.
         # Stamp BEFORE Relay processes the chunk so the watchdog can't cancel
         # a live stream mid-interceptor.
         self.last_chunk_time["t"] = time.time()
         return True
 
     def _writer_still_current(self, label: str) -> bool:
-        """Single-writer fence: False (with a warning) once a newer stream claimed the writer slot."""
+        """Single-writer fence for live callbacks; provider consumption continues."""
         token = self._writer_token
         if token is None or stream_writer_is_current(self.agent, token):
             return True
-        logger.warning(
-            "%s attempt superseded by a newer stream; stopping consumption to preserve the "
-            "single-writer invariant (model=%s).", label, self.api_kwargs.get("model", "unknown"))
+        if not self._writer_superseded_logged:
+            self._writer_superseded_logged = True
+            logger.warning(
+                "%s attempt superseded by a newer stream; suppressing its live deltas while "
+                "consuming to completion so the final response is not truncated (model=%s).",
+                label, self.api_kwargs.get("model", "unknown"))
         return False
 
     def _call_chat_completions(self, stream_attempt_id: int):
