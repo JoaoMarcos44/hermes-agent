@@ -160,7 +160,11 @@ catalog moved (via a reviewed PR), prepares and dependency-validates the new SHA
 before publishing it. Your
 enabled/disabled state is preserved, and so are files the plugin's repo does
 not track (the `config.yaml` created from its `.example`, data files, `.env`).
-Edits you made to *tracked* files are not carried onto the new code; copies are
+For monorepo `subdir` installs, whose installed subtree has no `.git`, update
+carries non-code files that the new revision does not ship. If preserving a user
+path would conflict with the new tree, the update aborts before publication
+instead of deleting the file. Edits you made to *tracked* files are not carried
+onto the new code; copies are
 saved under `~/.hermes/plugins-backup/<name>-<sha>/` and the update warns you.
 If the new pin renames the plugin's manifest, the old directory is removed and
 your enabled flag follows the new name. `hermes plugins list` shows catalog

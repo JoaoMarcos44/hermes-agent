@@ -204,6 +204,111 @@ def test_repin_keeps_local_files_backs_up_edits_and_follows_manifest_rename(worl
     assert any("plugins-backup" in w for w in result["warnings"]) and any("renamed" in w for w in result["warnings"])
 
 
+
+@pytest.mark.parametrize("via", ["url", "catalog"])
+def test_update_of_a_subdir_install_keeps_user_files_without_reviving_old_code(
+    world, tmp_path, monkeypatch, via
+):
+    """Force-replace updates preserve config/data, but do not resurrect source removed upstream."""
+    mono = tmp_path / f"mono-{via}"
+    src = mono / "plugins" / "sub-plugin"
+    src.mkdir(parents=True)
+    (src / "plugin.yaml").write_text("name: sub-plugin\nversion: 1.0.0\ndescription: d\n")
+    (src / "__init__.py").write_text("def register(ctx):\n    pass\n")
+    (src / "config.yaml.example").write_text("endpoint: default\n")
+    (src / "utils").mkdir()
+    (src / "utils" / "__init__.py").write_text("VALUE = 'old-package'\n")
+    sp.run(["git", "init", "-q"], cwd=mono, check=True, env=_GIT_ENV)
+    pin = {"sha": _commit(mono, "v1")}
+
+    def entry():
+        return pc_cat.PluginCatalogEntry(
+            name="sub-plugin", repo=mono.as_uri(), sha=pin["sha"],
+            description="d", maintainer="t", subdir="plugins/sub-plugin",
+        )
+
+    monkeypatch.setattr(pc_cat, "load_catalog", lambda catalog_dir=None: [entry()])
+    if via == "catalog":
+        target = cat.install_catalog_entry(entry(), force=False)[0]
+    else:
+        target = pc._install_plugin_core(f"{mono.as_uri()}#plugins/sub-plugin", force=False)[0]
+    assert not (target / ".git").exists()
+
+    (target / "config.yaml").write_text("endpoint: mine\n")
+    (target / "data" / "db").mkdir(parents=True)
+    (target / "data" / "db" / "index.db").write_text("user data")
+
+    (src / "plugin.yaml").write_text("name: sub-plugin\nversion: 2.0.0\ndescription: d\n")
+    (src / "config.yaml.example").write_text("endpoint: new-default\n")
+    shutil.rmtree(src / "utils")
+    (src / "utils.py").write_text("VALUE = 'new-module'\n")
+    pin["sha"] = _commit(mono, "v2")
+
+    result = pc.dashboard_update_user_plugin("sub-plugin")
+    assert result["ok"] is True, result
+    assert "version: 2.0.0" in (target / "plugin.yaml").read_text()
+    assert (target / "config.yaml").read_text() == "endpoint: mine\n"
+    assert (target / "data" / "db" / "index.db").read_text() == "user data"
+    assert (target / "utils.py").read_text() == "VALUE = 'new-module'\n"
+    assert not (target / "utils").exists()
+
+
+def test_repin_keeps_a_wholly_ignored_data_dir_in_a_git_checkout(world):
+    """A single ``!! data/`` status entry selects every user file below the directory."""
+    repo = world["repo"]
+    (repo / ".gitignore").write_text("data/\n")
+    world["state"]["pin"] = _commit(repo, "ignore data")
+    target = cat.install_catalog_entry(pc_cat.get_live_catalog_entry("cat-plugin"), force=False)[0]
+    assert (target / ".git").exists()
+    (target / "data" / "db").mkdir(parents=True)
+    (target / "data" / "db" / "index.db").write_text("user data")
+
+    (repo / "__init__.py").write_text("def register(ctx):\n    pass  # v3\n")
+    world["state"]["pin"] = _commit(repo, "v3")
+    result = pc.dashboard_update_user_plugin("cat-plugin")
+
+    assert result["ok"] is True, result
+    assert _head(target) == world["state"]["pin"]
+    assert (target / "data" / "db" / "index.db").read_text() == "user data"
+
+
+@pytest.mark.parametrize("shape", ["old-file-new-dir", "old-dir-new-file"])
+def test_carry_user_files_fails_closed_on_type_clashes(tmp_path, shape):
+    """A replacement that cannot preserve a user path aborts instead of deleting that data."""
+    old, new = tmp_path / "old", tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    if shape == "old-file-new-dir":
+        (old / "data").write_text("user data")
+        (new / "data").mkdir()
+    else:
+        (old / "data" / "db").mkdir(parents=True)
+        (old / "data" / "db" / "index.db").write_text("user data")
+        (new / "data").write_text("new upstream file")
+
+    with pytest.raises(pc.PluginOperationError, match="Cannot preserve user file"):
+        cat._carry_user_files(old, new, None)
+
+    if shape == "old-file-new-dir":
+        assert (old / "data").read_text() == "user data"
+        assert (new / "data").is_dir()
+    else:
+        assert (old / "data" / "db" / "index.db").read_text() == "user data"
+        assert (new / "data").read_text() == "new upstream file"
+
+
+def test_local_change_inspection_failure_aborts_instead_of_guessing(tmp_path, monkeypatch):
+    """A git checkout is never force-replaced when Hermes cannot classify its local changes."""
+    target = tmp_path / "plugin"
+    (target / ".git").mkdir(parents=True)
+    monkeypatch.setattr(pc, "_resolve_git_executable", lambda: "git")
+    failed = sp.CompletedProcess(["git", "status"], 1, stdout="", stderr="index unreadable")
+    monkeypatch.setattr(pc, "_run_plugin_git", lambda *args, **kwargs: failed)
+
+    with pytest.raises(pc.PluginOperationError, match="Could not inspect local changes.*index unreadable"):
+        cat._local_changes(target)
+
+
 def test_kill_list_covers_update_enable_and_load_of_an_installed_plugin(world, tmp_path, monkeypatch):
     """A URL install whose name lands on the kill list AFTER install must stop pulling, cannot be enabled
     and is refused at load; an install made with --allow-removed keeps working."""
