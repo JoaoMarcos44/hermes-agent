@@ -2,6 +2,7 @@
 
 import base64
 import stat
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,10 @@ import pytest
 from tools.code_execution_tool import _ship_file_to_remote
 from tools.environments.base import BaseEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment
+from tools.environments.remote_file_delivery import (
+    RPC_KERNEL_ENV_NAMES,
+    source_and_remove_env_file,
+)
 
 
 SYNTHETIC_SUDO_PASSWORD = "synthetic_sudo_password_121932_not_a_real_credential"
@@ -108,6 +113,36 @@ def test_sdk_file_staging_uses_owner_only_local_directory_and_file():
     assert upload["directory_mode"] == 0o700
     assert upload["file_mode"] == 0o600
     assert "chmod 600" in "\n".join(env.commands)
+
+
+@pytest.mark.platforms("linux", "macos")
+def test_private_env_scope_preserves_preexisting_exports(tmp_path):
+    env_file = tmp_path / "kernel.env"
+    env_file.write_text(
+        "export PYTHONPATH=/private/kernel\n"
+        "export PYTHONDONTWRITEBYTECODE=1\n",
+        encoding="utf-8",
+    )
+    wrapped = source_and_remove_env_file(
+        str(env_file),
+        "printf 'child:%s|%s\n' \"$PYTHONPATH\" \"$PYTHONDONTWRITEBYTECODE\"",
+        unset_names=RPC_KERNEL_ENV_NAMES,
+    )
+    script = (
+        "export PYTHONPATH=/opt/session-lib\n"
+        "export PYTHONDONTWRITEBYTECODE=session\n"
+        f"{wrapped}\n"
+        "printf 'parent:%s|%s\n' \"$PYTHONPATH\" \"$PYTHONDONTWRITEBYTECODE\"\n"
+    )
+
+    result = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "child:/private/kernel|1",
+        "parent:/opt/session-lib|session",
+    ]
+    assert not env_file.exists()
 
 
 def test_managed_modal_sudo_uses_stdin_payload_not_command_text():

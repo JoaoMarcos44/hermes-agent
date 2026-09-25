@@ -11,7 +11,7 @@ import pytest
 
 from tools.code_execution_tool import _ship_file_to_remote
 from tools.code_kernel_remote import _spawn_remote_kernel
-from tools.environments.remote_file_delivery import create_private_remote_dir
+from tools.environments.remote_file_delivery import create_private_remote_dir, ensure_owner_scoped_results_dir
 from tools.tool_result_storage import _resolve_storage_dir
 
 
@@ -56,6 +56,7 @@ class _RemoteEnv:
         self.remote_files = {}
         self.uploaded_content = {}
         self.remote_modes = {}
+        self.remote_owners = {}
         self.local_upload_modes = []
         self.private_dirs = []
         self.mkdir_attempts = []
@@ -73,12 +74,21 @@ class _RemoteEnv:
             args = shlex.split(mkdir_command)
             paths = args[3:4] if "2>/dev/null" in command else args[3:]
             self.mkdir_attempts.extend(paths)
-            if "2>/dev/null" not in command and any(path in self.private_dirs for path in paths):
-                return {"output": "", "returncode": 1}
+            existing = [path for path in paths if path in self.private_dirs]
+            if existing:
+                if "2>/dev/null" not in command:
+                    return {"output": "", "returncode": 1}
+                if "stat -c %u" in command:
+                    path = existing[0]
+                    if self.remote_owners.get(path) != self.uid:
+                        return {"output": "", "returncode": 1}
+                    self.remote_modes[path] = 0o700
+                    return {"output": "", "returncode": 0}
             for path in paths:
                 if path not in self.private_dirs:
                     self.private_dirs.append(path)
                     self.remote_modes[path] = 0o700
+                    self.remote_owners[path] = self.uid
         if stdin_data is not None and "cat >" in command:
             tokens = shlex.split(command)
             path = tokens[tokens.index(">") + 1]
@@ -233,6 +243,32 @@ def test_sdk_file_delivery_detects_base64_argv_leaks():
     _assert_secret_absent_from_argv(env.commands, SYNTHETIC_TOKEN)
 
 
+def test_shared_temp_results_root_refuses_foreign_owned_precreated_directory():
+    env = _RemoteEnv(uid="1001")
+    results_dir = "/tmp/hermes-results-1001"
+    env.private_dirs.append(results_dir)
+    env.remote_modes[results_dir] = 0o777
+    env.remote_owners[results_dir] = "2002"
+
+    with pytest.raises(RuntimeError):
+        ensure_owner_scoped_results_dir(env)
+
+    assert env.remote_modes[results_dir] == 0o777, "foreign-owned directory must not be chmodded"
+    ownership_check = next(command for command in env.commands if "stat -c %u" in command)
+    assert ownership_check.index("stat -c %u") < ownership_check.index("chmod 700")
+
+
+def test_shared_temp_results_root_allows_same_owner_reuse():
+    env = _RemoteEnv(uid="1001")
+    results_dir = "/tmp/hermes-results-1001"
+    env.private_dirs.append(results_dir)
+    env.remote_modes[results_dir] = 0o755
+    env.remote_owners[results_dir] = env.uid
+
+    assert ensure_owner_scoped_results_dir(env) == results_dir
+    assert env.remote_modes[results_dir] == 0o700
+
+
 def test_shared_temp_results_roots_are_scoped_to_remote_user():
     """Different remote OS UIDs get independently creatable private scratch roots."""
     first, second = _RemoteEnv(uid="1001"), _RemoteEnv(uid="1002")
@@ -278,6 +314,11 @@ def test_kernel_rpc_token_stays_out_of_base_session_snapshot_and_reaches_runner(
 
     env = SnapshotBackedLocalEnvironment(cwd=str(tmp_path), timeout=10)
     assert env._snapshot_ready, "BaseEnvironment session snapshot must be initialized"
+    seeded = env.execute(
+        "export PYTHONPATH=/opt/session-lib; "
+        "export PYTHONDONTWRITEBYTECODE=session"
+    )
+    assert seeded["returncode"] == 0, seeded
     monkeypatch.setattr(kernel_remote.secrets, "token_urlsafe", lambda _size: SYNTHETIC_TOKEN)
     monkeypatch.setattr(
         kernel_remote,
@@ -298,10 +339,15 @@ def test_kernel_rpc_token_stays_out_of_base_session_snapshot_and_reaches_runner(
         assert SYNTHETIC_TOKEN not in snapshot["output"], \
             "synthetic RPC token class leaked into the persistent session snapshot"
 
-        later_command = env.execute("printf '%s' \"${HERMES_RPC_TOKEN-__absent__}\"")
+        later_command = env.execute(
+            "printf '%s|%s|%s' "
+            "\"${HERMES_RPC_TOKEN-__absent__}\" "
+            "\"${PYTHONPATH-__absent__}\" "
+            "\"${PYTHONDONTWRITEBYTECODE-__absent__}\""
+        )
         assert later_command["returncode"] == 0, later_command
-        assert later_command["output"] == "__absent__", \
-            "synthetic RPC token class was restored into a later command environment"
+        assert later_command["output"] == "__absent__|/opt/session-lib|session", \
+            "kernel launch must not overwrite or clear the caller\'s pre-existing Python exports"
 
         token_received = Path(runner_token_path)
         for _ in range(100):

@@ -16,7 +16,8 @@ from tools.spill_safety import ensure_spill_dir, write_text_exclusive
 logger = logging.getLogger(__name__)
 _REMOTE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 # The per-call env file exports the RPC pair (first two); a kernel env file also
-# exports the remaining names and must clear the complete tuple before snapshotting.
+# exports the remaining names. The private-env helper confines all of them to a
+# launch subshell so pre-existing caller values are restored automatically.
 RPC_KERNEL_ENV_NAMES = (
     "HERMES_RPC_DIR",
     "HERMES_RPC_TOKEN",
@@ -97,7 +98,9 @@ def ensure_owner_scoped_results_dir(env: Any, temp_dir: str | None = None) -> st
     quoted = shlex.quote(results_dir)
     command = (
         f"mkdir -m 700 {quoted} 2>/dev/null || "
-        f"{{ test -d {quoted} && test ! -L {quoted} && chmod 700 {quoted}; }}")
+        f"{{ test -d {quoted} && test ! -L {quoted} && "
+        f"_hermes_owner=$(stat -c %u {quoted} 2>/dev/null || stat -f %u {quoted} 2>/dev/null) && "
+        f"test \"$_hermes_owner\" = {shlex.quote(owner_id)} && chmod 700 {quoted}; }}")
     _checked_result(env, command, timeout=15)
     return results_dir
 
@@ -138,36 +141,26 @@ def deliver_remote_file(env: Any, remote_path: str, content: str) -> None:
 
 
 def source_and_remove_env_file(remote_path: str, command: str, *, unset_names: tuple[str, ...]) -> str:
-    """Source and remove a private env file before running a child; optionally unset selected exports."""
+    """Run a child with a private env file in a subshell, preserving the caller's environment."""
     if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in unset_names):
         raise ValueError("environment cleanup names must be valid shell identifiers")
     quoted_path = shlex.quote(remote_path)
-    names = " ".join(unset_names)
-    unset_exports = f"    unset {names}\n" if names else ""
     return (
-        "{\n"
-        "_hermes_run_with_private_env() {\n"
+        "(\n"
         f"  . {quoted_path}\n"
         "  _hermes_source_status=$?\n"
         f"  rm -f {quoted_path}\n"
         "  _hermes_remove_status=$?\n"
         "  if [ $_hermes_source_status -ne 0 ]; then\n"
-        f"{unset_exports}"
-        "    return $_hermes_source_status\n"
+        "    exit $_hermes_source_status\n"
         "  fi\n"
         "  if [ $_hermes_remove_status -ne 0 ]; then\n"
-        f"{unset_exports}"
-        "    return $_hermes_remove_status\n"
+        "    exit $_hermes_remove_status\n"
         "  fi\n"
         f"  {command}\n"
         "  _hermes_command_status=$?\n"
-        f"{unset_exports}"
-        "  return $_hermes_command_status\n"
-        "}\n"
-        "_hermes_run_with_private_env\n"
-        "}")
-
-
+        "  exit $_hermes_command_status\n"
+        ")")
 def stage_remote_stdin(env: Any, content: str) -> tuple[str, str]:
     """Stage SDK-backend stdin in a private remote file; callers unlink it after opening stdin."""
     private_dir = create_private_remote_dir(env, "hermes-stdin")
