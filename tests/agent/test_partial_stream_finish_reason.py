@@ -129,9 +129,14 @@ class TestTerminalChunkFenceException:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_superseded_writer_still_fences_further_content(
+    def test_superseded_writer_suppresses_live_tail_but_preserves_final_response(
         self, _mock_close, mock_create, monkeypatch,
     ):
+        """Writer ownership belongs to the live delta sink, not provider ingestion.
+
+        A newer writer must silence stale callbacks without cutting the old provider
+        stream: the caller still needs its complete response and terminal marker.
+        """
         monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
         agent_box = {}
 
@@ -141,10 +146,7 @@ class TestTerminalChunkFenceException:
             def __iter__(self):
                 yield _make_stream_chunk(content="kept ")
                 agent_box["agent"]._claim_stream_writer()
-                # A False accept_chunk ends consumption; this text must
-                # never reach the accumulator, and the later finish chunk
-                # is never seen (the fence still stops *further* content).
-                yield _make_stream_chunk(content="must-not-append")
+                yield _make_stream_chunk(content="preserved-tail")
                 yield _make_stream_chunk(finish_reason="stop")
 
         mock_client = MagicMock()
@@ -153,12 +155,14 @@ class TestTerminalChunkFenceException:
 
         agent = _make_agent()
         agent_box["agent"] = agent
+        live_deltas = []
+        agent.stream_delta_callback = live_deltas.append
         response = agent._interruptible_streaming_api_call({})
 
-        content = response.choices[0].message.content or ""
-        assert "must-not-append" not in content
-        assert "kept" in content
-        assert response.id == PARTIAL_STREAM_STUB_ID
+        assert response.id != PARTIAL_STREAM_STUB_ID
+        assert response.choices[0].finish_reason == "stop"
+        assert response.choices[0].message.content == "kept preserved-tail"
+        assert "".join(live_deltas) == "kept "
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
