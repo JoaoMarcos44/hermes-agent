@@ -161,6 +161,8 @@ def source_and_remove_env_file(remote_path: str, command: str, *, unset_names: t
         "  _hermes_command_status=$?\n"
         "  exit $_hermes_command_status\n"
         ")")
+
+
 def stage_remote_stdin(env: Any, content: str) -> tuple[str, str]:
     """Stage SDK-backend stdin in a private remote file; callers unlink it after opening stdin."""
     private_dir = create_private_remote_dir(env, "hermes-stdin")
