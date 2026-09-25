@@ -501,7 +501,7 @@ class CLIChatTurnMixin:
         if turn.result:
             missing_suffix = _unstreamed_final_suffix(
                 turn.result.get("final_response", ""),
-                getattr(self, "_streamed_text_this_turn", ""),
+                getattr(self, "_streamed_text_this_segment", ""),
                 turn.result,
             )
             if missing_suffix:
