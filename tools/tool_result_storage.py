@@ -276,8 +276,8 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
         visible = _sandbox_visible_spillover_path(host_path, env) if host_path else None
         if visible is not None:
             return _persisted(visible, f" [host: {host_path}]")
-        remote_path = f"{_resolve_storage_dir(env)}/{filename}"
         try:
+            remote_path = f"{_resolve_storage_dir(env)}/{filename}"
             if _write_to_sandbox(content, remote_path, env):
                 return _persisted(remote_path)
         except Exception as exc:
