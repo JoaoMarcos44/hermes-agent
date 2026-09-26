@@ -513,8 +513,13 @@ def delegate_task(
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
     from tools.delegation_live_log import create_live_transcripts
+    # creds stores delegation OVERRIDES. In the normal inherit path its model/provider are
+    # intentionally None, while _resolve_child_runtime() builds the child from the parent's live
+    # route. The manifest is provenance for the route that will run, not a dump of override inputs.
+    manifest_model = creds.get("model") or getattr(parent_agent, "model", None)
+    manifest_provider = creds.get("provider") or getattr(parent_agent, "provider", None)
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context, model=manifest_model, provider=manifest_provider
     )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
