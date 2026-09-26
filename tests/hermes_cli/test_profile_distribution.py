@@ -512,6 +512,23 @@ class TestUpdate:
         assert not any(outside.iterdir())
         assert soul.read_text(encoding="utf-8") == before  # refused before the first write
 
+    def test_owned_skill_category_with_metadata_still_merges_per_skill(self, profile_env):
+        """Category metadata must not make the category itself an authoritative skill root."""
+        staged, plan = self._owned_category(profile_env, "rb-meta")
+        research = staged / "skills" / "research"
+        (research / "README.md").write_text("category docs v1\n", encoding="utf-8")
+
+        installed_research = plan.target_dir / "skills" / "research"
+        mine = installed_research / "my-notes"
+        mine.mkdir()
+        (mine / "SKILL.md").write_text("my own skill\n", encoding="utf-8")
+        (research / "README.md").write_text("category docs v2\n", encoding="utf-8")
+
+        update_distribution("rb-meta")
+
+        assert (mine / "SKILL.md").read_text(encoding="utf-8") == "my own skill\n"
+        assert (installed_research / "README.md").read_text(encoding="utf-8") == "category docs v2\n"
+
     def test_nested_non_skill_owned_directory_is_still_replaced_whole(self, profile_env):
         """Per-entry merge is a skills contract, not a generic property of nested directories."""
         mf = DistributionManifest(

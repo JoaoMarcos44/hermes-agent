@@ -442,19 +442,28 @@ def _refuse_symlink(path: Path) -> None:
 
 
 def _is_container(path: Path) -> bool:
-    """A shipped directory holding no files (a skills category) is a container of roots,
-    not a root itself; a skill dir always holds at least SKILL.md."""
+    """A generic directory holding no files is a container of authored roots."""
     return path.is_dir() and not any(p.is_file() for p in path.iterdir())
 
-def _is_owned_skill_container(path: Path, rel: Tuple[str, ...]) -> bool:
-    """True only for an explicitly owned directory that is a container of skill roots.
 
-    Top-level owned directories keep their existing per-root merge contract. Nested paths are
-    authoritative by default; only paths under ``skills/`` inherit the documented per-skill merge
-    semantics. This avoids turning an arbitrary owned path into an additive merge merely because
-    its root happens to contain directories instead of files.
+def _is_skill_container(path: Path, rel: Tuple[str, ...]) -> bool:
+    """A skills category/container is any directory below ``skills/`` without ``SKILL.md``.
+
+    The skills installer uses this same semantic boundary: a category bucket has no ``SKILL.md``;
+    a directory that contains ``SKILL.md`` is a skill root. Category metadata files therefore do
+    not turn the category itself into an owned skill root.
     """
-    return len(rel) > 1 and rel[0] == "skills" and _is_container(path)
+    return bool(rel) and rel[0] == "skills" and path.is_dir() and not (path / "SKILL.md").is_file()
+
+
+def _is_merge_container(path: Path, rel: Tuple[str, ...]) -> bool:
+    """Choose the container rule for the subtree being merged."""
+    return _is_skill_container(path, rel) if rel and rel[0] == "skills" else _is_container(path)
+
+
+def _is_owned_skill_container(path: Path, rel: Tuple[str, ...]) -> bool:
+    """True only for an explicitly owned nested category of skill roots."""
+    return len(rel) > 1 and _is_skill_container(path, rel)
 
 
 def _merge_dir(src: Path, dest: Path, rel: Tuple[str, ...]) -> None:
@@ -465,7 +474,7 @@ def _merge_dir(src: Path, dest: Path, rel: Tuple[str, ...]) -> None:
             continue
         if parts == _CRON_STORE_REL:
             continue  # merged up front by _copy_dist_payload
-        if _is_container(child):
+        if _is_merge_container(child, parts):
             _merge_dir(child, _real_dir(dest, (child.name,)), parts)
         else:
             _replace_entry(child, dest / child.name)
@@ -476,7 +485,7 @@ def _refuse_symlinked_containers(src: Path, dest: Path, rel: Tuple[str, ...]) ->
         parts = (*rel, child.name)
         if _is_distribution_runtime_path(parts):
             continue
-        if _is_container(child):
+        if _is_merge_container(child, parts):
             _refuse_symlink(dest / child.name)
             _refuse_symlinked_containers(child, dest / child.name, parts)
 
@@ -506,7 +515,7 @@ def _copy_dist_payload(staged: Path, target: Path, manifest: DistributionManifes
     ``preserve_config`` is False (fresh install / ``--force-config``). ``.env.template`` lands
     as ``.env.EXAMPLE`` so it never shadows a real ``.env``.
 
-    A top-level owned directory, and an owned category holding only roots, is merged per
+    A top-level owned directory, and an owned skills category, is merged per
     authored root. ``cron/jobs.json`` is
     special: it is one multi-record runtime store, so shipped definitions merge by job id
     instead of replacing the file."""
