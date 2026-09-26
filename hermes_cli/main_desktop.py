@@ -1167,6 +1167,9 @@ def _desktop_launch_options() -> tuple[list[str], str, str, str]:
     return flags, disable_gpu, password_store, ozone_hint
 
 
+_LEGACY_LINUX_DESKTOP_ENTRY_NAME = "hermes.desktop"
+
+
 def _register_linux_desktop_entry(defer: bool = False):
     """Install the XDG desktop entry for Hermes Desktop (Linux only, best-effort).
 
@@ -1179,16 +1182,31 @@ def _register_linux_desktop_entry(defer: bool = False):
     """
     from hermes_cli.main import PROJECT_ROOT
     try:
-        from hermes_cli.linux_desktop_entry import DeferredDesktopEntryInstall, install_desktop_entry, is_supported
+        from hermes_cli.linux_desktop_entry import (
+            DeferredDesktopEntryInstall,
+            desktop_entry_path,
+            install_desktop_entry,
+            is_supported,
+        )
         if not is_supported():
             return None
         if defer:
             deferred = DeferredDesktopEntryInstall(PROJECT_ROOT)
             deferred.start()
             return deferred
+
+        target_entry = desktop_entry_path()
+        legacy_entry = target_entry.with_name(_LEGACY_LINUX_DESKTOP_ENTRY_NAME)
+        migration_pending = target_entry.name != legacy_entry.name and legacy_entry.is_file()
+
         entry = install_desktop_entry(PROJECT_ROOT)
         if entry:
             print(f"✓ Desktop launcher entry installed: {entry}")
+            if migration_pending and not legacy_entry.exists():
+                print(
+                    f"✓ Launcher entry updated: {legacy_entry.name} -> {entry.name}\n"
+                    "  If Hermes is pinned to your panel, unpin it and re-pin from the app grid."
+                )
     except Exception as exc:  # never block a launch on launcher plumbing
         print(f"⚠ Could not install the desktop launcher entry: {exc}")
     return None

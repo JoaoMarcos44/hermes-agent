@@ -146,6 +146,66 @@ def _pack_into_staging(root: Path, content: str = "", returncode: int = 0):
     return _run
 
 
+def test_register_linux_desktop_entry_reports_completed_identity_migration(
+    tmp_path, monkeypatch, capsys
+):
+    """#124492: warn only when a differently named target actually retires hermes.desktop."""
+    from hermes_cli import linux_desktop_entry as lde
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    applications = tmp_path / "applications"
+    applications.mkdir()
+    legacy = applications / "hermes.desktop"
+    target = applications / "com.nousresearch.hermes.desktop"
+    legacy.write_text("[Desktop Entry]\nName=Hermes\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    monkeypatch.setattr(lde, "is_supported", lambda: True)
+    monkeypatch.setattr(lde, "desktop_entry_path", lambda: target)
+
+    def _install(_root):
+        legacy.unlink()
+        target.write_text("[Desktop Entry]\nName=Hermes\n", encoding="utf-8")
+        return target
+
+    monkeypatch.setattr(lde, "install_desktop_entry", _install)
+
+    main_desktop._register_linux_desktop_entry()
+
+    out = capsys.readouterr().out
+    assert "Launcher entry updated: hermes.desktop -> com.nousresearch.hermes.desktop" in out
+    assert "unpin it and re-pin from the app grid" in out
+
+
+@pytest.mark.parametrize("case", ["same-name", "missing-legacy", "legacy-survives"])
+def test_register_linux_desktop_entry_avoids_false_migration_notice(
+    tmp_path, monkeypatch, capsys, case
+):
+    """No rename or no completed retirement means no re-pin guidance."""
+    from hermes_cli import linux_desktop_entry as lde
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    applications = tmp_path / "applications"
+    applications.mkdir()
+    legacy = applications / "hermes.desktop"
+    target = legacy if case == "same-name" else applications / "com.nousresearch.hermes.desktop"
+    if case != "missing-legacy":
+        legacy.write_text("[Desktop Entry]\nName=Hermes\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    monkeypatch.setattr(lde, "is_supported", lambda: True)
+    monkeypatch.setattr(lde, "desktop_entry_path", lambda: target)
+    monkeypatch.setattr(lde, "install_desktop_entry", lambda _root: target)
+
+    main_desktop._register_linux_desktop_entry()
+
+    out = capsys.readouterr().out
+    assert "Launcher entry updated:" not in out
+    assert "re-pin from the app grid" not in out
+
+
 @pytest.mark.parametrize("local", [False, True])
 def test_source_launch_reads_bom_electron_path_without_provisioning(tmp_path, monkeypatch, local):
     root = _make_desktop_tree(tmp_path)
