@@ -109,6 +109,12 @@ _WINDOWS_REDIRECTOR = (
 )
 HERMES_INLINE_GATEWAYS = [_RUNTIME_BOOTSTRAP, _PUBLISHED_LAUNCHER, _WINDOWS_REDIRECTOR]
 
+HERMES_INLINE_GATEWAYS_BY_ROOT = [
+    _flatten(runtime_command(Path(root), ["gateway", "run", "--replace"], python="python"))
+    for root in ("/opt/hermes", "/opt/hermes-gateway", "/srv/hermes")
+]
+
+
 
 @pytest.mark.parametrize("cmd", HERMES_INLINE_GATEWAYS)
 def test_accepts_hermes_owned_inline_gateway_launchers(cmd):
@@ -116,6 +122,53 @@ def test_accepts_hermes_owned_inline_gateway_launchers(cmd):
     assert matches(cmd) is True
     assert matches_runtime(cmd) is True
     assert spawn_intent(cmd) == "run"
+
+
+@pytest.mark.parametrize("cmd", HERMES_INLINE_GATEWAYS_BY_ROOT)
+def test_inline_bootstrap_install_root_name_does_not_change_identity(cmd):
+    """Install-path basenames are source data, not nested-program boundaries."""
+    assert matches(cmd) is True
+    assert matches_runtime(cmd) is True
+    assert spawn_intent(cmd) == "run"
+
+
+def _venv_sync_relaunch(module: str | None) -> str:
+    from hermes_cli.venv_sync import relaunch_command
+
+    root = Path("/opt/hermes")
+    argv = [str(root / "hermes_cli" / "main.py"), "gateway", "run"]
+    original = ["python", "-m", "hermes_cli.main", "gateway", "run"]
+    return _flatten(relaunch_command(Path("python"), root, argv, original, module))
+
+
+@pytest.mark.parametrize("module", ["hermes_cli.main", None])
+def test_accepts_real_venv_sync_relaunch_shapes(module):
+    """Both run_module and run_path producer branches rebind this process to gateway argv."""
+    cmd = _venv_sync_relaunch(module)
+    assert matches(cmd) is True
+    assert matches_runtime(cmd) is True
+    assert spawn_intent(cmd) == "run"
+
+
+def test_restart_watcher_with_unquoted_relaunch_data_preserves_spawn_intent():
+    future = _venv_sync_relaunch("hermes_cli.main")
+    watcher = (
+        "python -c import sys, time; pid = int(sys.argv[1]); cmd = sys.argv[2:]; "
+        f"time.sleep(30) 4242 {future}"
+    )
+    assert matches(watcher) is False
+    assert matches_runtime(watcher) is False
+    assert spawn_intent(watcher) == "run"
+
+
+def test_marker_text_inside_inline_source_is_not_gateway_identity():
+    cmd = (
+        "python -c import sys; "
+        "sys.argv = ['/opt/hermes/hermes_cli/main.py', 'gateway', 'run']; "
+        "note = \"runpy.run_module('hermes_cli.main')\""
+    )
+    assert matches(cmd) is False
+    assert matches_runtime(cmd) is False
 
 
 @pytest.mark.parametrize("future_gateway", HERMES_INLINE_GATEWAYS)
