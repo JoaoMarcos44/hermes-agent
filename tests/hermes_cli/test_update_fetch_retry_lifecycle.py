@@ -13,7 +13,7 @@ def _result(returncode=0, stderr=""):
 
 def test_fetch_retry_uses_exponential_backoff_for_transient_failures(monkeypatch):
     results = iter([
-        _result(128, "fatal: unable to access: Could not resolve host: github.com"),
+        _result(124, "git fetch timed out after 300s"),
         _result(128, "fatal: unable to access: HTTP 503"),
         _result(0),
     ])
