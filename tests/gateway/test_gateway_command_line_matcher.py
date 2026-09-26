@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from gateway.status import (
+    _published_launcher_source_matches as published_source_matches,
     gateway_spawn_intent_subcommand as spawn_intent,
     looks_like_gateway_command_line as matches,
     looks_like_gateway_runtime_command_line as matches_runtime,
@@ -163,6 +164,22 @@ def test_inert_full_published_launcher_fingerprint_stays_anonymous():
     )
     assert matches(cmd) is False
     assert matches_runtime(cmd) is False
+
+
+def test_flattened_real_launcher_text_inside_string_stays_anonymous():
+    """Flattening must not turn an inert copy of the real producer source into identity."""
+    producer_source = _launcher_script("hermes", Path("/opt/hermes"), None).strip()
+    flattened_producer = " ".join(producer_source.splitlines())
+    inert_source = (
+        "import sys, time if False: note = \"\"\""
+        + flattened_producer
+        + "\"\"\" main = lambda: time.sleep(3600) sys.exit(main())"
+    )
+
+    # The real flattened producer is still recognized, while the exact same fingerprint inside a
+    # Python string is data rather than executable launcher code.
+    assert published_source_matches(flattened_producer) is True
+    assert published_source_matches(inert_source) is False
 
 
 def test_spaced_python_path_watcher_stays_anonymous_but_keeps_intent():
