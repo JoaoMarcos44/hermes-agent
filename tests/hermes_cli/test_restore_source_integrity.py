@@ -197,6 +197,17 @@ def _run_snapshot_restore(home: Path, snap_id: str):
     return restore_quick_snapshot(snap_id, hermes_home=home)
 
 
+def _run_snapshot_cli(snap_id: str) -> None:
+    from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+    class _Stub(CLICommandsMixin):
+        def __init__(self):
+            self.agent = None
+            self._session_db = None
+
+    _Stub()._snapshot_restore(["snapshot", "restore", snap_id])
+
+
 def _run_import(zip_path: Path):
     from hermes_cli.backup import run_import
 
@@ -289,6 +300,117 @@ def test_corrupt_source_cannot_replace_a_healthy_database(
         assert json.loads((home / "cron" / "jobs.json").read_text()) == {
             "jobs": [{"id": "archive-job"}]
         }
+
+
+# ---------------------------------------------------------------------------
+# Manifest settlement: every declared member contributes an outcome
+# ---------------------------------------------------------------------------
+
+def _snapshot_with_manifest(home: Path, files: dict[str, dict]) -> Path:
+    snap = home / "state-snapshots" / _SNAP_ID
+    snap.mkdir(parents=True)
+    (snap / "manifest.json").write_text(json.dumps({"id": _SNAP_ID, "files": files}))
+    return snap
+
+
+def _assert_cli_incomplete(capsys) -> None:
+    out = capsys.readouterr().out
+    assert "Restored state from" not in out
+    assert "Snapshot not found" not in out
+    assert "restore incomplete" in out.lower()
+
+
+def test_missing_declared_db_keeps_valid_sibling_but_reports_incomplete(
+    tmp_path, monkeypatch, capsys
+):
+    home = _install_home(tmp_path, monkeypatch)
+    _build_home(home)
+    before_db = (home / "state.db").read_bytes()
+    snap = _snapshot_with_manifest(home, {"state.db": {}, "config.yaml": {}})
+    (snap / "config.yaml").write_text("mode: snapshot\n")
+
+    _run_snapshot_cli(_SNAP_ID)
+
+    assert (home / "state.db").read_bytes() == before_db
+    assert (home / "config.yaml").read_text() == "mode: snapshot\n"
+    _assert_cli_incomplete(capsys)
+
+
+def test_source_traversal_keeps_valid_sibling_but_reports_incomplete(
+    tmp_path, monkeypatch, capsys
+):
+    home = _install_home(tmp_path, monkeypatch)
+    _build_home(home)
+    snap = _snapshot_with_manifest(home, {"../outside.txt": {}, "config.yaml": {}})
+    (snap / "config.yaml").write_text("mode: snapshot\n")
+    escaped_source = snap.parent / "outside.txt"
+    escaped_source.write_text("must not publish\n")
+
+    _run_snapshot_cli(_SNAP_ID)
+
+    assert not (home.parent / "outside.txt").exists()
+    assert escaped_source.read_text() == "must not publish\n"
+    assert (home / "config.yaml").read_text() == "mode: snapshot\n"
+    _assert_cli_incomplete(capsys)
+
+
+def test_destination_escape_keeps_valid_sibling_but_reports_incomplete(
+    tmp_path, monkeypatch, capsys
+):
+    home = _install_home(tmp_path, monkeypatch)
+    _build_home(home)
+    snap = _snapshot_with_manifest(home, {"escape/blocked.txt": {}, "config.yaml": {}})
+    (snap / "escape").mkdir()
+    (snap / "escape" / "blocked.txt").write_text("snapshot bytes\n")
+    (snap / "config.yaml").write_text("mode: snapshot\n")
+
+    outside = tmp_path / "outside-destination"
+    outside.mkdir()
+    try:
+        (home / "escape").symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    _run_snapshot_cli(_SNAP_ID)
+
+    assert not (outside / "blocked.txt").exists()
+    assert (home / "config.yaml").read_text() == "mode: snapshot\n"
+    _assert_cli_incomplete(capsys)
+
+
+def test_valid_multifile_snapshot_reports_success_through_cli(
+    tmp_path, monkeypatch, capsys
+):
+    home = _install_home(tmp_path, monkeypatch)
+    _build_home(home)
+    snap = _build_snapshot(home, _SNAP_ID, db_mode="ok")
+
+    _run_snapshot_cli(_SNAP_ID)
+
+    out = capsys.readouterr().out
+    assert f"Restored state from: {_SNAP_ID}" in out
+    assert "incomplete" not in out.lower()
+    assert _evidence_rows(home / "state.db") == [("snapshot",)]
+    assert (home / "config.yaml").read_text() == "mode: snapshot\n"
+    assert json.loads((home / "cron" / "jobs.json").read_text()) == {
+        "jobs": [{"id": "snapshot-job"}]
+    }
+
+
+def test_malformed_manifest_is_existing_but_incomplete(
+    tmp_path, monkeypatch, capsys
+):
+    home = _install_home(tmp_path, monkeypatch)
+    _build_home(home)
+    before_db = (home / "state.db").read_bytes()
+    snap = home / "state-snapshots" / _SNAP_ID
+    snap.mkdir(parents=True)
+    (snap / "manifest.json").write_text("{not-json")
+
+    _run_snapshot_cli(_SNAP_ID)
+
+    assert (home / "state.db").read_bytes() == before_db
+    _assert_cli_incomplete(capsys)
 
 
 # ---------------------------------------------------------------------------

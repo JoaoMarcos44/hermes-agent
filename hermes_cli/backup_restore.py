@@ -7,6 +7,7 @@ helpers used by ``hermes import`` and ``/snapshot restore``.  Backup
 which composes these helpers.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -15,6 +16,7 @@ import stat
 import sys
 import tempfile
 import zipfile
+from enum import Enum
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -23,6 +25,16 @@ from utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class QuickSnapshotRestoreStatus(str, Enum):
+    """Settlement of one quick-snapshot restore request."""
+
+    RESTORED = "restored"
+    NOT_FOUND = "not_found"
+    INCOMPLETE = "incomplete"
+
+
 
 # Bytes that may appear literally in a SQLite ``file:`` URI path: unreserved
 # characters plus the path separators and the Windows drive colon.  Everything
@@ -416,6 +428,96 @@ def _extract_member_atomically(
         except OSError:
             pass
         raise
+
+
+
+def _restore_quick_snapshot_directory(
+    snap_dir: Path,
+    home: Path,
+) -> QuickSnapshotRestoreStatus:
+    """Restore every manifest-declared member and report the aggregate honestly.
+
+    The manifest is the recovery obligation: a missing member, blocked path, refused
+    database, malformed manifest, or copy failure makes the result incomplete, but
+    valid siblings are still recovered. This is intentionally best-effort across
+    files rather than a whole-home transaction.
+    """
+    if not snap_dir.is_dir():
+        return QuickSnapshotRestoreStatus.NOT_FOUND
+
+    manifest_path = snap_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return QuickSnapshotRestoreStatus.NOT_FOUND
+
+    try:
+        with open(manifest_path, encoding="utf-8-sig") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Failed to read snapshot manifest %s: %s", manifest_path, exc)
+        return QuickSnapshotRestoreStatus.INCOMPLETE
+
+    declared = meta.get("files") if isinstance(meta, dict) else None
+    if not isinstance(declared, dict):
+        logger.error("Snapshot manifest %s has no valid files mapping", manifest_path)
+        return QuickSnapshotRestoreStatus.INCOMPLETE
+
+    try:
+        resolved_snap = snap_dir.resolve()
+        resolved_home = home.resolve()
+    except OSError as exc:
+        logger.error("Failed to resolve snapshot restore roots: %s", exc)
+        return QuickSnapshotRestoreStatus.INCOMPLETE
+
+    restored = 0
+    failures = 0
+    for rel in declared:
+        if not isinstance(rel, str) or not rel:
+            logger.error("Invalid manifest member path: %r", rel)
+            failures += 1
+            continue
+
+        src = snap_dir / rel
+        try:
+            src.resolve().relative_to(resolved_snap)
+        except (OSError, ValueError):
+            logger.error("Manifest source path traversal blocked: %s", rel)
+            failures += 1
+            continue
+
+        dst = home / rel
+        try:
+            dst.resolve().relative_to(resolved_home)
+        except (OSError, ValueError):
+            logger.error("Manifest destination path traversal blocked: %s", rel)
+            failures += 1
+            continue
+
+        if not src.exists():
+            logger.error("Snapshot member missing: %s", rel)
+            failures += 1
+            continue
+
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.suffix == ".db":
+                # Preserve the live inode so existing SQLite holders converge on
+                # the restored pages (#65942); source admission lives inside the
+                # shared restore boundary (#122868).
+                if not _safe_restore_db(src, dst):
+                    logger.error("Failed to restore %s: live-safe restore refused", rel)
+                    failures += 1
+                    continue
+            else:
+                shutil.copy2(src, dst)
+            restored += 1
+        except (OSError, PermissionError) as exc:
+            logger.error("Failed to restore %s: %s", rel, exc)
+            failures += 1
+
+    logger.info("Restored %d files from snapshot %s", restored, snap_dir.name)
+    if restored > 0 and failures == 0:
+        return QuickSnapshotRestoreStatus.RESTORED
+    return QuickSnapshotRestoreStatus.INCOMPLETE
 
 
 def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
