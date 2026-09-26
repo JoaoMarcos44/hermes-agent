@@ -161,6 +161,35 @@ def _fake_run(task_index, goal, child=None, parent_agent=None, **kw):
         "duration_seconds": 0.1, "model": "m", "exit_reason": "completed",
     }
 
+def test_delegate_manifest_uses_effective_parent_route_when_delegation_is_unpinned(monkeypatch):
+    """Pure inheritance must record the route the child will actually run, not null overrides."""
+    import tools.delegate_tool as dt
+    import tools.delegation_live_log as live_log
+
+    parent = _make_parent()
+    parent.model = "parent/model"
+    parent.provider = "parent-provider"
+    inherited = {
+        "model": None, "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "request_overrides": {}, "command": None, "args": [],
+    }
+    captured = {}
+
+    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_args, **_kwargs: dict(inherited))
+    monkeypatch.setattr(dt, "_oneshot_spawn_budget", lambda *_args, **_kwargs: None)
+
+    def capture(_tasks, _context=None, *, model=None, provider=None, **_kwargs):
+        captured.update(model=model, provider=provider)
+        return None, [None], []
+
+    monkeypatch.setattr(live_log, "create_live_transcripts", capture)
+    monkeypatch.setattr(dt, "_build_children", lambda *_args, **_kwargs: ([], "stop after manifest"))
+
+    dt.delegate_task(tasks=[{"goal": "inspect the inherited route"}], parent_agent=parent)
+
+    assert captured == {"model": "parent/model", "provider": "parent-provider"}
+
 
 if __name__ == "__main__":
     import sys
