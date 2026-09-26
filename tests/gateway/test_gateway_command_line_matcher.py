@@ -9,6 +9,8 @@ process and ``status``/``start`` report false positives.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from gateway.status import (
@@ -16,6 +18,7 @@ from gateway.status import (
     looks_like_gateway_command_line as matches,
     looks_like_gateway_runtime_command_line as matches_runtime,
 )
+from hermes_cli._launchers import _launcher_script, runtime_command
 
 
 ACCEPT = [
@@ -84,6 +87,57 @@ INLINE_SOURCE_REJECT = [
     # ``-q`` (quiet) takes NO operand, unlike ``-Q``; a case-folded walk would skip past the ``-c``.
     'python -q -c "import os" 14980 python -m hermes_cli.main gateway run',
 ]
+
+
+def _flatten(argv: list[str]) -> str:
+    """Match _read_process_cmdline(): psutil argv parts are joined with spaces."""
+    return " ".join(argv)
+
+
+_RUNTIME_BOOTSTRAP = _flatten(
+    runtime_command(Path("/tmp/hermes-agent"), ["gateway", "run", "--replace"], python="python")
+)
+_PUBLISHED_LAUNCHER = _flatten(
+    ["python", "-I", "-c", _launcher_script("hermes", Path("/tmp/hermes-agent"), None), "gateway", "run"]
+)
+_WINDOWS_REDIRECTOR = (
+    r"C:\Users\me\hermes\venv\Scripts\python.exe -I -c "
+    "import sys, runpy; "
+    r"sys.argv = ['C:\\Users\\me\\hermes\\venv\\Scripts\\hermes.exe', "
+    "'-p', 'worker', 'gateway', 'run']; "
+    "runpy.run_module('hermes_cli.main', run_name='__main__')"
+)
+HERMES_INLINE_GATEWAYS = [_RUNTIME_BOOTSTRAP, _PUBLISHED_LAUNCHER, _WINDOWS_REDIRECTOR]
+
+
+@pytest.mark.parametrize("cmd", HERMES_INLINE_GATEWAYS)
+def test_accepts_hermes_owned_inline_gateway_launchers(cmd):
+    """Both canonical bootstrap shapes and the Windows redirector are this process, not a future one."""
+    assert matches(cmd) is True
+    assert matches_runtime(cmd) is True
+    assert spawn_intent(cmd) == "run"
+
+
+@pytest.mark.parametrize("future_gateway", HERMES_INLINE_GATEWAYS)
+def test_restart_watcher_wrapping_inline_gateway_stays_non_gateway(future_gateway):
+    """#107002: a watcher's nested future gateway must never become the watcher's identity."""
+    watcher = f'python -c "import time; time.sleep(1)" 14980 {future_gateway}'
+    assert matches(watcher) is False
+    assert matches_runtime(watcher) is False
+    assert spawn_intent(watcher) == "run"
+
+
+def test_foreign_inline_source_cannot_borrow_plain_gateway_tail():
+    command = 'python -c "print(\'hermes_cli.main\')" gateway run'
+    assert matches(command) is False
+    assert matches_runtime(command) is False
+
+
+@pytest.mark.parametrize("subcommand", ["status", "stop"])
+def test_redirector_non_runtime_subcommands_stay_non_gateway(subcommand):
+    command = _WINDOWS_REDIRECTOR.replace("'run']", f"'{subcommand}']")
+    assert matches(command) is False
+    assert matches_runtime(command) is False
 
 
 # Real gateways whose interpreter carries operand-taking options must STILL be recognised — the
