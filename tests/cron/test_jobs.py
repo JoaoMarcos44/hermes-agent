@@ -1720,6 +1720,61 @@ class TestJobsJsonIdKeyedMap:
 
 
 
+    def test_non_object_list_entries_are_repaired_at_load_boundary(self, tmp_cron_dir):
+        """Junk list entries are dropped once so every reader sees only job mappings."""
+        import json
+        from cron.jobs import (
+            JOBS_FILE, create_job, get_due_jobs, list_jobs, load_jobs, resolve_job_ref,
+        )
+
+        job = create_job(prompt="keep me", schedule="every 1h", name="survivor")
+        payload = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        payload["jobs"][0]["next_run_at"] = (
+            datetime.now().astimezone() - timedelta(seconds=1)
+        ).isoformat()
+        payload["jobs"].extend([None, "not-a-job", 42])
+        JOBS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = load_jobs()
+        assert [item["id"] for item in loaded] == [job["id"]]
+        assert json.loads(JOBS_FILE.read_text(encoding="utf-8"))["jobs"] == loaded
+        assert [item["id"] for item in list_jobs(include_disabled=True)] == [job["id"]]
+        assert resolve_job_ref("survivor")["id"] == job["id"]
+        assert [item["id"] for item in get_due_jobs()] == [job["id"]]
+
+    def test_all_junk_list_is_repaired_without_logging_values(self, tmp_cron_dir, caplog):
+        """An empty repair is still durable and warnings never echo raw store values."""
+        import json
+        from cron.jobs import JOBS_FILE, ensure_dirs, load_jobs
+
+        ensure_dirs()
+        JOBS_FILE.write_text(
+            json.dumps({"jobs": [None, "sk-do-not-log-this", 42]}), encoding="utf-8")
+
+        with caplog.at_level("WARNING", logger="cron.jobs"):
+            assert load_jobs() == []
+
+        assert json.loads(JOBS_FILE.read_text(encoding="utf-8"))["jobs"] == []
+        assert "sk-do-not-log-this" not in caplog.text
+
+    @pytest.mark.parametrize("bad_jobs", [None, "not-a-list", 42, True])
+    def test_invalid_jobs_field_is_repaired_to_empty_list(
+        self, tmp_cron_dir, bad_jobs, caplog
+    ):
+        """A dict root with a scalar jobs value must not escape the load boundary."""
+        import json
+        from cron.jobs import JOBS_FILE, list_jobs, load_jobs
+
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        JOBS_FILE.write_text(json.dumps({"jobs": bad_jobs}), encoding="utf-8")
+
+        with caplog.at_level("WARNING", logger="cron.jobs"):
+            assert load_jobs() == []
+        assert list_jobs(include_disabled=True) == []
+        assert json.loads(JOBS_FILE.read_text(encoding="utf-8"))["jobs"] == []
+        assert type(bad_jobs).__name__ in caplog.text
+
+
 
 
 class TestAdvanceNextRuns:

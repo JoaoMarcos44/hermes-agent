@@ -1352,8 +1352,9 @@ def load_jobs() -> List[Dict[str, Any]]:
         logger.error("Failed to auto-repair jobs.json: %s", e)
         raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
 
-    # Accept the canonical dict, or a bare list (auto-repair); any other top-level shape is
-    # corruption.
+    # Normalize every accepted store shape at this single boundary. Downstream readers index job
+    # records as mappings, so returning a malformed collection here turns one bad value into a
+    # subsystem-wide failure (#123281).
     repair = "had invalid control characters" if _strict_retry else None
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
@@ -1368,13 +1369,31 @@ def load_jobs() -> List[Dict[str, Any]]:
                     ", ".join(map(repr, skipped)))
             jobs = [{**v, "id": v.get("id") or k} for k, v in jobs.items() if isinstance(v, dict)]
             repair = "id-keyed jobs map flattened to list"
+        elif not isinstance(jobs, list):
+            logger.warning(
+                "Replacing invalid jobs.json 'jobs' field (%s) with an empty list",
+                type(jobs).__name__)
+            jobs = []
+            repair = "invalid jobs field replaced with list"
     elif isinstance(data, list):
         jobs = data
         repair = "bare list wrapped as dict"
     else:
         raise RuntimeError(
             f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}")
-    if jobs and repair:
+
+    junk_types = sorted({type(job).__name__ for job in jobs if not isinstance(job, dict)})
+    if junk_types:
+        junk_count = sum(not isinstance(job, dict) for job in jobs)
+        logger.warning(
+            "Skipping %d non-object entr%s in jobs.json (types: %s)",
+            junk_count, "y" if junk_count == 1 else "ies", ", ".join(junk_types))
+        jobs = [job for job in jobs if isinstance(job, dict)]
+        repair = repair or "non-object entries dropped"
+
+    # Persist repairs even when every record was junk; otherwise every tick repeats the same
+    # failure-prone parse forever.
+    if repair:
         save_jobs(jobs)
         logger.warning("Auto-repaired jobs.json (%s)", repair)
     _record_load_stamp(pre_read_stamp)
