@@ -798,7 +798,52 @@ def _published_launcher_source_matches(source: str) -> bool:
         if position < 0:
             return False
         cursor = position + len(marker)
-    return lowered.endswith("sys.exit(main())")
+    if not lowered.endswith("sys.exit(main())"):
+        return False
+
+    # When argv boundaries preserve the source (for example a quoted Windows command line), AST
+    # parsing is authoritative: inert strings/comments carrying the same marker text must not
+    # manufacture identity. Flattened process listings lose indentation and may not parse, so only
+    # that representation falls back to the ordered producer fingerprint above.
+    try:
+        tree = ast.parse(source)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
+        return True
+
+    imports_bootstrap = any(
+        isinstance(statement, ast.Import)
+        and any(alias.name == "hermes_bootstrap" for alias in statement.names)
+        for statement in tree.body
+    )
+    imports_main = any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "hermes_cli.main"
+        and any(alias.name == "main" for alias in statement.names)
+        for statement in tree.body
+    )
+    if not imports_bootstrap or not imports_main or not tree.body:
+        return False
+
+    final = tree.body[-1]
+    call = final.value if isinstance(final, ast.Expr) else None
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "sys"
+        and call.func.attr == "exit"
+        and len(call.args) == 1
+        and not call.keywords
+    ):
+        return False
+    inner = call.args[0]
+    return (
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == "main"
+        and not inner.args
+        and not inner.keywords
+    )
 
 
 def _decoded_published_launcher_source(source: str) -> str | None:
