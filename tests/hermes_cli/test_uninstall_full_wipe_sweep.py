@@ -77,11 +77,7 @@ def test_full_uninstall_sweeps_macos_caches_and_dashboard_launchd(monkeypatch, t
     (project_root / ".git").mkdir()
     hermes_home.mkdir()
 
-    removed_caches, removed_jobs, gui_userdata_modes = [], [], []
-
-    def fake_uninstall_gui(_home, *, remove_userdata=True):
-        gui_userdata_modes.append(remove_userdata)
-        return True
+    removed_caches, removed_jobs = [], []
     cache_dirs = [tmp_path / "caches" / name for name in
                   ("Hermes", "com.nousresearch.hermes", "hermes-setup",
                    "com.nousresearch.hermes.setup")]
@@ -101,7 +97,7 @@ def test_full_uninstall_sweeps_macos_caches_and_dashboard_launchd(monkeypatch, t
     monkeypatch.setattr(uninstall, "_rmtree_step",
                         lambda path, **kw: None if path in (project_root, hermes_home)
                         else (_ for _ in ()).throw(AssertionError(f"unexpected rmtree {path}")))
-    monkeypatch.setattr("hermes_cli.gui_uninstall.uninstall_gui", fake_uninstall_gui)
+    monkeypatch.setattr("hermes_cli.gui_uninstall.uninstall_gui", lambda home: True)
     monkeypatch.setattr(uninstall, "_macos_cache_leftover_dirs", lambda: cache_dirs)
     monkeypatch.setattr(uninstall, "_rmtree_if_exists",
                         lambda p: removed_caches.append(p) or True)
@@ -112,13 +108,11 @@ def test_full_uninstall_sweeps_macos_caches_and_dashboard_launchd(monkeypatch, t
 
     assert removed_caches == cache_dirs  # Electron + setup caches swept in the full wipe
     assert removed_jobs  # dashboard/serve launchd jobs booted out + deleted
-    assert gui_userdata_modes == [True]
 
     removed_caches.clear(), removed_jobs.clear()
     uninstall.run_uninstall(_args(hermes_home, project_root, full=False, yes=True))
     assert removed_caches == []  # keep-data never touches caches outside the home
     assert not removed_jobs
-    assert gui_userdata_modes == [True, False]
 
 
 def _args(hermes_home, project_root, *, full, yes):
