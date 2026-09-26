@@ -182,6 +182,13 @@ def test_flattened_real_launcher_text_inside_string_stays_anonymous():
     assert published_source_matches(inert_source) is False
 
 
+def test_flattened_launcher_unicode_root_keeps_marker_offsets_stable():
+    """Case-fold expansion in a real install path must not move lexical marker positions."""
+    root = Path("/opt") / ("İ" * 32) / "hermes"
+    producer_source = _launcher_script("hermes", root, None).strip()
+    assert published_source_matches(" ".join(producer_source.splitlines())) is True
+
+
 def test_spaced_python_path_watcher_stays_anonymous_but_keeps_intent():
     """psutil argv joining must not reopen #107002 when the outer interpreter path has spaces."""
     future = _flatten(
