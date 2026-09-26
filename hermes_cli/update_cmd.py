@@ -217,9 +217,7 @@ def _fetch_updates_with_retry(git_cmd, fetch_args):
         result = _git_run(git_cmd, fetch_args, network=True)
         if result.returncode == 0:
             return result
-        if attempt >= _UPDATE_FETCH_MAX_ATTEMPTS or not _fetch_failure_is_transient(
-            result.stderr, result.returncode
-        ):
+        if attempt >= _UPDATE_FETCH_MAX_ATTEMPTS or not _fetch_failure_is_transient(result.stderr):
             return result
         delay = _UPDATE_FETCH_BACKOFF_SECONDS * (2 ** (attempt - 1))
         print(

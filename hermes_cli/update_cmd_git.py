@@ -376,16 +376,16 @@ def _classify_fetch_failure(stderr: str) -> str:
     return next((message for matches, message in _FETCH_FAILURE_RULES if matches(stderr)), "✗ Failed to fetch updates from origin.")
 
 
-def _fetch_failure_is_transient(stderr: str, returncode: int | None = None) -> bool:
+def _fetch_failure_is_transient(stderr: str) -> bool:
     """Whether a failed update fetch is safe to retry immediately.
 
     Keep this deliberately narrower than :func:`_classify_fetch_failure`: an
     "unable to access" message can also wrap permanent 4xx/auth failures. 429 is
     explicitly non-retryable here because an immediate retry extends GitHub's
-    secondary-rate-limit window (#89317).
+    secondary-rate-limit window (#89317). A bounded-fetch timeout (rc=124) is
+    intentionally not inferred from the return code here: #95797 owns the
+    HTTP/2→HTTP/1.1 recovery policy and #119118 owns timeout measurement.
     """
-    if returncode == 124:
-        return True
     text = stderr or ""
     lower = text.lower()
     if _has_http_code(text, "429", "401", "403", "404"):

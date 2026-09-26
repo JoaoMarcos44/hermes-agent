@@ -13,7 +13,7 @@ def _result(returncode=0, stderr=""):
 
 def test_fetch_retry_uses_exponential_backoff_for_transient_failures(monkeypatch):
     results = iter([
-        _result(124, "git fetch timed out after 300s"),
+        _result(128, "fatal: unable to access: Could not resolve host: github.com"),
         _result(128, "fatal: unable to access: HTTP 503"),
         _result(0),
     ])
@@ -33,6 +33,26 @@ def test_fetch_retry_uses_exponential_backoff_for_transient_failures(monkeypatch
     assert len(calls) == 3
     assert all(call[2] == {"network": True} for call in calls)
     assert sleeps == [1.0, 2.0]
+
+
+def test_fetch_retry_leaves_bounded_timeout_to_transport_owner(monkeypatch):
+    """rc=124 has a dedicated HTTP/1.1 recovery PR; do not duplicate it here."""
+    calls, sleeps = [], []
+    monkeypatch.setattr(
+        update_cmd,
+        "_git_run",
+        lambda *a, **k: (
+            calls.append((a, k))
+            or _result(124, "git fetch timed out after 300s with no response from the remote")
+        ),
+    )
+    monkeypatch.setattr(update_cmd._time, "sleep", sleeps.append)
+
+    result = update_cmd._fetch_updates_with_retry(["git"], ["fetch", "origin", "main"])
+
+    assert result.returncode == 124
+    assert len(calls) == 1
+    assert sleeps == []
 
 
 def test_fetch_retry_does_not_retry_rate_limits_or_auth(monkeypatch):
