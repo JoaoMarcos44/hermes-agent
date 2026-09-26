@@ -881,7 +881,9 @@ def recover_with_credential_pool(
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     pool_provider = (getattr(pool, "provider", "") or "").strip().lower()
     if pool_provider and not credential_pool_matches_provider(
-        pool, current_provider, base_url=getattr(agent, "base_url", None)
+        pool, current_provider, base_url=getattr(agent, "base_url", None),
+        requested_provider=getattr(agent, "requested_provider", None),
+        api_key=getattr(agent, "api_key", None),
     ):
         # Same fail-closed boundary predicate as runtime binding.
         _ra().logger.warning(
@@ -1272,14 +1274,22 @@ def restore_primary_runtime(agent) -> bool:
         # that was never verified and re-fail every turn. Stay on the fallback.
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
+    primary_requested_provider = str((rt or {}).get("requested_provider") or primary_provider)
+    primary_api_key = (rt or {}).get("api_key")
 
     def _matches_primary(candidate) -> bool:
-        return credential_pool_matches_provider(candidate, primary_provider, base_url=primary_runtime_base_url)
+        return credential_pool_matches_provider(
+            candidate, primary_provider, base_url=primary_runtime_base_url,
+            requested_provider=primary_requested_provider, api_key=primary_api_key,
+        )
 
     def _load_primary_pool():
         """Load the primary provider's pool; None when absent or provider-mismatched."""
         from agent.credential_pool import load_pool
-        key = resolve_runtime_pool_key(primary_provider, primary_runtime_base_url)
+        key = resolve_runtime_pool_key(
+            primary_provider, primary_runtime_base_url,
+            requested_provider=primary_requested_provider, api_key=primary_api_key,
+        )
         loaded = load_pool(key) if key else None
         return loaded if loaded is not None and _matches_primary(loaded) else None
     blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(

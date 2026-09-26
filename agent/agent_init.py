@@ -433,6 +433,8 @@ def _finalize_routing(agent, api_mode, credential_pool):
             from agent.credential_pool import credential_pool_matches_provider
             if not credential_pool_matches_provider(
                 credential_pool, agent.provider, base_url=agent.base_url,
+                requested_provider=getattr(agent, "requested_provider", None),
+                api_key=getattr(agent, "api_key", None),
             ):
                 agent._credential_pool = None
         except Exception:

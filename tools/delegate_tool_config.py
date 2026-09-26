@@ -233,8 +233,11 @@ def _pool_serves_endpoint(pool: Any, provider: Optional[str], base_url: Optional
     return not isinstance(entries, list) or any(_entry_serves_endpoint(entry, base_url) for entry in entries)
 
 def _resolve_child_credential_pool(
-    effective_provider: Optional[str], parent_agent, effective_base_url: Optional[str] = None,
+    effective_provider: Optional[str],
+    parent_agent,
+    effective_base_url: Optional[str] = None,
     effective_requested_provider: Optional[str] = None,
+    effective_api_key: Optional[str] = None,
 ):
     """Credential pool for the child: parent's pool (same provider), that provider's own pool, or None (child keeps
     its fixed credential). Custom endpoints all collapse to ``provider="custom"``, so they are matched by endpoint
@@ -258,16 +261,30 @@ def _resolve_child_credential_pool(
     parent_provider = getattr(parent_agent, "provider", None) or ""
     try:
         if effective_provider == "custom":
-            from agent.credential_pool import get_custom_provider_pool_key
-            child_key = get_custom_provider_pool_key(effective_base_url, provider_name=effective_requested_provider)
-            if child_key is None:
-                return None
-            parent_key = get_custom_provider_pool_key(
-                getattr(parent_agent, "base_url", None), provider_name=getattr(parent_agent, "requested_provider", None),
+            from agent.credential_pool import custom_provider_pool_key_candidates_for_owner
+            child_keys = custom_provider_pool_key_candidates_for_owner(
+                effective_base_url,
+                provider_name=effective_requested_provider,
+                api_key=effective_api_key,
             )
-            if parent_pool is not None and parent_provider == "custom" and parent_key is not None and parent_key == child_key:
+            if not child_keys:
+                return None
+            parent_keys = custom_provider_pool_key_candidates_for_owner(
+                getattr(parent_agent, "base_url", None),
+                provider_name=getattr(parent_agent, "requested_provider", None),
+                api_key=getattr(parent_agent, "api_key", None),
+            )
+            if (
+                parent_pool is not None
+                and parent_provider == "custom"
+                and set(parent_keys) & set(child_keys)
+            ):
                 return parent_pool
-            return _loaded_pool(child_key)
+            for child_key in child_keys:
+                child_pool = _loaded_pool(child_key)
+                if child_pool is not None:
+                    return child_pool
+            return None
         if parent_pool is not None and effective_provider == parent_provider:
             if not effective_base_url or _pool_serves_endpoint(parent_pool, effective_provider, effective_base_url):
                 return parent_pool
