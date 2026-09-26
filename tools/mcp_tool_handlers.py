@@ -495,19 +495,34 @@ def _capped_structured_content(result):
 
 
 def _content_dual_emits_structured(result, structured) -> bool:
-    """True when some text block already carries the same typed structured data."""
-    return any(
-        _text_is_value(text, structured)
+    """Whether MCP text content already carries the same typed structured data.
+
+    Besides the spec JSON dual-emit, MCPServer/FastMCP wraps scalar/list returns in
+    ``{"result": value}`` while rendering the bare value into one or more text blocks.
+    False positives lose data, so wrapper matching is deliberately narrow and type-stable.
+    """
+    texts = [
+        text
         for text in (getattr(block, "text", None) for block in (result.content or []))
         if text
-    )
+    ]
+    if any(_text_is_value(text, structured) for text in texts):
+        return True
+    if not (isinstance(structured, dict) and structured.keys() == {"result"}):
+        return False
+    value = structured["result"]
+    if isinstance(value, list):
+        return len(texts) == len(value) and all(
+            _text_is_value(text, item) for text, item in zip(texts, value)
+        )
+    return any(_text_is_value(text, value) for text in texts)
 
 
 def _text_is_value(text: str, value: Any) -> bool:
-    """Whether one MCP text block represents *value* without bool/int coercion.
+    """Whether one text block represents *value* without bool/int coercion.
 
-    Python strings are emitted verbatim, while some non-string Python values (notably
-    ``bytes``) become JSON strings. Try the raw string first, then parsed JSON.
+    Python ``str`` values are emitted verbatim. Other values are JSON-rendered first;
+    notably ``bytes`` becomes a JSON string, so string-valued output must try both forms.
     """
     if isinstance(value, str) and text == value:
         return True
@@ -518,7 +533,7 @@ def _text_is_value(text: str, value: Any) -> bool:
 
 
 def _json_type_stable_equal(left: Any, right: Any) -> bool:
-    """JSON equality without Python's ``1 == True`` / ``0 == False`` coercion."""
+    """JSON equality without Python\'s ``1 == True`` / ``0 == False`` coercion."""
     if isinstance(left, dict) and isinstance(right, dict):
         return left.keys() == right.keys() and all(
             _json_type_stable_equal(left[key], right[key]) for key in left
@@ -528,46 +543,6 @@ def _json_type_stable_equal(left: Any, right: Any) -> bool:
             _json_type_stable_equal(l_item, r_item) for l_item, r_item in zip(left, right)
         )
     return type(left) is type(right) and left == right
-
-
-def _project_text_value(text: str, value: Any):
-    """Return the sanitized typed value represented by one matching MCP text block."""
-    if not _text_is_value(text, value):
-        return False, None
-    clean = strip_unicode_tags(text)
-    if isinstance(value, str) and text == value:
-        return True, clean
-    try:
-        parsed = json.loads(clean)
-    except (TypeError, ValueError):
-        return False, None
-    return True, strip_unicode_tags(parsed) if isinstance(parsed, str) else parsed
-
-
-def _sdk_wrapped_result_projection(result, structured):
-    """Project an exact Python-SDK ``{"result": value}`` dual emit to one typed value.
-
-    Every content block must be text and map one-for-one to the scalar or list value.
-    Anything richer or different fails closed and keeps both representations.
-    """
-    if not (isinstance(structured, dict) and structured.keys() == {"result"}):
-        return False, None
-    blocks = list(result.content or [])
-    if not blocks or any(getattr(block, "text", None) is None for block in blocks):
-        return False, None
-    value = structured["result"]
-    expected = value if isinstance(value, list) else [value]
-    if len(blocks) != len(expected):
-        return False, None
-
-    projected = []
-    for block, item in zip(blocks, expected):
-        matched, projected_item = _project_text_value(block.text, item)
-        if not matched:
-            return False, None
-        projected.append(projected_item)
-    return True, projected if isinstance(value, list) else projected[0]
-
 
 def _render_call_tool_result(result, server_name: str) -> str:
     """Pure: ``CallToolResult`` -> handler JSON. ``content`` and ``structuredContent`` are both
@@ -585,18 +560,6 @@ def _render_call_tool_result(result, server_name: str) -> str:
     text_result, usable_parts = _render_content_blocks(result, server_name)
     structured = _capped_structured_content(result)
     meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
-    # Python MCP SDK scalar/list results dual-emit text plus {"result": value}. If the
-    # whole content is exactly that wrapper, keep the typed value once instead of flattening
-    # list item boundaries into newline-joined text.
-    wrapped_match, wrapped_value = _sdk_wrapped_result_projection(result, structured)
-    if wrapped_match:
-        payload: Dict[str, Any] = {"result": wrapped_value}
-        if meta is not None:
-            payload["_meta"] = meta
-        try:
-            return json.dumps(payload, ensure_ascii=False)
-        except (TypeError, ValueError):
-            return json.dumps({"result": wrapped_value}, ensure_ascii=False)
     # A str here is the over-cap truncation stand-in (wire structuredContent is always an object): next to
     # usable text it would be a second multi-MB copy — the flood #56059 caps — so it only fills an empty result.
     if structured is not None and usable_parts > 0 and (isinstance(structured, str) or _content_dual_emits_structured(result, structured)):
