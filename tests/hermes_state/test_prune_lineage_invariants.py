@@ -5,6 +5,7 @@ objects. They are intended to be cherry-picked on top of PR #123884.
 """
 
 from contextlib import closing
+import os
 import time
 
 from hermes_state import SessionDB
@@ -91,7 +92,7 @@ def test_auto_prune_live_turn_lease_spares_every_candidate_segment(tmp_path):
         )
         db._conn.commit()
 
-        holder = "12345:test-prune-lineage"
+        holder = f"pid={os.getpid()}:turn=test-prune-lineage"
         assert db.try_acquire_session_turn_lease(
             "lease-tip",
             holder,
