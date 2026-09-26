@@ -696,30 +696,82 @@ def _python_c_sys_argv(
     return None
 
 
-def _hermes_inline_bootstrap_argv(
+def _runtime_bootstrap_argv(
+    raw_tokens: list[str], cased_tokens: list[str], flag_index: int, source_end: int
+) -> list[str] | None:
+    """Lifecycle argv after an actually executed runtime_command bootstrap."""
+    for end in range(flag_index + 2, source_end + 1):
+        source = " ".join(raw_tokens[flag_index + 1:end]).strip()
+        if len(source) >= 2 and source[0] == source[-1] and source[0] in {"'", '"'}:
+            source = source[1:-1]
+        try:
+            tree = ast.parse(source)
+        except (MemoryError, RecursionError, SyntaxError, ValueError):
+            continue
+
+        imported_bootstrap = any(
+            isinstance(statement, ast.Import)
+            and any(alias.name == "hermes_bootstrap" for alias in statement.names)
+            for statement in tree.body
+        )
+        if not imported_bootstrap or not tree.body:
+            continue
+        statement = tree.body[-1]
+        call = statement.value if isinstance(statement, ast.Expr) else None
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "runpy"
+            and call.func.attr == "run_module"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == "hermes_cli.main"
+            and any(
+                keyword.arg == "alter_sys"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in call.keywords
+            )
+        ):
+            continue
+        return cased_tokens[end:source_end]
+    return None
+
+
+def _published_inline_bootstrap_argv(
     cased_tokens: list[str], flag_index: int, source_end: int
 ) -> list[str] | None:
-    """Return lifecycle argv after one of Hermes' two generated in-process bootstrap programs."""
+    """Lifecycle argv after the generated .hermes/bin/hermes launcher source."""
     tail = cased_tokens[flag_index + 1:source_end]
     source = " ".join(tail).lower()
-    if "import hermes_bootstrap" not in source:
+    # Process APIs flatten this multiline source, so indentation is unavailable for an AST parse.
+    # Require its producer-specific fingerprint rather than trusting a runpy/main substring.
+    required = (
+        "import os, re, sys",
+        "os.environ.pop('pythonhome', none)",
+        "from hermes_constants import get_default_hermes_root",
+        "import hermes_bootstrap",
+        "from hermes_cli.main import main",
+        "sys.argv[0] = re.sub",
+        "sys.exit(main())",
+    )
+    if not all(marker in source for marker in required):
         return None
-
-    marker: str | None = None
-    if (
-        ("runpy.run_module('hermes_cli.main'" in source or 'runpy.run_module("hermes_cli.main"' in source)
-        and "alter_sys=true" in source
-    ):
-        marker = "alter_sys=true)"
-    elif "from hermes_cli.main import main" in source:
-        marker = "sys.exit(main())"
-    if marker is None:
-        return None
-
     for position in range(flag_index + 1, source_end):
-        if marker in cased_tokens[position].lower():
+        if "sys.exit(main())" in cased_tokens[position].lower():
             return cased_tokens[position + 1:source_end]
     return None
+
+
+def _hermes_inline_bootstrap_argv(
+    raw_tokens: list[str], cased_tokens: list[str], flag_index: int, source_end: int
+) -> list[str] | None:
+    """Lifecycle argv after either Hermes-owned generated in-process bootstrap."""
+    runtime = _runtime_bootstrap_argv(raw_tokens, cased_tokens, flag_index, source_end)
+    if runtime is not None:
+        return runtime
+    return _published_inline_bootstrap_argv(cased_tokens, flag_index, source_end)
 
 
 def _gateway_command_subcommand_from_tokens(
@@ -800,7 +852,9 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
                 embedded_argv, hermes_entrypoint_inferred=True
             )
 
-        bootstrap_argv = _hermes_inline_bootstrap_argv(cased_tokens, flag_index, source_end)
+        bootstrap_argv = _hermes_inline_bootstrap_argv(
+            raw_tokens, cased_tokens, flag_index, source_end
+        )
         if bootstrap_argv is not None:
             return _gateway_command_subcommand_from_tokens(
                 bootstrap_argv, hermes_entrypoint_inferred=True
