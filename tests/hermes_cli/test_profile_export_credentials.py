@@ -212,6 +212,7 @@ class TestExportSecretScrub:
             f"SERVICE_TOKEN={opaque}\n"
             f'curl -H "Authorization: Bearer {_LEAKED_KEY}" https://api.example.test\n'
             f'curl -H "X-API-Key: {_LEAKED_KEY}" https://api.example.test\n'
+            f'curl -H "Authorization: Bearer token,{opaque}" https://api.example.test\n'
         )
 
         skill_dir = profile_dir / "skills" / "demo"
