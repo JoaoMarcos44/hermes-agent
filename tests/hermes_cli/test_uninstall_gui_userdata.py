@@ -154,7 +154,6 @@ def test_keep_data_completion_reports_preserved_desktop_userdata(
     assert (userdata / "connections.json").exists()
 
 
-
 def test_userdata_probe_failure_does_not_skip_gui_cleanup(
     uninstall_env, monkeypatch
 ):
