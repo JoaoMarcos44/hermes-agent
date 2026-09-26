@@ -810,6 +810,13 @@ _TERMINAL_SUMMARY_FAILURES = (
 # capped request after its per-turn attempt budget was refilled (#69637).
 _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
 
+# A summary overload is worth retrying without data loss, but an unbounded sequence of
+# terminal overload aborts grows the transcript until compression_exhausted makes the
+# gateway reset the whole session (#123167). Keep a small retry budget, then degrade to
+# the existing deterministic fallback. The streak is durable per session because gateway
+# and API paths can construct a fresh ContextCompressor for the same conversation.
+_CONSECUTIVE_OVERLOAD_ABORT_ESCALATION = 3
+
 
 def _next_timeout_cooldown(compressor: Any, counter: str = "_consecutive_timeout_failures") -> int:
     """Bump ``compressor.<counter>`` and return the ladder rung for it.
@@ -2205,6 +2212,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # named in the user-visible warning and falls back to the main model (#116472).
         self._last_aux_resolved_model = None
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
+        self._consecutive_overload_aborts = 0
+        self._last_summary_overload_degraded = False
         # Turns unrecoverably dropped by a static fallback, so callers can warn.
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = self._last_feasibility_skip = False
@@ -2240,11 +2249,14 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._cooldown_persist_failed = False
         self._last_summary_error = None
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = self._fallback_compression_streak = 0
+        self._consecutive_overload_aborts = 0
+        self._last_summary_overload_degraded = False
         self._ineffective_compression_count = self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = self._structural_no_op_backoff_until = 0.0
         self._reset_proactive_prune_rearm()
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
+        self._load_overload_abort_streak()
         self._load_ineffective_compression_count()
         self._load_anti_thrash_recovery_deadline()
         self._load_proactive_prune_rearm_tokens()
@@ -2256,6 +2268,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         old_session_id = kwargs.get("old_session_id")
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
         previous_fallback_streak = self._fallback_compression_streak
+        previous_overload_streak = self._consecutive_overload_aborts
         previous_ineffective_count = self._ineffective_compression_count
         if boundary_reason == "compression" and old_session_id:
             # Parent row carries the streak/strike state across the rotation.
@@ -2269,10 +2282,17 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             previous_ineffective_count = _parent(
                 "get_compression_ineffective_count", "compression parent ineffective count", previous_ineffective_count,
             )
+            previous_overload_streak = _parent(
+                "get_compression_overload_abort_streak", "compression parent overload streak", previous_overload_streak,
+            )
         self.bind_session_state(session_db, session_id)
         if boundary_reason == "compression":
             # Rotation creates a fresh child row first; carry the streak until boundary bookkeeping persists it.
             self._fallback_compression_streak = previous_fallback_streak
+            # A compression rotation creates a fresh child row. Carry the overload budget so a
+            # session-id boundary cannot launder a sustained outage back to attempt one (#123167).
+            if self._consecutive_overload_aborts != previous_overload_streak:
+                self._set_overload_abort_streak(previous_overload_streak)
             # No later bookkeeping writes the strike counter, so persist it onto the child row now (#54923).
             if self._ineffective_compression_count != previous_ineffective_count:
                 self._ineffective_compression_count = previous_ineffective_count
@@ -2337,6 +2357,40 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     def _persist_fallback_compression_streak(self) -> None:
         self._durable_write("set_compression_fallback_streak", "compression fallback streak", self._fallback_compression_streak)
+
+    def _load_overload_abort_streak(self) -> None:
+        """Restore the per-session sustained-overload budget across fresh agents/restarts."""
+        self._load_durable(
+            "_consecutive_overload_aborts", "get_compression_overload_abort_streak",
+            "compression overload abort streak", int, 0,
+        )
+
+    def _set_overload_abort_streak(self, streak: int) -> None:
+        """Update the local overload budget and mirror it durably when a session is bound."""
+        self._consecutive_overload_aborts = max(0, int(streak))
+        self._durable_write(
+            "set_compression_overload_abort_streak", "compression overload abort streak",
+            self._consecutive_overload_aborts,
+        )
+
+    def _increment_overload_abort_streak(self) -> int:
+        """Atomically bump the durable streak when SessionDB supports it; otherwise stay local."""
+        increment = getattr(getattr(self, "_session_db", None), "increment_compression_overload_abort_streak", None)
+        session_id = getattr(self, "_session_id", "")
+        if session_id and callable(increment):
+            try:
+                streak = max(0, int(increment(session_id)))
+                self._consecutive_overload_aborts = streak
+                return streak
+            except Exception as exc:
+                logger.debug("compression overload abort streak increment failed: %s", exc)
+        self._consecutive_overload_aborts = max(0, int(getattr(self, "_consecutive_overload_aborts", 0))) + 1
+        # Legacy/custom SessionDB implementations may expose only the setter.
+        self._durable_write(
+            "set_compression_overload_abort_streak", "compression overload abort streak",
+            self._consecutive_overload_aborts,
+        )
+        return self._consecutive_overload_aborts
 
     def _load_ineffective_compression_count(self) -> None:
         """Load the durable anti-thrash strike count so a restart never disarms a guard."""
@@ -3904,6 +3958,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             self._last_summary_error = None
             for flag, _class, _msg in _TERMINAL_SUMMARY_FAILURES:
                 setattr(self, flag, False)
+            # A healthy LLM summary ends the sustained-overload sequence, including its
+            # durable copy so a later fresh compressor receives a fresh retry budget.
+            if self._consecutive_overload_aborts:
+                self._set_overload_abort_streak(0)
             return self._with_summary_prefix(summary)
         except Exception as e:
             return self._on_summary_failure(e, turns_to_summarize, focus_topic, memory_context)
@@ -4118,7 +4176,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         elif kind.empty_content:
             self._last_summary_empty_content_failure = True
         elif kind.overloaded:
-            self._last_summary_overload_failure = True
+            streak = self._increment_overload_abort_streak()
+            self._last_summary_overload_failure = streak < _CONSECUTIVE_OVERLOAD_ABORT_ESCALATION
+            self._last_summary_overload_degraded = not self._last_summary_overload_failure
         logger.warning(
             "Failed to generate context summary: %s. Further summary attempts paused for %d seconds.", e,
             _transient_cooldown,
@@ -4996,6 +5056,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
         self._last_compress_refused_would_grow = False
+        self._last_summary_overload_degraded = False
         self._last_compression_made_progress = False
         # Do NOT reset the *_failure flags: the cooldown early-return doesn't re-assert them, so a
         # reset would fall through to the destructive static fallback (#29559). Success clears them.
@@ -5142,7 +5203,9 @@ Write only the summary body. Do not include any preamble or prefix."""
         telemetry["fallback_used"] = True
         # Feasibility skip is deliberate, not aux-model breakage — keep the telemetry class distinct.
         telemetry["failure_class"] = telemetry.get("failure_class") or (
-            "feasibility_skip" if feasibility_skip else "summary_generation_failed"
+            "feasibility_skip" if feasibility_skip
+            else "summary_overload_degraded" if getattr(self, "_last_summary_overload_degraded", False)
+            else "summary_generation_failed"
         )
         return self._build_static_fallback_summary(
             turns_to_summarize,

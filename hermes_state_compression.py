@@ -71,6 +71,9 @@ def _claim_lease_row(conn, table: str, key_col: str, key: str, holder: str, now:
     return owner is not None and owner["holder"] == holder, reclaimed_holder
 
 
+_COMPRESSION_OVERLOAD_ABORT_STREAK_KEY = "_compression_overload_abort_streak"
+
+
 class SessionCompressionMixin:
     """Compression lineage, cooldown/streak counters, locks and turn leases."""
 
@@ -404,6 +407,61 @@ class SessionCompressionMixin:
         """Persist the deterministic-fallback streak for one session."""
         if session_id:
             self._write_session_column("compression_fallback_streak", session_id, max(0, int(streak)))
+
+    def get_compression_overload_abort_streak(self, session_id: str) -> int:
+        """Return the persisted sustained-summary-overload abort streak."""
+        if not session_id:
+            return 0
+        try:
+            value = self.get_session_model_config_value(
+                session_id, _COMPRESSION_OVERLOAD_ABORT_STREAK_KEY, 0,
+            )
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_compression_overload_abort_streak(self, session_id: str, streak: int) -> None:
+        """Persist the overload streak without adding another sessions-table migration."""
+        if not session_id:
+            return
+        value = max(0, int(streak))
+        self.patch_session_model_config(
+            session_id, {_COMPRESSION_OVERLOAD_ABORT_STREAK_KEY: value or None},
+        )
+
+    def increment_compression_overload_abort_streak(self, session_id: str) -> int:
+        """Atomically increment the overload streak and return the new value.
+
+        Fresh agents can bind the same session on successive or concurrent turns, so a
+        read-then-write in ContextCompressor would lose increments. Keep read/merge/write
+        inside one SessionDB write transaction instead.
+        """
+        if not session_id:
+            return 0
+
+        def _do(conn):
+            row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                return 0
+            try:
+                config = json.loads(row[0]) if row[0] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                config = {}
+            if not isinstance(config, dict):
+                config = {}
+            try:
+                current = max(0, int(config.get(_COMPRESSION_OVERLOAD_ABORT_STREAK_KEY, 0) or 0))
+            except (TypeError, ValueError):
+                current = 0
+            current += 1
+            config[_COMPRESSION_OVERLOAD_ABORT_STREAK_KEY] = current
+            conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (json.dumps(config), session_id),
+            )
+            return current
+
+        return int(self._execute_write(_do) or 0)
 
     def get_compression_ineffective_count(self, session_id: str) -> int:
         """Persisted ineffective-compaction strike count — the durable half of the built-in
