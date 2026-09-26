@@ -18,8 +18,10 @@ def _tool():
 
 
 def _server(name, cfg):
+    from tools.mcp_tool_connection_identity import resolved_connection_identity
     return SimpleNamespace(name=name, session=object(), _config=cfg, _tools=[_tool()], tool_timeout=30,
-                           initialize_result=None, _registered_tool_names=[], _sampling=None)
+                           initialize_result=None, _registered_tool_names=[], _sampling=None,
+                           _resolved_identity=resolved_connection_identity(name, cfg))
 
 
 @pytest.fixture
@@ -148,6 +150,52 @@ def test_same_named_server_with_other_mtls_identity_is_a_separate_connection(two
     two_profiles("b")
     reg.register_connected_into_current_scope({"x": cfg_b})
     assert "x" in disc._select_new_servers({"x": cfg_b})
+
+
+@pytest.mark.parametrize("policy", [{"ssl_verify": False}, {"strict_redirect_headers": True}])
+def test_cross_profile_share_refuses_on_connection_policy_differences(two_profiles, policy):
+    """``ssl_verify`` and ``strict_redirect_headers`` shape the live connection: a profile must
+    never inherit another profile's TLS-verification or redirect-header policy through adoption."""
+    from tools import mcp_tool_discovery as disc
+    from tools import mcp_tool_registration as reg
+
+    cfg_a = {"url": "https://mcp.example/x", **policy}
+    cfg_b = {"url": "https://mcp.example/x"}
+
+    two_profiles("a")
+    srv_a = _server("x", cfg_a)
+    disc._adopt_server("x", srv_a)
+    srv_a._registered_tool_names = reg._register_server_tools("x", srv_a, cfg_a)
+
+    two_profiles("b")
+    assert reg.register_connected_into_current_scope({"x": cfg_b}) == 0
+    assert "x" in disc._select_new_servers({"x": cfg_b})
+
+
+def test_cross_profile_share_fails_closed_on_unresolvable_or_unrecorded_identity(two_profiles):
+    """A connection whose effective inputs cannot be resolved — or whose opener recorded no
+    identity digest — is never shared across profiles, and a failed resolution never raises."""
+    from tools import mcp_tool_discovery as disc
+    from tools import mcp_tool_registration as reg
+
+    # No executable to resolve: the effective inputs cannot be proven equal to anything.
+    unresolvable = {"command": ""}
+    two_profiles("a")
+    disc._adopt_server("x", _server("x", unresolvable))
+
+    two_profiles("b")
+    assert reg.register_connected_into_current_scope({"x": dict(unresolvable)}) == 0
+
+    # A live connection from before identity recording: resolvable on the adopter's side,
+    # but the opener kept no digest — sharing still refused.
+    cfg = {"url": "https://mcp.example/x"}
+    two_profiles("a")
+    srv_a = _server("x", cfg)
+    srv_a.__dict__.pop("_resolved_identity", None)
+    disc._adopt_server("x", srv_a)
+
+    two_profiles("b")
+    assert reg.register_connected_into_current_scope({"x": dict(cfg)}) == 0
 
 
 def test_owner_reload_reregisters_profiles_that_adopted_its_connection(two_profiles):

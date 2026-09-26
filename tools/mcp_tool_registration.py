@@ -410,33 +410,43 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
 
 def _connection_identity(config: dict) -> tuple:
     """What makes one live connection reusable for another profile: the route fingerprint PLUS
-    everything that authenticates it (``config_fingerprint`` deliberately excludes credentials so
-    the schema cache survives a token rotation). Two profiles pointing at the same URL with different
-    headers/env/auth/client certificates are two identities; borrowing across them would call tools
-    as the other user."""
+    everything that authenticates or secures it (``config_fingerprint`` deliberately excludes
+    credentials so the schema cache survives a token rotation). Two profiles pointing at the same
+    URL with different headers/env/auth/client certificates/TLS policy are two identities;
+    borrowing across them would call tools as the other user — or under the other profile's
+    ``ssl_verify`` / ``strict_redirect_headers`` policy."""
     from tools.mcp_schema_cache import config_fingerprint
 
     def _frozen(value):
         return json.dumps(value or {}, sort_keys=True, default=str)
 
     return (config_fingerprint(config), _frozen(config.get("env")), _frozen(config.get("headers")),
-            _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")))
+            _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")),
+            config.get("ssl_verify", True), bool(config.get("strict_redirect_headers")))
 
 
 def _auth_type(config: dict) -> str:
     return (config.get("auth") or "").lower().strip()
 
 
-def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False) -> bool:
-    """Whether *server* matches *config*, with OAuth connections never reusable across profiles.
-
-    OAuth credentials live in the owning profile's token storage rather than the static config,
-    so identical OAuth configs cannot prove that two profiles authenticate as the same account.
-    """
+def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False,
+                       resolved_identity: str | None = None) -> bool:
+    """Whether *server* matches *config*. The static config is only half the answer across
+    profiles: OAuth credentials live in the owning profile's token storage, and secret-source env,
+    the default cwd, the identity header and the live endpoint resolve per profile — so the
+    adopter must recompute what the connection would be opened with in its own scope
+    (*resolved_identity*, resolved by the caller outside the registry lock) and it must equal the
+    digest the connecting task recorded. A missing digest on either side refuses the share (fail
+    closed); same-profile matching never needs one."""
     if _connection_identity(getattr(server, "_config", {}) or {}) != _connection_identity(config):
         return False
+    if not cross_profile:
+        return True
     # Identities match, so both sides carry the same normalised auth type.
-    return not (cross_profile and _auth_type(config) == "oauth")
+    if _auth_type(config) == "oauth":
+        return False
+    recorded = getattr(server, "_resolved_identity", None)
+    return recorded is not None and resolved_identity is not None and recorded == resolved_identity
 
 
 def register_connected_into_current_scope(servers: dict) -> int:
@@ -470,6 +480,15 @@ def _register_connected_into_current_scope(servers: dict) -> int:
                    if scope in scopes and _key_name(key) not in servers}
     profile_servers = _config._load_mcp_config() if omitted else {}
 
+    # Resolving what a connection WOULD be opened with does file I/O (PATH lookup, secret scope,
+    # live endpoint) — do it once per judged name, outside the global registry lock. A name whose
+    # resolution fails maps to None and is never shared, without aborting the pass.
+    from tools.mcp_tool_connection_identity import resolved_connection_identity
+    resolved_ids: dict = {}
+    for name, config in list(servers.items()) + [(n, profile_servers.get(n)) for n in omitted]:
+        if config is not None and name not in resolved_ids:
+            resolved_ids[name] = resolved_connection_identity(name, config)
+
     with _core._lock:
         stale = []
         for key, scopes in _core._server_tool_scopes.items():
@@ -483,7 +502,8 @@ def _register_connected_into_current_scope(servers: dict) -> int:
             cross_profile = _key_scope(key) != scope
             if (config is None or not mcp_server_enabled(config) or server is None
                     or getattr(server, "session", None) is None
-                    or not _same_server_route(server, config, cross_profile=cross_profile)):
+                    or not _same_server_route(server, config, cross_profile=cross_profile,
+                                              resolved_identity=resolved_ids.get(name))):
                 stale.append(key)
     for key in stale:
         _remove_server_scope(key, scope)
@@ -495,10 +515,11 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         with _core._lock:
             if _server_key(name, scope, current=False) in _core._servers:
                 continue  # this profile has its own connection for the name
-            # Any other profile's live connection with the same route AND credentials is shareable.
+            # Any other profile's live connection with the same route AND resolved identity is shareable.
             shared = [(key, live) for key, live in _core._servers.items()
                       if _key_name(key) == name and getattr(live, "session", None) is not None
-                      and _same_server_route(live, config, cross_profile=True)]
+                      and _same_server_route(live, config, cross_profile=True,
+                                             resolved_identity=resolved_ids.get(name))]
         if not shared:
             continue
         key, server = shared[0]

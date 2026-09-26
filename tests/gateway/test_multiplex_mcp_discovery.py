@@ -174,8 +174,13 @@ async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
         get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")),
     )
 
+    # Premise is reload reporting, not identity: both profiles resolve the connection's inputs
+    # identically, so the fake carries the shared digest the adopter recomputes.
+    monkeypatch.setattr("tools.mcp_tool_connection_identity.resolved_connection_identity",
+                        lambda name, cfg: "shared-identity")
     live_server = SimpleNamespace(session=object(), _config={}, _tools=[], tool_timeout=30,
-                                  initialize_result=None, _registered_tool_names=[])
+                                  initialize_result=None, _registered_tool_names=[],
+                                  _resolved_identity="shared-identity")
     monkeypatch.setattr(mcp_tool, "_servers", {"shared": live_server})
     monkeypatch.setattr(mcp_tool, "_server_scope_keys", {"shared": launch_scope})
     monkeypatch.setattr(mcp_tool, "_server_tool_scopes", {"shared": {launch_scope}}, raising=False)
@@ -260,6 +265,10 @@ def test_shared_server_tools_are_callable_and_removed_on_non_owner_reload(
         inputSchema={"type": "object", "properties": {}},
         annotations=None,
     )
+    # Premise is scope cleanup, not identity: both profiles resolve the connection's inputs
+    # identically, so the fake carries the shared digest the adopter recomputes.
+    monkeypatch.setattr("tools.mcp_tool_connection_identity.resolved_connection_identity",
+                        lambda name, cfg: "shared-identity")
     server = SimpleNamespace(
         name="shared",
         session=object(),
@@ -268,6 +277,7 @@ def test_shared_server_tools_are_callable_and_removed_on_non_owner_reload(
         _registered_tool_names=[],
         _config={},
         initialize_result=None,
+        _resolved_identity="shared-identity",
     )
     owner_tool_name = "mcp__shared__echo"
     registry.register(

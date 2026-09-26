@@ -11,8 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Dict, Optional, Set
 from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
-from agent import runtime_cwd as _runtime_cwd
-from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
+from tools.mcp_tool_errors import NonMcpEndpointError, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
 from tools.mcp_tool_lifecycle import _filter_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_config as _config
@@ -313,19 +312,13 @@ class MCPServerTransportMixin:
         if not _core._ensure_mcp_sdk():
             raise ImportError(f"MCP server '{self.name}' requires the 'mcp' Python SDK, but "
                               "it is not installed. Run `hermes setup` to install MCP support, then retry.")
-        command = config.get("command")
-        if not command:
-            raise ValueError(f"MCP server '{self.name}' has no 'command' in config")
-        command, safe_env = _config._resolve_stdio_command(command, _config._build_safe_env(config.get("env")))
+        # Effective inputs come from the shared resolver so the recorded identity digest is
+        # definitionally what the child is spawned with (see tools/mcp_tool_connection_identity).
+        from tools.mcp_tool_connection_identity import effective_stdio_inputs, stdio_identity
+        command, args, safe_env, stdio_cwd = effective_stdio_inputs(self.name, config)
+        self._resolved_identity = stdio_identity(command, args, safe_env, stdio_cwd)
         # OSV malware preflight, then the cached-npx swap (ordering enforced there).
-        command, args = await _core._preflight_stdio_command(self.name, command, config.get("args", []))
-        # A stdio child inherits this process's cwd when none is configured. Hosted sessions (ACP,
-        # gateway) pin a logical cwd via agent.runtime_cwd; without it the child resolves relative
-        # paths against the daemon's launch dir, not the session workspace. Explicit config always
-        # wins; an existing session/TERMINAL_CWD anchor becomes the default; else native (None).
-        stdio_cwd = config.get("cwd")
-        if stdio_cwd is None:
-            stdio_cwd = _runtime_cwd.resolve_context_cwd() or None
+        command, args = await _core._preflight_stdio_command(self.name, command, args)
         server_params = _core.StdioServerParameters(
             command=command, args=args, env=safe_env or None, cwd=stdio_cwd,
             # Windows pipes can split non-UTF-8 bytes at chunk boundaries; substitute, don't raise.
@@ -528,22 +521,14 @@ class MCPServerTransportMixin:
             raise ImportError(f"MCP server '{self.name}' requires HTTP transport but "
                               "mcp.client.streamable_http is not available. "
                               "Upgrade the mcp package to get HTTP support.")
-        url = config["url"]
-        headers = dict(config.get("headers") or {})
-        live = _live_endpoint(self.name)
-        if live is not None:
-            url, live_headers = live
-            headers.update(live_headers)
+        # Effective inputs come from the shared resolver so the recorded identity digest is
+        # definitionally the URL/headers the transport connects with (live endpoint and identity
+        # header included; see tools/mcp_tool_connection_identity).
+        from tools.mcp_tool_connection_identity import effective_http_inputs, http_identity
+        url, headers, configured_header_names = effective_http_inputs(self.name, config)
+        self._resolved_identity = http_identity(url, headers)
         logger.debug("MCP server '%s': connecting to %s", self.name, url)
         self._http_rejection = {}  # last 4xx/5xx the owned client saw this attempt (recorder hook)
-        # Agent Plugins v1 strict_redirect_headers: configured headers MUST NOT follow a cross-origin
-        # redirect — capture their names BEFORE client-generated headers are merged in.
-        configured_header_names = {key.lower() for key in headers}
-        headers = _apply_identity_header(self.name, config, headers)  # explicit same-name headers win
-        # Seed MCP-Protocol-Version (user override wins) from the HANDSHAKE version, not the latest: a
-        # 2026-07-28 header routes the handshake-era ``initialize()`` onto the envelope ladder, which rejects it.
-        if not any(key.lower() == "mcp-protocol-version" for key in headers):
-            headers["mcp-protocol-version"] = _core.LATEST_HANDSHAKE_VERSION
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
         common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
                   self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))
