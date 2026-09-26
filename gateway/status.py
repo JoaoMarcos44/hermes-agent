@@ -702,6 +702,17 @@ def _literal_sys_argv_from_source(source: str) -> list[str] | None:
                 continue
         elif not _hermes_argv0(target):
             continue
+        # runpy only executes Hermes' CLI entrypoint when the producer runs it as __main__.
+        # Without this, an introspection/import helper such as
+        # runpy.run_module("hermes_cli.main") is mistaken for a live gateway and can become a
+        # termination target even though hermes_cli.main's __main__ guard never ran.
+        if not any(
+            keyword.arg == "run_name"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "__main__"
+            for keyword in call.keywords
+        ):
+            continue
         launch_position = (statement.lineno, statement.col_offset)
 
     if (
@@ -766,6 +777,12 @@ def _runtime_bootstrap_argv(
             and call.args
             and isinstance(call.args[0], ast.Constant)
             and call.args[0].value == "hermes_cli.main"
+            and any(
+                keyword.arg == "run_name"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "__main__"
+                for keyword in call.keywords
+            )
             and any(
                 keyword.arg == "alter_sys"
                 and isinstance(keyword.value, ast.Constant)
