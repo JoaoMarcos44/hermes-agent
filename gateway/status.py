@@ -613,6 +613,17 @@ def _hermes_argv0(value: str) -> bool:
     )
 
 
+def _looks_like_python_interpreter(value: str) -> bool:
+    """Whether value names a Python/PyPy interpreter, not merely another -c runtime."""
+    basename = value.replace("\\", "/").lower().rsplit("/", 1)[-1].removesuffix(".exe")
+    for stem in ("pythonw", "python", "pypyw", "pypy"):
+        if not basename.startswith(stem):
+            continue
+        suffix = basename[len(stem):]
+        return not suffix or re.fullmatch(r"\d+(?:\.\d+)*(?:t)?", suffix) is not None
+    return False
+
+
 def _literal_sys_argv_from_source(source: str) -> list[str] | None:
     """Literal sys.argv used by a Hermes relaunch source that actually executes the entrypoint."""
     if len(source) > 32_768:
@@ -739,28 +750,101 @@ def _runtime_bootstrap_argv(
     return None
 
 
-def _published_inline_bootstrap_argv(
-    cased_tokens: list[str], flag_index: int, source_end: int
-) -> list[str] | None:
-    """Lifecycle argv after the generated .hermes/bin/hermes launcher source."""
-    tail = cased_tokens[flag_index + 1:source_end]
-    source = " ".join(tail).lower()
-    # Process APIs flatten this multiline source, so indentation is unavailable for an AST parse.
-    # Require its producer-specific fingerprint rather than trusting a runpy/main substring.
-    required = (
-        "import os, re, sys",
-        "os.environ.pop('pythonhome', none)",
-        "from hermes_constants import get_default_hermes_root",
-        "import hermes_bootstrap",
-        "from hermes_cli.main import main",
-        "sys.argv[0] = re.sub",
-        "sys.exit(main())",
-    )
-    if not all(marker in source for marker in required):
+_PUBLISHED_LAUNCHER_MARKERS = (
+    "import os, re, sys",
+    "os.environ.pop('pythonhome', none)",
+    "from hermes_constants import get_default_hermes_root",
+    "import hermes_bootstrap",
+    "from hermes_cli.main import main",
+    "sys.argv[0] = re.sub",
+    "sys.exit(main())",
+)
+
+
+def _published_launcher_source_matches(source: str) -> bool:
+    """Match the generated launcher program in order, with main() as its terminal action."""
+    lowered = source.lower().strip()
+    cursor = 0
+    for marker in _PUBLISHED_LAUNCHER_MARKERS:
+        position = lowered.find(marker, cursor)
+        if position < 0:
+            return False
+        cursor = position + len(marker)
+    return lowered.endswith("sys.exit(main())")
+
+
+def _decoded_published_launcher_source(source: str) -> str | None:
+    """Decode the exact Windows command-file fallback wrapper around _launcher_script."""
+    if len(source) > 128_000:
         return None
+    try:
+        tree = ast.parse(source)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
+        return None
+    if len(tree.body) != 2:
+        return None
+
+    import_stmt, exec_stmt = tree.body
+    if not (
+        isinstance(import_stmt, ast.Import)
+        and len(import_stmt.names) == 1
+        and import_stmt.names[0].name == "base64"
+        and import_stmt.names[0].asname is None
+        and isinstance(exec_stmt, ast.Expr)
+        and isinstance(exec_stmt.value, ast.Call)
+        and isinstance(exec_stmt.value.func, ast.Name)
+        and exec_stmt.value.func.id == "exec"
+        and len(exec_stmt.value.args) == 1
+        and not exec_stmt.value.keywords
+    ):
+        return None
+
+    decode_call = exec_stmt.value.args[0]
+    if not (
+        isinstance(decode_call, ast.Call)
+        and isinstance(decode_call.func, ast.Attribute)
+        and isinstance(decode_call.func.value, ast.Name)
+        and decode_call.func.value.id == "base64"
+        and decode_call.func.attr == "b64decode"
+        and len(decode_call.args) == 1
+        and not decode_call.keywords
+        and isinstance(decode_call.args[0], ast.Constant)
+        and isinstance(decode_call.args[0].value, str)
+    ):
+        return None
+
+    try:
+        import base64
+        decoded = base64.b64decode(
+            decode_call.args[0].value, validate=True
+        ).decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return decoded if _published_launcher_source_matches(decoded) else None
+
+
+def _published_inline_bootstrap_argv(
+    raw_tokens: list[str], cased_tokens: list[str], flag_index: int, source_end: int
+) -> list[str] | None:
+    """Lifecycle argv after the generated launcher, direct or Windows command-file fallback."""
+    # Native/POSIX process listings flatten the generated multiline source. Indentation is
+    # unavailable for an AST parse, so match the producer fingerprint in order and require the
+    # terminal main() call before treating the following tokens as argv.
     for position in range(flag_index + 1, source_end):
-        if "sys.exit(main())" in cased_tokens[position].lower():
+        if "sys.exit(main())" not in cased_tokens[position].lower():
+            continue
+        source = " ".join(cased_tokens[flag_index + 1:position + 1])
+        if _published_launcher_source_matches(source):
             return cased_tokens[position + 1:source_end]
+
+    # Windows can publish a .cmd fallback whose -c source is a base64/exec wrapper. Reconstruct
+    # progressive prefixes because _read_process_cmdline joins argv and loses the source boundary.
+    for end in range(flag_index + 2, source_end + 1):
+        source = " ".join(raw_tokens[flag_index + 1:end]).strip()
+        if len(source) >= 2 and source[0] == source[-1] and source[0] in {"'", '"'}:
+            source = source[1:-1]
+        if _decoded_published_launcher_source(source) is not None:
+            return cased_tokens[end:source_end]
     return None
 
 
@@ -771,7 +855,9 @@ def _hermes_inline_bootstrap_argv(
     runtime = _runtime_bootstrap_argv(raw_tokens, cased_tokens, flag_index, source_end)
     if runtime is not None:
         return runtime
-    return _published_inline_bootstrap_argv(cased_tokens, flag_index, source_end)
+    return _published_inline_bootstrap_argv(
+        raw_tokens, cased_tokens, flag_index, source_end
+    )
 
 
 def _gateway_command_subcommand_from_tokens(
@@ -842,6 +928,12 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
 
     flag_index = inline_source_flag_index(cased_tokens)
     if flag_index is not None:
+        # This path is acceptance-capable now, so argv[0] must be an actual Python/PyPy
+        # interpreter. Keeping the old broad -c detection here would let bash/node/etc. donate
+        # Python-looking source as process identity.
+        if not _looks_like_python_interpreter(cased_tokens[0]):
+            return None
+
         # Keep inspection inside this interpreter's source region. A restart watcher can carry a
         # second Python -c launcher as trailing data; only that child may claim its markers.
         source_end = _nested_inline_source_start(cased_tokens, flag_index)
