@@ -654,6 +654,49 @@ def _python_inline_source_flag_index(cased_tokens: list[str]) -> int | None:
     return None
 
 
+def _runtime_bootstrap_source_matches(source: str) -> bool:
+    """Whether source is the executable bootstrap emitted by runtime_command()."""
+    if len(source) > 32_768:
+        return False
+    try:
+        tree = ast.parse(source)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
+        return False
+
+    imported_bootstrap = any(
+        isinstance(statement, ast.Import)
+        and any(alias.name == "hermes_bootstrap" for alias in statement.names)
+        for statement in tree.body
+    )
+    if not imported_bootstrap or not tree.body:
+        return False
+
+    statement = tree.body[-1]
+    call = statement.value if isinstance(statement, ast.Expr) else None
+    return bool(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "runpy"
+        and call.func.attr == "run_module"
+        and len(call.args) == 1
+        and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == "hermes_cli.main"
+        and any(
+            keyword.arg == "run_name"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "__main__"
+            for keyword in call.keywords
+        )
+        and any(
+            keyword.arg == "alter_sys"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in call.keywords
+        )
+    )
+
+
 def _literal_sys_argv_from_source(source: str) -> list[str] | None:
     """Literal argv from the exact relaunch/redirector program shapes Hermes emits.
 
@@ -724,11 +767,30 @@ def _literal_sys_argv_from_source(source: str) -> list[str] | None:
     ):
         return None
     argv = list(value)
-    if not _hermes_argv0(argv[0]):
-        return None
 
     launch_stmt = body[index + 1]
     call = launch_stmt.value if isinstance(launch_stmt, ast.Expr) else None
+
+    # When hermes_bootstrap refreshes dependencies from an existing python -c launcher,
+    # relaunch_command() preserves sys.argv[0] == "-c" and terminally execs that launcher's
+    # original source. This is still the same in-process gateway, but only when the exec literal
+    # is itself one of Hermes' supported inline launcher producers.
+    if argv[0] == "-c":
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "exec"
+            and len(call.args) == 1
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+            and not call.keywords
+            and _relaunch_exec_source_is_hermes(call.args[0].value)
+        ):
+            return None
+        return argv
+
+    if not _hermes_argv0(argv[0]):
+        return None
     if not (
         isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
@@ -783,44 +845,8 @@ def _runtime_bootstrap_argv(
         source = " ".join(raw_tokens[flag_index + 1:end]).strip()
         if len(source) >= 2 and source[0] == source[-1] and source[0] in {"'", '"'}:
             source = source[1:-1]
-        try:
-            tree = ast.parse(source)
-        except (MemoryError, RecursionError, SyntaxError, ValueError):
-            continue
-
-        imported_bootstrap = any(
-            isinstance(statement, ast.Import)
-            and any(alias.name == "hermes_bootstrap" for alias in statement.names)
-            for statement in tree.body
-        )
-        if not imported_bootstrap or not tree.body:
-            continue
-        statement = tree.body[-1]
-        call = statement.value if isinstance(statement, ast.Expr) else None
-        if not (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "runpy"
-            and call.func.attr == "run_module"
-            and call.args
-            and isinstance(call.args[0], ast.Constant)
-            and call.args[0].value == "hermes_cli.main"
-            and any(
-                keyword.arg == "run_name"
-                and isinstance(keyword.value, ast.Constant)
-                and keyword.value.value == "__main__"
-                for keyword in call.keywords
-            )
-            and any(
-                keyword.arg == "alter_sys"
-                and isinstance(keyword.value, ast.Constant)
-                and keyword.value.value is True
-                for keyword in call.keywords
-            )
-        ):
-            continue
-        return cased_tokens[end:source_end]
+        if _runtime_bootstrap_source_matches(source):
+            return cased_tokens[end:source_end]
     return None
 
 
@@ -977,6 +1003,15 @@ def _decoded_published_launcher_source(source: str) -> str | None:
         return None
     return decoded if _published_launcher_source_matches(decoded) else None
 
+
+
+def _relaunch_exec_source_is_hermes(source: str) -> bool:
+    """Whether relaunch_command's exec literal replays a supported Hermes inline launcher."""
+    return (
+        _runtime_bootstrap_source_matches(source)
+        or _published_launcher_source_matches(source)
+        or _decoded_published_launcher_source(source) is not None
+    )
 
 def _published_inline_bootstrap_argv(
     raw_tokens: list[str], cased_tokens: list[str], flag_index: int, source_end: int
