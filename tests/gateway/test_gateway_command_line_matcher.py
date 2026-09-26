@@ -9,6 +9,7 @@ process and ``status``/``start`` report false positives.
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,73 @@ HERMES_INLINE_GATEWAYS_BY_ROOT = [
     for root in ("/opt/hermes", "/opt/hermes-gateway", "/srv/hermes")
 ]
 
+
+def _windows_cmd_fallback_gateway() -> str:
+    """Reproduce mint_launcher's real base64/exec .cmd fallback without requiring Windows."""
+    source = _launcher_script("hermes", Path("/opt/My Hermes"), None)
+    encoded = base64.b64encode(source.encode("utf-8")).decode("ascii")
+    code = f"import base64; exec(base64.b64decode('{encoded}'))"
+    return _flatten(
+        [
+            r"C:\Program Files\Python\python.exe",
+            "-I",
+            "-c",
+            code,
+            "gateway",
+            "run",
+        ]
+    )
+
+
+def test_accepts_windows_command_file_fallback_launcher():
+    """The supported .cmd fallback executes the generated launcher source in-process."""
+    cmd = _windows_cmd_fallback_gateway()
+    assert matches(cmd) is True
+    assert matches_runtime(cmd) is True
+    assert spawn_intent(cmd) == "run"
+
+
+def test_non_python_inline_runtime_cannot_donate_gateway_identity():
+    """Once inline launchers are acceptance-capable, a foreign -c runtime must stay anonymous."""
+    cmd = (
+        "bash -c import sys, runpy; "
+        "sys.argv = ['/opt/hermes/hermes_cli/main.py', 'gateway', 'run']; "
+        "runpy.run_module('hermes_cli.main', run_name='__main__')"
+    )
+    assert matches(cmd) is False
+    assert matches_runtime(cmd) is False
+
+
+def test_inert_full_published_launcher_fingerprint_stays_anonymous():
+    """All marker strings as data are not equivalent to executing the generated launcher."""
+    cmd = (
+        "python -c import sys; "
+        "note = \"import os, re, sys; os.environ.pop('PYTHONHOME', None); "
+        "from hermes_constants import get_default_hermes_root; import hermes_bootstrap; "
+        "from hermes_cli.main import main; sys.argv[0] = re.sub; sys.exit(main())\"; "
+        "main = lambda: 0; sys.exit(main()) gateway run"
+    )
+    assert matches(cmd) is False
+    assert matches_runtime(cmd) is False
+
+
+def test_spaced_python_path_watcher_stays_anonymous_but_keeps_intent():
+    """psutil argv joining must not reopen #107002 when the outer interpreter path has spaces."""
+    future = _flatten(
+        runtime_command(
+            Path("/opt/hermes"),
+            ["gateway", "run", "--replace"],
+            python="python",
+        )
+    )
+    watcher = (
+        r"C:\Program Files\Python\python.exe -c "
+        "import time; time.sleep(1) 14980 "
+        + future
+    )
+    assert matches(watcher) is False
+    assert matches_runtime(watcher) is False
+    assert spawn_intent(watcher) == "run"
 
 
 @pytest.mark.parametrize("cmd", HERMES_INLINE_GATEWAYS)
