@@ -75,6 +75,21 @@ def _sql_json_extract(expression: str, path: str) -> str:
     return f"json_extract({safe_json}, {_sql_literal(path)})"
 
 
+def _sql_non_continuation_child_filter(child_prefix: str, parent_id_expr: str) -> str:
+    """SQL suffix that admits only a compression continuation edge.
+
+    Fork markers are meaningful only when they name this exact parent; a
+    continuation inherits model_config, so presence-only checks are incorrect.
+    """
+    markers = ("_branched_from", "_delegate_from", "_reset_from")
+    clauses = (
+        f"  AND COALESCE({_sql_json_extract(f'{child_prefix}model_config', f'$.{marker}')}, '')"
+        f" != {parent_id_expr}\n"
+        for marker in markers
+    )
+    return "".join((*clauses, f"  AND COALESCE({child_prefix}source, '') != 'tool'\n"))
+
+
 def _sql_ltrim_whitespace(expression: str) -> str:
     return f"LTRIM({expression}, {_SQL_WHITESPACE})"
 
