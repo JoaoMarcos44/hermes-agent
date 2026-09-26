@@ -5,6 +5,7 @@ import hashlib
 
 import logging
 import re
+import sqlite3
 from contextlib import nullcontext
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -296,6 +297,32 @@ def _db_flush_adopt_compression_tip(agent) -> bool:
     return True
 
 
+def _db_flush_recreate_missing_session(agent, error: Exception, retry_budget: int) -> bool:
+    """Recreate a vanished session parent after a proven transcript FK reject.
+
+    This stays at the agent boundary so the replacement row is rebuilt with the
+    agent's real source, routing identity, model config, prompt, and parent
+    metadata.  Raw SessionDB appenders keep their existing semantics.
+    """
+    if (
+        retry_budget <= 0
+        or not isinstance(error, sqlite3.IntegrityError)
+        or getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+    ):
+        return False
+
+    agent._session_db_created = False
+    agent._ensure_db_session()
+    if not agent._session_db_created:
+        return False
+
+    logger.warning(
+        "Recreated missing session row %s after transcript FK failure; retrying flush once",
+        agent.session_id,
+    )
+    return True
+
+
 def _db_flush_failed(agent, e: Exception, batch_rows: List[Dict[str, Any]], adoption_budget: int) -> bool:
     """Classify a failed flush; True when the caller should retry once on an adopted compression tip."""
     agent._db_flush_scan_prefix = None  # full re-scan next flush: an exception mid-loop leaves mixed dispositions
@@ -384,7 +411,8 @@ class SessionPersistenceMixin:
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
 
     def _flush_messages_to_session_db_unlocked(
-        self, messages: List[Dict], conversation_history: Optional[List[Dict]] = None, _adoption_budget: int = 1,
+        self, messages: List[Dict], conversation_history: Optional[List[Dict]] = None,
+        _adoption_budget: int = 1, _session_recreate_budget: int = 1,
     ):
         """Persist un-flushed messages to SQLite. Dedup is the intrinsic ``_DB_PERSISTED_MARKER`` on each written
         dict — not positional slices (drift after sequence repair) nor an ``id(msg)`` set (address reuse). The
@@ -406,6 +434,8 @@ class SessionPersistenceMixin:
         try:
             if not self._session_db_created:  # retry row creation if the earlier attempt failed transiently
                 self._ensure_db_session()
+                if not self._session_db_created:
+                    return False
             batch_rows, batch_msgs = _db_flush_collect(self, messages, conversation_history)
             _db_flush_write(self, batch_rows, batch_msgs, messages)
             # Markers are now the sole truth; reset the one-shot seed so no id() outlives this flush.
@@ -415,8 +445,16 @@ class SessionPersistenceMixin:
             self._db_flush_scan_prefix = messages[:]
             return True
         except Exception as e:
+            if _db_flush_recreate_missing_session(self, e, _session_recreate_budget):
+                return self._flush_messages_to_session_db_unlocked(
+                    messages, conversation_history,
+                    _adoption_budget=_adoption_budget, _session_recreate_budget=0,
+                )
             if _db_flush_failed(self, e, batch_rows, _adoption_budget):
-                return self._flush_messages_to_session_db_unlocked(messages, conversation_history, _adoption_budget=0)
+                return self._flush_messages_to_session_db_unlocked(
+                    messages, conversation_history,
+                    _adoption_budget=0, _session_recreate_budget=_session_recreate_budget,
+                )
             return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
