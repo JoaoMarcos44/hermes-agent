@@ -529,10 +529,12 @@ def delegate_task(
     # route that will actually start (it also handles parent inheritance and ACP/provider rewrites).
     # Current delegate_task has one batch route, so all children should agree. If a future per-task
     # router makes them differ, leave the batch-level fields alone for that feature to represent.
-    child_routes = {(getattr(child, "model", None), getattr(child, "provider", None))
-                    for _index, _task, child in children}
-    if len(child_routes) == 1:
-        effective_model, effective_provider = next(iter(child_routes))
+    child_routes = [
+        (getattr(child, "model", None), getattr(child, "provider", None))
+        for _index, _task, child in children
+    ]
+    if child_routes and all(route == child_routes[0] for route in child_routes[1:]):
+        effective_model, effective_provider = child_routes[0]
         update_manifest_route(live_deleg_id, model=effective_model, provider=effective_provider)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
