@@ -339,8 +339,7 @@ _PATH_OR_VAR_VALUE_RE = re.compile(rf"^(?:{_SHELL_VAR_REF}|\$\(|~|/)(?:[\w./:-]|
 # Exported source/templates contain credential references, not credential bytes. Treating
 # these as auth-header values corrupts executable code and skill instructions (#124523).
 _CODE_CREDENTIAL_PLACEHOLDER_RE = re.compile(
-    r"^(?:token|api[_-]?key|secret|password|credential|value|"
-    r"your[_-]?(?:token|api[_-]?key|secret|password))$",
+    r"^(?:token|api[_-]?key|your[_-]?(?:token|api[_-]?key|secret|password))$",
     re.IGNORECASE,
 )
 
@@ -348,7 +347,11 @@ _CODE_CREDENTIAL_PLACEHOLDER_RE = re.compile(
 def _is_credential_reference(value: str, *, allow_placeholders: bool = False) -> bool:
     """True for an explicit variable/template reference rather than secret bytes."""
     candidate = value.strip().rstrip("\"');")
-    candidate = candidate.split(",", 1)[0]
+    if "," in candidate:
+        first, remainder = candidate.split(",", 1)
+        if not re.fullmatch(r"[A-Za-z][\\w-]*:", remainder):
+            return False
+        candidate = first
     if re.fullmatch(_SHELL_VAR_REF, candidate):
         return True
     if re.fullmatch(r"\$env:[A-Za-z_]\w*", candidate, re.IGNORECASE):
@@ -362,7 +365,8 @@ def _is_credential_reference(value: str, *, allow_placeholders: bool = False) ->
 
 _SOURCE_CALL_VALUE_RE = re.compile(r"^[A-Za-z_$][\w.$]*(?:\([^()\r\n]*\))[,;]?$")
 _SOURCE_PLACEHOLDER_VALUE_RE = re.compile(
-    r"^(?:placeholder\b.*|example\b.*|ephemeral\b.*|generated\b.*)$",
+    r"^(?:placeholder|example|generated(?: at runtime)?|",
+    r"ephemeral(?:, generated(?: at runtime)?)?)$",
     re.IGNORECASE,
 )
 
