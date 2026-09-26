@@ -116,3 +116,22 @@ def test_complete_publication_preserves_links_and_retries(transfer, monkeypatch,
     if os.name == "posix":
         assert target.stat().st_mode & 0o777 == remote.stat().st_mode & 0o777
     assert set(host.parent.iterdir()) == {host, target, host.parent / "anchor.py"}
+
+@pytest.mark.platforms("linux")
+def test_complete_publication_preserves_destination_only_xattrs(transfer):
+    manager, host, remote, _observations = transfer
+    marker = "user.hermes_sync_back_local"
+    try:
+        os.setxattr(host, marker, b"keep-local-metadata")
+    except OSError as exc:
+        if exc.errno in {
+            getattr(errno, "ENOTSUP", 95),
+            getattr(errno, "EOPNOTSUPP", getattr(errno, "ENOTSUP", 95)),
+        }:
+            pytest.skip("test filesystem does not support user xattrs")
+        raise
+
+    manager.sync_back()
+
+    assert host.read_bytes() == remote.read_bytes()
+    assert os.getxattr(host, marker) == b"keep-local-metadata"

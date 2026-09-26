@@ -5,6 +5,7 @@ remote environments transactionally.  Used by SSH, Modal, and Daytona.
 Docker and Singularity use bind mounts (live host FS view) and don't need this.
 """
 
+import errno
 import hashlib
 import logging
 import os
@@ -12,6 +13,7 @@ import posixpath
 import shlex
 import shutil
 import signal
+import stat
 import tarfile
 import tempfile
 import threading
@@ -61,6 +63,50 @@ _SYNC_BACK_TEMP_PREFIX = "hermes-sync-back-"
 # most; the old 6 h window let a crash loop pile up tens of GB before anything was reclaimed.
 _SYNC_BACK_STALE_SECONDS = 30 * 60
 
+_XATTR_UNSUPPORTED_ERRNOS = frozenset({
+    getattr(errno, "ENOTSUP", 95),
+    getattr(errno, "EOPNOTSUPP", getattr(errno, "ENOTSUP", 95)),
+})
+_XATTR_GONE_ERRNOS = frozenset({
+    getattr(errno, "ENODATA", 61),
+    getattr(errno, "ENOATTR", getattr(errno, "ENODATA", 61)),
+})
+
+
+def _preserve_destination_only_xattrs(target: Path, prepared: Path) -> None:
+    """Carry local-only xattrs across the inode swap without overriding remote metadata.
+
+    ``shutil.copy2(src, existing_dst)`` leaves destination-only xattrs in place while
+    source xattrs with the same name win. Staging to a fresh inode would otherwise
+    silently drop that local metadata. Once a target reports xattrs, failure to carry
+    one aborts publication rather than replacing the live file with a lossy copy.
+    """
+    listxattr = getattr(os, "listxattr", None)
+    getxattr = getattr(os, "getxattr", None)
+    setxattr = getattr(os, "setxattr", None)
+    if listxattr is None or getxattr is None or setxattr is None:
+        return
+
+    try:
+        target_names = listxattr(target)
+    except OSError as exc:
+        if exc.errno in _XATTR_UNSUPPORTED_ERRNOS:
+            return
+        raise
+    if not target_names:
+        return
+
+    prepared_names = set(listxattr(prepared))
+    for name in target_names:
+        if name in prepared_names:
+            continue
+        try:
+            value = getxattr(target, name)
+        except OSError as exc:
+            if exc.errno in _XATTR_GONE_ERRNOS:
+                continue
+            raise
+        setxattr(prepared, name, value)
 
 def _sync_back_max_bytes() -> int:
     """Extraction cap; config.yaml ``terminal.sync_back_max_bytes`` overrides it for trees that
@@ -470,6 +516,12 @@ class FileSyncManager:
         with tempfile.TemporaryDirectory(prefix=".hermes-sync-", dir=target.parent) as copying:
             prepared = Path(copying) / "payload"
             shutil.copy2(staged_file, prepared)
+            if target.exists():
+                _preserve_destination_only_xattrs(target, prepared)
+                if os.name == "posix":
+                    # POSIX ACL xattrs can adjust mode bits. Match copy2's source-mode-last
+                    # contract before the atomic publication.
+                    os.chmod(prepared, stat.S_IMODE(os.stat(staged_file).st_mode))
             # Do not fall back to an in-place copy if publication is refused.
             os.replace(prepared, target)
             _restore_file_owner(target, owner)
