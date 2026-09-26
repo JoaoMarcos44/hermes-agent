@@ -338,11 +338,6 @@ _PATH_OR_VAR_VALUE_RE = re.compile(rf"^(?:{_SHELL_VAR_REF}|\$\(|~|/)(?:[\w./:-]|
 
 # Exported source/templates contain credential references, not credential bytes. Treating
 # these as auth-header values corrupts executable code and skill instructions (#124523).
-_CREDENTIAL_REFERENCE_RE = re.compile(
-    rf"^(?:{_SHELL_VAR_REF}|\\$env:[A-Za-z_]\\w*|%[A-Za-z_]\\w*%|"
-    r"(?:<[A-Za-z_][\\w.\\-]*>)(?::(?:<[A-Za-z_][\\w.\\-]*>))*)$",
-    re.IGNORECASE,
-)
 _CODE_CREDENTIAL_PLACEHOLDER_RE = re.compile(
     r"^(?:token|api[_-]?key|secret|password|credential|value|"
     r"your[_-]?(?:token|api[_-]?key|secret|password))$",
@@ -352,13 +347,18 @@ _CODE_CREDENTIAL_PLACEHOLDER_RE = re.compile(
 
 def _is_credential_reference(value: str, *, code_file: bool = False) -> bool:
     """True for an explicit variable/template reference rather than secret bytes."""
-    candidate = value.strip().rstrip('"';)')
-    # Header examples may continue with another comma-separated header. Only the first
-    # token occupies the credential position.
+    candidate = value.strip().rstrip("\\\"\';)")
     candidate = candidate.split(",", 1)[0]
-    if _CREDENTIAL_REFERENCE_RE.fullmatch(candidate):
+    if re.fullmatch(_SHELL_VAR_REF, candidate):
+        return True
+    if re.fullmatch(r"\$env:[A-Za-z_]\w*", candidate, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"%[A-Za-z_]\w*%", candidate):
+        return True
+    if re.fullmatch(r"(?:<[A-Za-z_][\w.\-]*>)(?::(?:<[A-Za-z_][\w.\-]*>))*", candidate):
         return True
     return bool(code_file and _CODE_CREDENTIAL_PLACEHOLDER_RE.fullmatch(candidate))
+
 # ``$VAR`` / ``$(cmd`` are unambiguous references. A ``/``- or ``~``-led value is a path only
 # while every segment reads like one: a 16+ char segment mixing case and digits with no ``.``
 # (``/wJalrXUtnFEMIK7MDENG/bPxRf…``) is a secret that happens to start with a path character,
@@ -969,6 +969,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _redact_assignments(text, mask_nonreusable=file_read)
 
     if "uthorization" in text or "UTHORIZATION" in text:  # cheapest gate over every casing
+
         def _auth_sub(m):
             credential = m.group(3)
             if _is_credential_reference(credential, code_file=code_file):
@@ -977,6 +978,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _AUTH_HEADER_RE.sub(_auth_sub, text)
 
     if ":" in text:
+
         def _secret_header_sub(m):
             credential = m.group(2)
             if _is_credential_reference(credential, code_file=code_file):

@@ -2147,6 +2147,7 @@ def _export_file_uses_source_redaction(staged: Path, path: Path) -> bool:
         return False
     return bool(rel.parts and rel.parts[0] in {"skills", "scripts"})
 
+
 def _scrub_export_secrets(staged: Path) -> None:
     """Force-redact secret-shaped strings in a staged export tree (same pass as ``hermes
     sessions export --redact``). Runs on the staged copy only; symlinks to text files are
