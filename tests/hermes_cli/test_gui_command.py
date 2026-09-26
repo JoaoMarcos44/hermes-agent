@@ -146,8 +146,6 @@ def _pack_into_staging(root: Path, content: str = "", returncode: int = 0):
     return _run
 
 
-
-
 def test_register_linux_desktop_entry_reports_legacy_retirement(tmp_path, monkeypatch, capsys):
     """A removed legacy launcher tells the user that an existing panel pin must be re-added."""
     from hermes_cli import linux_desktop_entry as lde
