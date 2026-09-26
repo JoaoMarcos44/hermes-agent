@@ -600,7 +600,7 @@ def custom_provider_pool_key_candidates_for_owner(
     if not normalized_url:
         return []
 
-    requested = str(provider_name or "").strip()
+    requested = provider_name.strip() if isinstance(provider_name, str) else ""
     requested_norm = _normalize_custom_pool_name(requested)
     if requested_norm not in {"", "custom", "auto"}:
         aliases = _requested_custom_name_aliases(requested)
@@ -633,6 +633,7 @@ def custom_provider_pool_key_candidates_for_owner(
         return unclaimed or []
 
     return custom_provider_pool_key_candidates(base_url)
+
 
 def get_custom_provider_pool_key(base_url: Optional[str], provider_name: Optional[str] = None) -> Optional[str]:
     """Preferred pool key for a custom provider: durable slug, else ``custom:<name>``.
@@ -771,7 +772,8 @@ def credential_pool_matches_provider(
     provider_norm = str(provider or "").strip().lower()
     if not pool_provider or not provider_norm:
         return False
-    owner_named = str(requested_provider or "").strip().lower() not in {"", "custom", "auto"}
+    requested_hint = requested_provider.strip().lower() if isinstance(requested_provider, str) else ""
+    owner_named = requested_hint not in {"", "custom", "auto"}
     owner_key = api_key.strip() if isinstance(api_key, str) else ""
     if provider_norm == "custom" and (owner_named or owner_key):
         try:

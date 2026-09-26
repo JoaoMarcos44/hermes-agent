@@ -2027,3 +2027,33 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_bare_custom_child_does_not_attach_same_url_sibling_pool():
+    endpoint = "https://shared.example/v1"
+    parent = _make_mock_parent()
+    parent.provider = "custom"
+    parent.requested_provider = "custom"
+    parent.base_url = endpoint
+    parent.api_key = "main-key-12345678"
+    parent._credential_pool = None
+    configured = [(
+        "second",
+        {
+            "name": "Second", "provider_key": "second",
+            "base_url": endpoint, "api_key": "second-key-12345678",
+        },
+    )]
+
+    with (
+        patch("agent.credential_pool._iter_custom_providers", return_value=configured),
+        patch("tools.delegate_tool_config._loaded_pool") as loaded,
+    ):
+        result = _resolve_child_credential_pool(
+            "custom", parent, endpoint,
+            effective_requested_provider="custom",
+            effective_api_key="main-key-12345678",
+        )
+
+    assert result is None
+    loaded.assert_not_called()

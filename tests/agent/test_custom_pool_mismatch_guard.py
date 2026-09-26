@@ -26,7 +26,9 @@ FIREWORKS_URL = "https://api.fireworks.ai/inference/v1"
 def _agent(provider, base_url, pool_provider):
     agent = MagicMock()
     agent.provider = provider
+    agent.requested_provider = provider
     agent.base_url = base_url
+    agent.api_key = ""
     pool = MagicMock()
     pool.provider = pool_provider
     agent._credential_pool = pool
@@ -162,3 +164,29 @@ class TestCustomPoolMismatchGuard:
         assert recovered is False
         assert not pool.method_calls
 
+
+
+def test_bare_custom_recovery_refuses_same_url_sibling_pool():
+    endpoint = "https://shared.example/v1"
+    agent, pool = _agent("custom", endpoint, "second")
+    agent.requested_provider = "custom"
+    agent.api_key = "main-key-12345678"
+    configured = [(
+        "second",
+        {
+            "name": "Second",
+            "provider_key": "second",
+            "base_url": endpoint,
+            "api_key": "second-key-12345678",
+        },
+    )]
+
+    with patch("agent.credential_pool._iter_custom_providers", return_value=configured):
+        recovered, retried = recover_with_credential_pool(
+            agent, status_code=401, has_retried_429=False,
+            classified_reason=FailoverReason.auth,
+        )
+
+    assert recovered is False
+    assert retried is False
+    assert not pool.method_calls

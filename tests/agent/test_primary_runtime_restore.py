@@ -715,3 +715,49 @@ class TestSwitchModelRequestOverridesSnapshot:
             result = agent._restore_primary_runtime()
         assert result is True
         assert agent.request_overrides == overrides
+
+
+def test_restore_bare_custom_does_not_reload_same_url_sibling_pool():
+    endpoint = "https://shared.example/v1"
+    main_key = "main-key-12345678"
+    sibling = MagicMock()
+    sibling.provider = "second"
+    sibling.has_available.return_value = True
+    sibling.has_credentials.return_value = True
+    sibling.select.return_value = MagicMock(
+        id="second-key", runtime_api_key="second-key-12345678",
+        access_token="second-key-12345678", base_url=endpoint,
+    )
+
+    agent = _make_agent(provider="custom", base_url=endpoint)
+    agent._primary_runtime.update({
+        "provider": "custom", "requested_provider": "custom",
+        "base_url": endpoint, "api_key": main_key,
+    })
+    agent._fallback_activated = True
+    fallback_pool = MagicMock()
+    fallback_pool.provider = "openrouter"
+    agent._credential_pool = fallback_pool
+    agent._swap_credential = MagicMock()
+    configured = [(
+        "second",
+        {
+            "name": "Second", "provider_key": "second",
+            "base_url": endpoint, "api_key": "second-key-12345678",
+        },
+    )]
+
+    def _load(key):
+        return sibling if key == "second" else None
+
+    with (
+        patch("agent.credential_pool._iter_custom_providers", return_value=configured),
+        patch("agent.credential_pool.load_pool", side_effect=_load) as load_pool,
+        patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+    ):
+        result = agent._restore_primary_runtime()
+
+    assert result is True
+    assert agent._credential_pool is None
+    assert all(call.args != ("second",) for call in load_pool.call_args_list)
+    agent._swap_credential.assert_not_called()
