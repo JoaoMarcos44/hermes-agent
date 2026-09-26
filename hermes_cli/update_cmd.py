@@ -690,8 +690,12 @@ def _pause_windows_gateways_before_mutation(completion_request: dict) -> dict | 
 
     Network discovery and git fetch leave the live source tree untouched, so
     keeping the gateway up through those fallible steps avoids an outage when
-    GitHub is temporarily unreachable (#123370).
+    GitHub is temporarily unreachable (#123370). Reuse an existing token when a
+    later recovery path crosses the same mutation boundary.
     """
+    existing = completion_request.get("windows_resume")
+    if existing is not None:
+        return existing
     token = _m()._pause_windows_gateways_for_update()
     completion_request["windows_resume"] = token
     if token:
@@ -1227,6 +1231,8 @@ def _handle_update_called_process_error(
         print(f"⚠ {stage}: {e}")
         print("→ Falling back to ZIP download...")
         print()
+        if completion_request is not None:
+            _pause_windows_gateways_before_mutation(completion_request)
         _update_via_zip(
             args, had_desktop_app_before_update=had_desktop_app_before_update,
             target_sha=target_sha, completion_request=completion_request,
