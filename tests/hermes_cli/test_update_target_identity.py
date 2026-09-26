@@ -236,11 +236,15 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
 
     monkeypatch.setattr(subprocess, 'run', guarded_run)
     if server == 'fetch-refused':
+        monkeypatch.setattr(
+            cli_main, '_pause_windows_gateways_for_update',
+            lambda: pytest.fail('gateway paused before the remote fetch succeeded'),
+        )
         with pytest.raises(SystemExit) as error:
             cli_main.cmd_update(t.args)
         assert error.value.code == 1
         assert git(t.clone, 'rev-parse', 'HEAD') == t.base
-        assert t.resumed
+        assert not t.resumed
         assert t.requests == []
     else:
         cli_main.cmd_update(t.args)

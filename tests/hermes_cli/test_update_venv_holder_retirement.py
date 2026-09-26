@@ -74,7 +74,7 @@ def test_gateway_ancestor_refusal_never_kills_unknown_ancestry(monkeypatch, gate
     forbidden.assert_not_called()
 
 
-def test_command_reaches_checkout_preparation_without_holder_gates(monkeypatch, tmp_path):
+def test_command_reaches_remote_preflight_without_pausing_gateway(monkeypatch, tmp_path):
     from hermes_cli import update_inventory
 
     class ReachedCheckout(BaseException):
@@ -107,6 +107,7 @@ def test_command_reaches_checkout_preparation_without_holder_gates(monkeypatch, 
     monkeypatch.setattr(update_cmd, "_prepare_git_command", prepare_checkout)
     with pytest.raises(ReachedCheckout):
         main.cmd_update(SimpleNamespace(gateway=False, check=False, yes=True, force=False, force_venv=False))
-    assert reached == ["backup", "pause", "checkout"]
+    # A failure before remote preflight completes must leave the gateway untouched (#123370).
+    assert reached == ["backup", "checkout"]
     forbidden.assert_not_called()
 

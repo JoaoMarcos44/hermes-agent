@@ -371,6 +371,48 @@ _FETCH_FAILURE_RULES = (
 )
 
 
+_TRANSIENT_FETCH_FAILURE_MARKERS = (
+    "could not resolve host",
+    "could not resolve proxy",
+    "failed to connect",
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "network is unreachable",
+    "recv failure",
+    "send failure",
+    "empty reply from server",
+    "early eof",
+    "remote end hung up unexpectedly",
+    "gnutls recv error",
+    "ssl connect error",
+    "tls connect error",
+    "http/2 stream",
+)
+
+
+def _is_transient_fetch_failure(stderr: str) -> bool:
+    """Whether a failed fetch is safe to retry as a short-lived transport/server failure.
+
+    Keep policy boundaries narrow: HTTP 429 is handled by #105870's rate-limit recovery,
+    authentication/host-key failures need user action, and the updater's own long-running
+    subprocess timeout is owned by #119118. This predicate covers failures where retrying the
+    same read-only fetch can reasonably succeed without changing local state (#123370).
+    """
+    text = stderr or ""
+    lowered = text.lower()
+    if _has_http_code(text, "429") or "rate limit" in lowered:
+        return False
+    if any(marker in lowered for marker in (
+        "authentication failed", "permission denied (publickey)", "host key verification failed",
+        "could not read username", "terminal prompts disabled",
+    )):
+        return False
+    return _has_http_code(text, "408", "500", "502", "503", "504") or any(
+        marker in lowered for marker in _TRANSIENT_FETCH_FAILURE_MARKERS
+    )
+
+
 def _classify_fetch_failure(stderr: str) -> str:
     """Map git-fetch stderr to a one-line diagnosis (caller also prints the raw first line)."""
     return next((message for matches, message in _FETCH_FAILURE_RULES if matches(stderr)), "✗ Failed to fetch updates from origin.")

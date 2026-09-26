@@ -7,6 +7,8 @@ classifier must call out rate limiting / outages explicitly, and the raw
 stderr line must always be printed alongside the diagnosis.
 """
 
+import subprocess
+
 from hermes_cli import update_cmd
 
 
@@ -155,3 +157,51 @@ def test_update_and_upstream_network_calls_disable_terminal_prompts(monkeypatch,
         assert env["GIT_ASKPASS"] == "fixture-askpass", args
         assert env["GIT_CONFIG_COUNT"] == "1", args
         assert env["GIT_CONFIG_VALUE_0"] == "fixture-helper", args
+
+
+class TestTransientFetchRetry:
+    def test_retry_classifier_is_narrow_and_does_not_duplicate_other_pr_owners(self):
+        assert update_cmd._is_transient_fetch_failure("fatal: Could not resolve host: github.com")
+        assert update_cmd._is_transient_fetch_failure("HTTP 503 Service Unavailable")
+        assert update_cmd._is_transient_fetch_failure("RPC failed; curl 56 Connection reset by peer")
+        assert not update_cmd._is_transient_fetch_failure(RATE_LIMIT_STDERR)  # #105870
+        assert not update_cmd._is_transient_fetch_failure("fatal: Authentication failed")
+        assert not update_cmd._is_transient_fetch_failure(
+            "git fetch timed out after 300s with no response from the remote")  # #119118
+
+    def test_primary_fetch_retries_transient_failures_with_bounded_exponential_backoff(self, monkeypatch):
+        results = iter([
+            subprocess.CompletedProcess(["git"], 1, "", "Could not resolve host: github.com"),
+            subprocess.CompletedProcess(["git"], 1, "", "HTTP 503 Service Unavailable"),
+            subprocess.CompletedProcess(["git"], 0, "", ""),
+        ])
+        calls, sleeps = [], []
+
+        def run(git_cmd, args, **kwargs):
+            calls.append((git_cmd, args, kwargs))
+            return next(results)
+
+        monkeypatch.setattr(update_cmd, "_git_run", run)
+        monkeypatch.setattr(update_cmd._time, "sleep", sleeps.append)
+        result = update_cmd._fetch_update_ref_with_retry(["git"], ["fetch", "origin", "main"])
+
+        assert result.returncode == 0
+        assert len(calls) == 3
+        assert all(call[2] == {"network": True} for call in calls)
+        assert sleeps == [2.0, 4.0]
+
+    def test_primary_fetch_does_not_retry_rate_limit_or_auth_failures(self, monkeypatch):
+        for stderr in (RATE_LIMIT_STDERR, "fatal: Authentication failed for origin"):
+            calls, sleeps = [], []
+            monkeypatch.setattr(
+                update_cmd, "_git_run",
+                lambda *args, _stderr=stderr, **kwargs: (
+                    calls.append((args, kwargs))
+                    or subprocess.CompletedProcess(["git"], 1, "", _stderr)
+                ),
+            )
+            monkeypatch.setattr(update_cmd._time, "sleep", sleeps.append)
+            result = update_cmd._fetch_update_ref_with_retry(["git"], ["fetch", "origin", "main"])
+            assert result.returncode == 1
+            assert len(calls) == 1
+            assert sleeps == []
