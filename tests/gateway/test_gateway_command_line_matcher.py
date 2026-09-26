@@ -244,6 +244,50 @@ def test_accepts_real_venv_sync_relaunch_shapes(module):
     assert spawn_intent(cmd) == "run"
 
 
+@pytest.mark.parametrize(
+    "original",
+    [
+        runtime_command(
+            Path("/opt/hermes"),
+            ["gateway", "run", "--replace"],
+            python="python",
+        ),
+        [
+            "python",
+            "-I",
+            "-c",
+            _launcher_script("hermes", Path("/opt/hermes"), None),
+            "gateway",
+            "run",
+        ],
+        [
+            "python",
+            "-I",
+            "-c",
+            "import base64; exec(base64.b64decode('"
+            + base64.b64encode(
+                _launcher_script("hermes", Path("/opt/hermes"), None).encode("utf-8")
+            ).decode("ascii")
+            + "'))",
+            "gateway",
+            "run",
+        ],
+    ],
+)
+def test_accepts_inline_launcher_after_venv_sync_reexec(original):
+    """Lazy sync re-execs -c launchers through relaunch_command's literal exec branch."""
+    from hermes_cli.venv_sync import relaunch_command
+
+    flag_index = original.index("-c")
+    argv = ["-c", *original[flag_index + 2 :]]
+    cmd = _flatten(
+        relaunch_command(Path("python"), Path("/opt/hermes"), argv, original, None)
+    )
+    assert matches(cmd) is True
+    assert matches_runtime(cmd) is True
+    assert spawn_intent(cmd) == "run"
+
+
 def test_restart_watcher_with_unquoted_relaunch_data_preserves_spawn_intent():
     future = _venv_sync_relaunch("hermes_cli.main")
     watcher = (
