@@ -1179,16 +1179,29 @@ def _register_linux_desktop_entry(defer: bool = False):
     """
     from hermes_cli.main import PROJECT_ROOT
     try:
-        from hermes_cli.linux_desktop_entry import DeferredDesktopEntryInstall, install_desktop_entry, is_supported
+        from hermes_cli.linux_desktop_entry import (
+            DeferredDesktopEntryInstall,
+            LEGACY_DESKTOP_ENTRY_NAME,
+            desktop_entry_path,
+            install_desktop_entry,
+            is_supported,
+        )
         if not is_supported():
             return None
         if defer:
             deferred = DeferredDesktopEntryInstall(PROJECT_ROOT)
             deferred.start()
             return deferred
+        legacy_entry = desktop_entry_path().with_name(LEGACY_DESKTOP_ENTRY_NAME)
+        had_legacy_entry = legacy_entry.is_file()
         entry = install_desktop_entry(PROJECT_ROOT)
         if entry:
             print(f"✓ Desktop launcher entry installed: {entry}")
+            if had_legacy_entry and not legacy_entry.exists():
+                print(
+                    f"✓ Launcher entry updated: {LEGACY_DESKTOP_ENTRY_NAME} -> {entry.name}\n"
+                    "  If Hermes is pinned to your panel, unpin it and re-pin from the app grid."
+                )
     except Exception as exc:  # never block a launch on launcher plumbing
         print(f"⚠ Could not install the desktop launcher entry: {exc}")
     return None

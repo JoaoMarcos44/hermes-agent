@@ -32,6 +32,8 @@ hermes desktop
 
 That uses your current config, keys, sessions, and skills.
 
+On Linux, an upgrade may retire an older Hermes launcher entry so the running window and app-grid identity stay aligned. If Hermes was pinned to your dock or panel under the retired entry, unpin it and re-pin Hermes from the app grid. A foreground `hermes desktop` launch prints this hint when it actually retires the old entry.
+
 ## What's in the app
 
 The desktop app is organized as a chat-first window with a left sidebar for navigation. It's built to allow managing multiple simultaneous agent conversations, configuring messaging providers, creating artifacts, browsing projects' folder structures, and working on multiple projects at once.
