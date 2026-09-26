@@ -877,6 +877,10 @@ def _published_launcher_source_matches(source: str) -> bool:
         position = cursor + match.start()
         marker_positions.append(position)
         cursor += match.end()
+    # The generated program itself starts with this import. A marker set copied into later data or
+    # a dead wrapper is not the published launcher, even if a flattened listing loses indentation.
+    if not marker_positions or marker_positions[0] != 0:
+        return False
     if not stripped.lower().endswith("sys.exit(main())"):
         return False
 
