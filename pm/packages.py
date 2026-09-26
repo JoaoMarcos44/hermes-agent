@@ -296,6 +296,18 @@ def _uv_lock_digest(path: Path) -> bytes:
 _uv_lock_digest_cache: dict[Path, tuple] = {}
 
 
+def _validate_pm_runtime_snapshot(project: Path, workspace: Path) -> None:
+    """Refuse a generated Hermes workspace that cannot bootstrap its own PM runtime."""
+    source_pm = project / "pm"
+    if not (source_pm / "pyproject.toml").is_file():
+        return
+    snapshot_pm = workspace / "pm"
+    for name in ("pyproject.toml", "uv.lock"):
+        required = snapshot_pm / name
+        if not required.is_file():
+            raise InstallError("venv", f"prepared workspace is missing PM runtime input: {required}")
+
+
 def uv_cache_dir() -> Path:
     """The hermes-owned uv cache: machine-scoped and shared (keyed by
     content — two profiles reuse one cache), anchored to the DEFAULT
@@ -429,10 +441,12 @@ class Venv(StatePackage):
                 replay = recorded.parent
             seed = (Path(prior["resolved_lock"]) if members and prior.get("resolved_lock")
                     else project / "uv.lock")
-            lock_and_sync(members, extras, root=generation / "workspace",
+            workspace = generation / "workspace"
+            lock_and_sync(members, extras, root=workspace,
                           seed_lock=seed, frozen=repair or not members, replay=replay,
                           source=project, environment=environment)
-            resolved_lock = generation / "workspace" / "uv.lock"
+            _validate_pm_runtime_snapshot(project, workspace)
+            resolved_lock = workspace / "uv.lock"
             environment.check()
             if repair:
                 from pm.recovery import validate_environment
