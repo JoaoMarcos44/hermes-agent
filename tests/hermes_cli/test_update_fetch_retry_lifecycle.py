@@ -130,6 +130,31 @@ def test_failed_fetch_never_pauses_windows_gateway(monkeypatch, tmp_path):
     assert resumed == []
 
 
+def test_branch_probe_failure_still_never_pauses_windows_gateway(monkeypatch, tmp_path):
+    """A read-only local probe failure must not turn into gateway downtime."""
+    events = []
+    _patch_update_preflight(monkeypatch, tmp_path, events, [_result(0)])
+    monkeypatch.setattr(
+        main,
+        "_pause_windows_gateways_for_update",
+        lambda: events.append(("pause", None)) or {"resume_needed": True},
+    )
+
+    class BranchProbeFailed(BaseException):
+        pass
+
+    def fail_branch_probe(*_args, **_kwargs):
+        events.append(("branch-probe", None))
+        raise BranchProbeFailed
+
+    monkeypatch.setattr(update_cmd, "_current_branch_name", fail_branch_probe)
+    args = SimpleNamespace(branch="main", channel=None)
+    with pytest.raises(BranchProbeFailed):
+        update_cmd._cmd_update_impl(args, False)
+
+    assert events == [("fetch", 1), ("branch-probe", None)]
+
+
 def test_gateway_pauses_only_after_fetch_succeeds_and_token_reaches_mutation(
     monkeypatch, tmp_path,
 ):

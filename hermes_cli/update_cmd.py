@@ -1424,8 +1424,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
 
-        _windows_gateway_resume = _pause_windows_gateways_before_mutation(completion_request)
+        # The branch-name probe is still read-only and can fail (corrupt/inaccessible .git).
+        # Keep the healthy gateway serving until that last pre-mutation check has succeeded.
         current_branch = _current_branch_name(git_cmd, check=True)
+        _windows_gateway_resume = _pause_windows_gateways_before_mutation(completion_request)
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
