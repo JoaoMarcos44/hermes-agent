@@ -175,7 +175,7 @@ def test_parked_profile_remains_in_migration_inventory_but_skips_config_prefligh
 
     # A parked profile is not in the post-migration served roster, so its credentials are not a
     # current collision. It must remain config-inert until the operator starts it again.
-    (home / ".env").write_text("TELEGRAM_BOT_TOKEN=111111:default-token\\n", encoding="utf-8")
+    (home / ".env").write_text("TELEGRAM_BOT_TOKEN=111111:default-token\n", encoding="utf-8")
     loaded.clear()
     blocked = gm.build_migration_plan()
     assert home not in loaded
