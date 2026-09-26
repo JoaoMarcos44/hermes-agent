@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import io
 import json
 import logging
 import math
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import tokenize
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -806,26 +808,58 @@ _PUBLISHED_LAUNCHER_MARKERS = (
 )
 
 
+def _source_marker_starts_are_code(source: str, marker_positions: list[int]) -> bool:
+    """True when every producer marker starts in code, never inside a string/comment.
+
+    Flattened process listings can destroy indentation and make the real generated launcher
+    unparsable by AST. Lexing still preserves whether marker text came from executable source
+    or inert data, so the fallback can stay tolerant of flattening without accepting a quoted copy
+    of the launcher as process identity.
+    """
+    line_offsets = [0]
+    for line in source.splitlines(keepends=True):
+        line_offsets.append(line_offsets[-1] + len(line))
+
+    def _absolute(position: tuple[int, int]) -> int:
+        row, column = position
+        return line_offsets[row - 1] + column
+
+    excluded: list[tuple[int, int]] = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type in {tokenize.STRING, tokenize.COMMENT}:
+                excluded.append((_absolute(token.start), _absolute(token.end)))
+    except (IndentationError, tokenize.TokenError):
+        return False
+
+    return all(
+        not any(start <= position < end for start, end in excluded)
+        for position in marker_positions
+    )
+
+
 def _published_launcher_source_matches(source: str) -> bool:
     """Match the generated launcher program in order, with main() as its terminal action."""
-    lowered = source.lower().strip()
+    stripped = source.strip()
+    lowered = stripped.lower()
     cursor = 0
+    marker_positions: list[int] = []
     for marker in _PUBLISHED_LAUNCHER_MARKERS:
         position = lowered.find(marker, cursor)
         if position < 0:
             return False
+        marker_positions.append(position)
         cursor = position + len(marker)
     if not lowered.endswith("sys.exit(main())"):
         return False
 
     # When argv boundaries preserve the source (for example a quoted Windows command line), AST
-    # parsing is authoritative: inert strings/comments carrying the same marker text must not
-    # manufacture identity. Flattened process listings lose indentation and may not parse, so only
-    # that representation falls back to the ordered producer fingerprint above.
+    # parsing is authoritative. Flattened process listings can lose indentation and fail AST
+    # parsing, so the fallback lexes the flattened program and accepts only markers still in code.
     try:
         tree = ast.parse(source)
     except (MemoryError, RecursionError, SyntaxError, ValueError):
-        return True
+        return _source_marker_starts_are_code(stripped, marker_positions)
 
     imports_bootstrap = any(
         isinstance(statement, ast.Import)
