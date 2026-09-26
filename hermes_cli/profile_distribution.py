@@ -442,9 +442,27 @@ def _refuse_symlink(path: Path) -> None:
 
 
 def _is_container(path: Path) -> bool:
-    """A shipped directory holding no files (a skills category) is a container of roots,
-    not a root itself; a skill dir always holds at least SKILL.md."""
+    """A generic authored-root container: a directory with no direct files."""
     return path.is_dir() and not any(p.is_file() for p in path.iterdir())
+
+
+def _is_skill_container(path: Path, rel: Tuple[str, ...]) -> bool:
+    """A category/container below ``skills/`` is any directory without ``SKILL.md``.
+
+    This matches the Skills Hub ownership boundary: a directory with ``SKILL.md`` is one skill
+    root; a directory without it is a category and may also contain category metadata files.
+    """
+    return bool(rel) and rel[0] == "skills" and path.is_dir() and not (path / "SKILL.md").is_file()
+
+
+def _is_merge_container(path: Path, rel: Tuple[str, ...]) -> bool:
+    """Use the semantic skill boundary under ``skills/`` and legacy shape elsewhere."""
+    return _is_skill_container(path, rel) if rel and rel[0] == "skills" else _is_container(path)
+
+
+def _is_owned_skill_category(path: Path, rel: Tuple[str, ...]) -> bool:
+    """Whether an explicitly owned nested path is a skill category, not a skill root."""
+    return len(rel) > 1 and _is_skill_container(path, rel)
 
 
 def _merge_dir(src: Path, dest: Path, rel: Tuple[str, ...]) -> None:
@@ -455,7 +473,7 @@ def _merge_dir(src: Path, dest: Path, rel: Tuple[str, ...]) -> None:
             continue
         if parts == _CRON_STORE_REL:
             continue  # merged up front by _copy_dist_payload
-        if _is_container(child):
+        if _is_merge_container(child, parts):
             _merge_dir(child, _real_dir(dest, (child.name,)), parts)
         else:
             _replace_entry(child, dest / child.name)
@@ -466,7 +484,7 @@ def _refuse_symlinked_containers(src: Path, dest: Path, rel: Tuple[str, ...]) ->
         parts = (*rel, child.name)
         if _is_distribution_runtime_path(parts):
             continue
-        if _is_container(child):
+        if _is_merge_container(child, parts):
             _refuse_symlink(dest / child.name)
             _refuse_symlinked_containers(child, dest / child.name, parts)
 
@@ -483,7 +501,9 @@ def _refuse_symlinked_targets(target: Path, entries) -> None:
         for part in rel_parts[:depth]:
             path = path / part
             _refuse_symlink(path)
-        if src.is_dir() and len(rel_parts) == 1:
+        if src.is_dir() and (
+            len(rel_parts) == 1 or _is_owned_skill_category(src, rel_parts)
+        ):
             _refuse_symlinked_containers(src, path, rel_parts)
 
 
@@ -494,7 +514,8 @@ def _copy_dist_payload(staged: Path, target: Path, manifest: DistributionManifes
     ``preserve_config`` is False (fresh install / ``--force-config``). ``.env.template`` lands
     as ``.env.EXAMPLE`` so it never shadows a real ``.env``.
 
-    A top-level owned directory is merged per authored root. ``cron/jobs.json`` is
+    A top-level owned directory is merged per authored root. Explicitly owned skill categories
+    are merged per skill. ``cron/jobs.json`` is
     special: it is one multi-record runtime store, so shipped definitions merge by job id
     instead of replacing the file."""
     target.mkdir(parents=True, exist_ok=True)
@@ -522,6 +543,11 @@ def _copy_dist_payload(staged: Path, target: Path, manifest: DistributionManifes
             if src.is_dir():
                 _merge_dir(src, _real_dir(target, rel_parts), rel_parts)
                 continue
+        elif _is_owned_skill_category(src, rel_parts):
+            # An explicitly owned category such as ``skills/research/`` owns the authored
+            # skills inside it, not installer- or agent-added sibling skills in the category.
+            _merge_dir(src, _real_dir(target, rel_parts), rel_parts)
+            continue
         _replace_entry(src, _real_dir(target, rel_parts[:-1]) / rel_parts[-1])
 
     # Emit .env.EXAMPLE from manifest if the staged tree didn't ship one

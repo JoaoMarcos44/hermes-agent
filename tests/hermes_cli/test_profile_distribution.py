@@ -464,6 +464,99 @@ class TestUpdate:
         assert (custom / "SKILL.md").read_text(encoding="utf-8") == "custom skill\n"
         assert (plan.target_dir / "cron" / "mine.json").exists()
 
+    @staticmethod
+    def _install_owned_research_category(profile_env, name, *, metadata=False):
+        mf = DistributionManifest(
+            name=name,
+            version="0.1.0",
+            distribution_owned=["SOUL.md", "skills/research/"],
+        )
+        staged = _make_staging_dir(profile_env, name, manifest=mf)
+        research = staged / "skills" / "research"
+        (research / "web-search").mkdir(parents=True)
+        (research / "web-search" / "SKILL.md").write_text("author v1\n", encoding="utf-8")
+        if metadata:
+            (research / "README.md").write_text("research category v1\n", encoding="utf-8")
+        return staged, install_distribution(str(staged), name=name)
+
+    def test_explicit_owned_skill_category_merges_per_skill(self, profile_env):
+        """#123646: an explicitly owned category must preserve installer-added sibling skills."""
+        staged, plan = self._install_owned_research_category(profile_env, "owned-research")
+        research = plan.target_dir / "skills" / "research"
+        mine = research / "my-notes"
+        mine.mkdir()
+        (mine / "SKILL.md").write_text("mine\n", encoding="utf-8")
+        (research / "web-search" / "stale.txt").write_text("retired\n", encoding="utf-8")
+        (staged / "skills" / "research" / "web-search" / "SKILL.md").write_text(
+            "author v2\n", encoding="utf-8"
+        )
+
+        update_distribution("owned-research")
+
+        assert (mine / "SKILL.md").read_text(encoding="utf-8") == "mine\n"
+        assert (research / "web-search" / "SKILL.md").read_text(encoding="utf-8") == "author v2\n"
+        assert not (research / "web-search" / "stale.txt").exists()
+
+    def test_owned_skill_category_metadata_does_not_change_ownership(self, profile_env):
+        """A category is defined by absence of SKILL.md, not by absence of metadata files."""
+        staged, plan = self._install_owned_research_category(profile_env, "owned-meta", metadata=True)
+        research = plan.target_dir / "skills" / "research"
+        mine = research / "my-notes"
+        mine.mkdir()
+        (mine / "SKILL.md").write_text("mine\n", encoding="utf-8")
+        (staged / "skills" / "research" / "README.md").write_text(
+            "research category v2\n", encoding="utf-8"
+        )
+
+        update_distribution("owned-meta")
+
+        assert (mine / "SKILL.md").read_text(encoding="utf-8") == "mine\n"
+        assert (research / "README.md").read_text(encoding="utf-8") == "research category v2\n"
+
+    def test_nested_non_skill_owned_path_remains_authoritative(self, profile_env):
+        """The special per-entry merge belongs to skills, not arbitrary nested owned dirs."""
+        mf = DistributionManifest(
+            name="owned-template",
+            version="0.1.0",
+            distribution_owned=["SOUL.md", "templates/fragments/"],
+        )
+        staged = _make_staging_dir(profile_env, "owned-template", manifest=mf)
+        shipped = staged / "templates" / "fragments" / "default"
+        shipped.mkdir(parents=True)
+        (shipped / "prompt.md").write_text("v1\n", encoding="utf-8")
+        plan = install_distribution(str(staged), name="owned-template")
+        local = plan.target_dir / "templates" / "fragments" / "local-only"
+        local.mkdir()
+        (local / "prompt.md").write_text("local\n", encoding="utf-8")
+        (shipped / "prompt.md").write_text("v2\n", encoding="utf-8")
+
+        update_distribution("owned-template")
+
+        assert not local.exists()
+        assert (plan.target_dir / "templates" / "fragments" / "default" / "prompt.md").read_text(
+            encoding="utf-8"
+        ) == "v2\n"
+
+    def test_explicit_owned_skill_category_refuses_nested_symlink_before_writes(
+        self, profile_env, tmp_path
+    ):
+        staged, plan = self._install_owned_research_category(profile_env, "owned-link")
+        papers = staged / "skills" / "research" / "papers" / "summarize"
+        papers.mkdir(parents=True)
+        (papers / "SKILL.md").write_text("summarize\n", encoding="utf-8")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        _symlink_file_or_skip(plan.target_dir / "skills" / "research" / "papers", outside)
+        soul = plan.target_dir / "SOUL.md"
+        before = soul.read_bytes()
+        (staged / "SOUL.md").write_text("changed\n", encoding="utf-8")
+
+        with pytest.raises(DistributionError, match="symlink"):
+            update_distribution("owned-link")
+
+        assert not any(outside.iterdir())
+        assert soul.read_bytes() == before
+
     def test_update_merges_cron_jobs_without_losing_local_state(self, profile_env):
         """Updating one shipped definition cannot replace the profile's whole cron store."""
         from cron.jobs import create_job, list_jobs, pause_job, resume_job, update_job, use_cron_store
