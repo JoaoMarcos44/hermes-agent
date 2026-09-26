@@ -624,6 +624,34 @@ def _looks_like_python_interpreter(value: str) -> bool:
     return False
 
 
+def _python_inline_source_flag_index(cased_tokens: list[str]) -> int | None:
+    """Inline-source flag index after recovering a flattened interpreter path with spaces.
+
+    psutil returns argv parts, but _read_process_cmdline joins them with spaces. On Windows that
+    can turn "C:/Program Files/Python/python.exe" into two tokens before shlex sees it. Recover
+    only an interpreter-looking path fragment before the first option; arbitrary command prefixes
+    are not treated as Python launchers.
+    """
+    if not cased_tokens:
+        return None
+
+    if _looks_like_python_interpreter(cased_tokens[0]):
+        return inline_source_flag_index(cased_tokens)
+
+    # A split executable path must have started as a path, not an arbitrary wrapper command.
+    if "/" not in cased_tokens[0]:
+        return None
+    for index in range(1, len(cased_tokens)):
+        token = cased_tokens[index]
+        if token.startswith("-"):
+            break
+        if not _looks_like_python_interpreter(token):
+            continue
+        relative = inline_source_flag_index(cased_tokens[index:])
+        return index + relative if relative is not None else None
+    return None
+
+
 def _literal_sys_argv_from_source(source: str) -> list[str] | None:
     """Literal sys.argv used by a Hermes relaunch source that actually executes the entrypoint."""
     if len(source) > 32_768:
@@ -926,14 +954,8 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     if not cased_tokens:
         return None
 
-    flag_index = inline_source_flag_index(cased_tokens)
+    flag_index = _python_inline_source_flag_index(cased_tokens)
     if flag_index is not None:
-        # This path is acceptance-capable now, so argv[0] must be an actual Python/PyPy
-        # interpreter. Keeping the old broad -c detection here would let bash/node/etc. donate
-        # Python-looking source as process identity.
-        if not _looks_like_python_interpreter(cased_tokens[0]):
-            return None
-
         # Keep inspection inside this interpreter's source region. A restart watcher can carry a
         # second Python -c launcher as trailing data; only that child may claim its markers.
         source_end = _nested_inline_source_start(cased_tokens, flag_index)
@@ -951,6 +973,12 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
             return _gateway_command_subcommand_from_tokens(
                 bootstrap_argv, hermes_entrypoint_inferred=True
             )
+        return None
+
+    # Non-Python -c runtimes remain fail-closed. Before inline launchers became acceptable this
+    # broad detection only rejected extra processes; now letting such a command fall through to
+    # the normal Hermes substring/argv parser could manufacture identity.
+    if inline_source_flag_index(cased_tokens) is not None:
         return None
 
     return _gateway_command_subcommand_from_tokens(raw_tokens)
@@ -977,7 +1005,11 @@ def gateway_spawn_intent_subcommand(command: str | None) -> str | None:
     except ValueError:
         raw_tokens = command.split()
     cased_tokens = [t.strip("\"'").replace("\\", "/") for t in raw_tokens]
-    flag_index = inline_source_flag_index(cased_tokens)
+    flag_index = _python_inline_source_flag_index(cased_tokens)
+    if flag_index is None:
+        # Spawn intent may still inspect a non-Python wrapper's trailing argv, but it never grants
+        # process identity; _gateway_command_subcommand above remains fail-closed for that process.
+        flag_index = inline_source_flag_index(cased_tokens)
     if flag_index is None:
         return None
     # Skip the interpreter, its options, ``-c`` and the source literal; then try every suffix —
