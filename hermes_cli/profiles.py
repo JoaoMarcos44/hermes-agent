@@ -2169,7 +2169,7 @@ def _scrub_export_secrets(staged: Path) -> None:
         redacted = redact_sensitive_text(
             text,
             force=True,
-            code_file=_export_file_uses_source_redaction(staged, path),
+            source_file=_export_file_uses_source_redaction(staged, path),
         )
         if redacted == text:
             continue

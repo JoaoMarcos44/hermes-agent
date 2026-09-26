@@ -155,6 +155,7 @@ class TestExportSecretScrub:
         bridge_text = (
             "const question = {\n"
             "  messageSecret: randomBytes(32),\n"
+            '  "password": "ephemeral, generated at runtime",\n'
             "};\n"
         )
         bridge.write_text(bridge_text)
@@ -206,7 +207,9 @@ class TestExportSecretScrub:
         scripts = profile_dir / "scripts"
         scripts.mkdir()
         script = scripts / "leak.sh"
+        opaque = "A9f3kZq7Lm2Xw8Rt4Yv6Cc9Pq1Hs5Nd8"
         script.write_text(
+            f"SERVICE_TOKEN={opaque}\n"
             f'curl -H "Authorization: Bearer {_LEAKED_KEY}" https://api.example.test\n'
             f'curl -H "X-API-Key: {_LEAKED_KEY}" https://api.example.test\n'
         )
@@ -215,6 +218,7 @@ class TestExportSecretScrub:
         skill_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: demo\ndescription: Demo.\n---\n"
+            f"SERVICE_TOKEN={opaque}\n"
             f"literal key: {_LEAKED_KEY}\n"
         )
         (profile_dir / "config.yaml").write_text("model: gpt-4\n")
@@ -232,5 +236,6 @@ class TestExportSecretScrub:
                     archived_text.append(handle.read().decode("utf-8", errors="ignore"))
         blob = "\n".join(archived_text)
         assert _LEAKED_KEY not in blob
+        assert opaque not in blob
         assert "Authorization: Bearer" in blob
         assert "X-API-Key:" in blob
