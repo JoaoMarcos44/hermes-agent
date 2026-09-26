@@ -668,6 +668,12 @@ def _desktop_userdata_dir_safe() -> Path | None:
         return None
 
 
+def _uninstall_desktop_artifacts(hermes_home: Path, *, full_uninstall: bool) -> list[Path]:
+    """Remove desktop artifacts while applying the agent uninstall's data policy."""
+    from hermes_cli.gui_uninstall import uninstall_gui
+    return uninstall_gui(hermes_home, remove_userdata=full_uninstall)
+
+
 def run_uninstall(args):
     """
     Run the uninstall process.
@@ -963,8 +969,7 @@ def _perform_uninstall(
     #     Electron userData is, and lives outside HERMES_HOME, so it follows the selected data policy.
     log_info("Removing desktop Chat GUI artifacts...")
     try:
-        from hermes_cli.gui_uninstall import uninstall_gui
-        if not uninstall_gui(hermes_home, remove_userdata=full_uninstall):
+        if not _uninstall_desktop_artifacts(hermes_home, full_uninstall=full_uninstall):
             log_info("No desktop GUI artifacts found")
     except Exception as e:
         log_warn(f"Could not remove desktop GUI artifacts: {e}")
