@@ -18,8 +18,8 @@ from tools.delegation_live_log import (
     LiveTranscriptWriter,
     create_live_transcripts,
     live_transcript_root,
-    wrap_progress_callback,
     update_manifest_route,
+    wrap_progress_callback,
 )
 
 
@@ -200,7 +200,7 @@ def test_delegate_manifest_uses_constructed_child_route(monkeypatch):
 
 
 def test_update_manifest_route_replaces_null_dispatch_route():
-    delegation_id, _writers, _paths = create_live_transcripts([{ "goal": "task" }])
+    delegation_id, _writers, _paths = create_live_transcripts([{"goal": "task"}])
 
     update_manifest_route(delegation_id, model="resolved/model", provider="resolved-provider")
 
