@@ -171,6 +171,15 @@ def test_marker_text_inside_inline_source_is_not_gateway_identity():
     assert matches_runtime(cmd) is False
 
 
+def test_bootstrap_marker_text_is_not_gateway_identity():
+    cmd = (
+        "python -c import hermes_bootstrap; "
+        "note = \"runpy.run_module('hermes_cli.main', alter_sys=True)\" gateway run"
+    )
+    assert matches(cmd) is False
+    assert matches_runtime(cmd) is False
+
+
 @pytest.mark.parametrize("future_gateway", HERMES_INLINE_GATEWAYS)
 def test_restart_watcher_wrapping_inline_gateway_stays_non_gateway(future_gateway):
     """#107002: a watcher's nested future gateway must never become the watcher's identity."""
