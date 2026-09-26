@@ -335,6 +335,30 @@ _PASSWORD_KEY_RE = re.compile(r"passwd|password|pass|pw", re.IGNORECASE)
 # agent-ssh-socket)``): the value token stops at whitespace, so only ``$(gpgconf`` is seen.
 _SHELL_VAR_REF = r"\$(?:\{[A-Za-z_]\w*[^}]*\}|[A-Za-z_]\w*)"
 _PATH_OR_VAR_VALUE_RE = re.compile(rf"^(?:{_SHELL_VAR_REF}|\$\(|~|/)(?:[\w./:-]|{_SHELL_VAR_REF})*$")
+
+# Exported source/templates contain credential references, not credential bytes. Treating
+# these as auth-header values corrupts executable code and skill instructions (#124523).
+_CREDENTIAL_REFERENCE_RE = re.compile(
+    rf"^(?:{_SHELL_VAR_REF}|\\$env:[A-Za-z_]\\w*|%[A-Za-z_]\\w*%|"
+    r"(?:<[A-Za-z_][\\w.\\-]*>)(?::(?:<[A-Za-z_][\\w.\\-]*>))*)$",
+    re.IGNORECASE,
+)
+_CODE_CREDENTIAL_PLACEHOLDER_RE = re.compile(
+    r"^(?:token|api[_-]?key|secret|password|credential|value|"
+    r"your[_-]?(?:token|api[_-]?key|secret|password))$",
+    re.IGNORECASE,
+)
+
+
+def _is_credential_reference(value: str, *, code_file: bool = False) -> bool:
+    """True for an explicit variable/template reference rather than secret bytes."""
+    candidate = value.strip().rstrip('"';)')
+    # Header examples may continue with another comma-separated header. Only the first
+    # token occupies the credential position.
+    candidate = candidate.split(",", 1)[0]
+    if _CREDENTIAL_REFERENCE_RE.fullmatch(candidate):
+        return True
+    return bool(code_file and _CODE_CREDENTIAL_PLACEHOLDER_RE.fullmatch(candidate))
 # ``$VAR`` / ``$(cmd`` are unambiguous references. A ``/``- or ``~``-led value is a path only
 # while every segment reads like one: a 16+ char segment mixing case and digits with no ``.``
 # (``/wJalrXUtnFEMIK7MDENG/bPxRf…``) is a secret that happens to start with a path character,
@@ -396,7 +420,7 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
     # is a code snippet, not a leaked secret value.
     # Same programmatic-env-lookup exception as _redact_env above (issue #2852): api_key: os.getenv('X') is
     # a code snippet, not a leaked secret value.
-    if _ENV_LOOKUP_VALUE_RE.match(value):
+    if _ENV_LOOKUP_VALUE_RE.match(value) or _is_credential_reference(value):
         return False
     # An earlier pass already masked this value (``***`` or the ``«redacted:…»`` sentinel). Masking it
     # again only erases what the sentinel deliberately kept — the vendor label (``Digest ***`` →
@@ -850,17 +874,23 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
 
 
 def _redact_url_credentials(text: str, code_file: bool) -> str:
-    """DB connection-string passwords and bare-token URL userinfo (``://`` text only)."""
+    """DB passwords and bare-token userinfo; preserve explicit source references."""
     def _redact_db(m):
-        # code_file: a pure ``{...}`` password is an f-string template reference
-        # (f"postgresql://{user}:{pass}@{host}"), not a literal credential.
         pw = m.group(2)
+        if _is_credential_reference(pw, code_file=code_file):
+            return m.group(0)
         if code_file and pw.startswith("{") and pw.endswith("}"):
             return m.group(0)
         return f"{m.group(1)}***{m.group(3)}"
-    text = _DB_CONNSTR_RE.sub(_redact_db, text)
-    return _URL_BARE_TOKEN_RE.sub(lambda m: f"{m.group(1)}{_mask_token(m.group(2))}{m.group(3)}", text)
 
+    def _redact_bare_token(m):
+        token = m.group(2)
+        if _is_credential_reference(token, code_file=code_file):
+            return m.group(0)
+        return f"{m.group(1)}{_mask_token(token)}{m.group(3)}"
+
+    text = _DB_CONNSTR_RE.sub(_redact_db, text)
+    return _URL_BARE_TOKEN_RE.sub(_redact_bare_token, text)
 
 def _redact_phone(m):
     phone = m.group(1)
@@ -939,10 +969,20 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _redact_assignments(text, mask_nonreusable=file_read)
 
     if "uthorization" in text or "UTHORIZATION" in text:  # cheapest gate over every casing
-        text = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)), text)
+        def _auth_sub(m):
+            credential = m.group(3)
+            if _is_credential_reference(credential, code_file=code_file):
+                return m.group(0)
+            return m.group(1) + (m.group(2) or "") + _mask_token(credential)
+        text = _AUTH_HEADER_RE.sub(_auth_sub, text)
 
     if ":" in text:
-        text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
+        def _secret_header_sub(m):
+            credential = m.group(2)
+            if _is_credential_reference(credential, code_file=code_file):
+                return m.group(0)
+            return m.group(1) + _mask_token(credential)
+        text = _SECRET_HEADER_RE.sub(_secret_header_sub, text)
         text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
 
     if "BEGIN" in text and "-----" in text:

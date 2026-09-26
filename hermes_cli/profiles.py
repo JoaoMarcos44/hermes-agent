@@ -2123,6 +2123,9 @@ _EXPORT_REDACT_SUFFIXES = frozenset({
 })
 # ``Path(".cursorrules").suffix`` is "" — name-match; ``*.env.example`` uses endswith.
 _EXPORT_REDACT_NAMES = frozenset({".cursorrules"})
+_EXPORT_SOURCE_SUFFIXES = frozenset({
+    ".py", ".sh", ".bash", ".zsh", ".js", ".ts", ".tsx", ".jsx", ".css", ".html",
+})
 
 
 def _should_redact_export_file(path: Path) -> bool:
@@ -2133,6 +2136,16 @@ def _should_redact_export_file(path: Path) -> bool:
         or path.suffix.lower() in _EXPORT_REDACT_SUFFIXES
     )
 
+
+def _export_file_uses_source_redaction(staged: Path, path: Path) -> bool:
+    """Whether export redaction must preserve executable/template syntax for path."""
+    if path.suffix.lower() in _EXPORT_SOURCE_SUFFIXES or path.name.lower().endswith(".env.example"):
+        return True
+    try:
+        rel = path.relative_to(staged)
+    except ValueError:
+        return False
+    return bool(rel.parts and rel.parts[0] in {"skills", "scripts"})
 
 def _scrub_export_secrets(staged: Path) -> None:
     """Force-redact secret-shaped strings in a staged export tree (same pass as ``hermes
@@ -2152,7 +2165,11 @@ def _scrub_export_secrets(staged: Path) -> None:
             text = path.read_text(encoding="utf-8-sig")
         except (UnicodeDecodeError, OSError):
             continue
-        redacted = redact_sensitive_text(text, force=True)
+        redacted = redact_sensitive_text(
+            text,
+            force=True,
+            code_file=_export_file_uses_source_redaction(staged, path),
+        )
         if redacted == text:
             continue
         if is_link:
