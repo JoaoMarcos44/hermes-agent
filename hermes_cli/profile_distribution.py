@@ -446,6 +446,16 @@ def _is_container(path: Path) -> bool:
     not a root itself; a skill dir always holds at least SKILL.md."""
     return path.is_dir() and not any(p.is_file() for p in path.iterdir())
 
+def _is_owned_skill_container(path: Path, rel: Tuple[str, ...]) -> bool:
+    """True only for an explicitly owned directory that is a container of skill roots.
+
+    Top-level owned directories keep their existing per-root merge contract. Nested paths are
+    authoritative by default; only paths under ``skills/`` inherit the documented per-skill merge
+    semantics. This avoids turning an arbitrary owned path into an additive merge merely because
+    its root happens to contain directories instead of files.
+    """
+    return len(rel) > 1 and rel[0] == "skills" and _is_container(path)
+
 
 def _merge_dir(src: Path, dest: Path, rel: Tuple[str, ...]) -> None:
     """Merge authored roots while leaving runtime-owned nested state untouched."""
@@ -483,7 +493,9 @@ def _refuse_symlinked_targets(target: Path, entries) -> None:
         for part in rel_parts[:depth]:
             path = path / part
             _refuse_symlink(path)
-        if src.is_dir() and (len(rel_parts) == 1 or _is_container(src)):
+        if src.is_dir() and (
+            len(rel_parts) == 1 or _is_owned_skill_container(src, rel_parts)
+        ):
             _refuse_symlinked_containers(src, path, rel_parts)
 
 
@@ -523,10 +535,10 @@ def _copy_dist_payload(staged: Path, target: Path, manifest: DistributionManifes
             if src.is_dir():
                 _merge_dir(src, _real_dir(target, rel_parts), rel_parts)
                 continue
-        elif _is_container(src):
-            # An owned category (``skills/research/``) holds skill roots, not files: merge it per
-            # root like a top-level dir, so skills the installer added to it (``hermes skills
-            # install`` and agent-created skills land in ``skills/<category>/``) survive.
+        elif _is_owned_skill_container(src, rel_parts):
+            # An owned skill category (``skills/research/``) holds skill roots, not files: merge
+            # it per root like ``skills/``, so installer- and agent-added skills survive. Other
+            # explicitly owned nested directories remain authoritative replacement boundaries.
             _merge_dir(src, _real_dir(target, rel_parts), rel_parts)
             continue
         _replace_entry(src, _real_dir(target, rel_parts[:-1]) / rel_parts[-1])

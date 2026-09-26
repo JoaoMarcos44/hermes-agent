@@ -512,6 +512,30 @@ class TestUpdate:
         assert not any(outside.iterdir())
         assert soul.read_text(encoding="utf-8") == before  # refused before the first write
 
+    def test_nested_non_skill_owned_directory_is_still_replaced_whole(self, profile_env):
+        """Per-entry merge is a skills contract, not a generic property of nested directories."""
+        mf = DistributionManifest(
+            name="rb",
+            version="0.1.0",
+            distribution_owned=["SOUL.md", "templates/fragments/"],
+        )
+        staged = _make_staging_dir(profile_env, "rb", manifest=mf)
+        shipped = staged / "templates" / "fragments" / "default"
+        shipped.mkdir(parents=True)
+        (shipped / "prompt.md").write_text("author v1\n", encoding="utf-8")
+        plan = install_distribution(str(staged), name="rb")
+
+        fragments = plan.target_dir / "templates" / "fragments"
+        local = fragments / "local-only"
+        local.mkdir()
+        (local / "prompt.md").write_text("installer local\n", encoding="utf-8")
+        (shipped / "prompt.md").write_text("author v2\n", encoding="utf-8")
+
+        update_distribution("rb")
+
+        assert (fragments / "default" / "prompt.md").read_text(encoding="utf-8") == "author v2\n"
+        assert not local.exists()
+
     def test_update_merges_cron_jobs_without_losing_local_state(self, profile_env):
         """Updating one shipped definition cannot replace the profile's whole cron store."""
         from cron.jobs import create_job, list_jobs, pause_job, resume_job, update_job, use_cron_store
