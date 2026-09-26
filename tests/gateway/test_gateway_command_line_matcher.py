@@ -248,6 +248,34 @@ def test_bootstrap_marker_text_is_not_gateway_identity():
     assert matches_runtime(cmd) is False
 
 
+@pytest.mark.parametrize(
+    "launch",
+    [
+        "runpy.run_module('hermes_cli.main')",
+        "runpy.run_module('hermes_cli.main', run_name='probe')",
+        "runpy.run_path('/opt/hermes/hermes_cli/main.py')",
+        "runpy.run_path('/opt/hermes/hermes_cli/main.py', run_name='probe')",
+    ],
+)
+def test_relaunch_target_without_main_execution_is_not_gateway_identity(launch):
+    """Naming Hermes in runpy is insufficient unless the CLI is actually executed as __main__."""
+    cmd = (
+        "python -c import sys, runpy; "
+        "sys.argv = ['/opt/hermes/hermes_cli/main.py', 'gateway', 'run']; "
+        + launch
+    )
+    assert matches(cmd) is False
+    assert matches_runtime(cmd) is False
+
+
+def test_runtime_bootstrap_wrong_run_name_is_not_gateway_identity():
+    """The runtime bootstrap must execute hermes_cli.main's __main__ guard, not only load it."""
+    cmd = _RUNTIME_BOOTSTRAP.replace("run_name='__main__'", "run_name='probe'")
+    assert cmd != _RUNTIME_BOOTSTRAP
+    assert matches(cmd) is False
+    assert matches_runtime(cmd) is False
+
+
 @pytest.mark.parametrize("future_gateway", HERMES_INLINE_GATEWAYS)
 def test_restart_watcher_wrapping_inline_gateway_stays_non_gateway(future_gateway):
     """#107002: a watcher's nested future gateway must never become the watcher's identity."""
