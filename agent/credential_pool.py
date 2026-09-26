@@ -567,6 +567,62 @@ def custom_provider_pool_key_candidates(
     return []
 
 
+def _custom_provider_declares_other_credential(entry: Dict[str, Any], api_key: str) -> bool:
+    """Return True when a custom entry explicitly owns a different credential."""
+    if str(entry.get("key_cmd") or "").strip():
+        return True
+    own = str(entry.get("api_key") or "").strip()
+    if own.startswith("${") and own.endswith("}"):
+        own = get_secret_str(own[2:-1].strip(), "").strip()
+        if not own:
+            return True
+    env_var = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if not own and env_var:
+        own = get_secret_str(env_var, "").strip()
+        if not own:
+            return True
+    return bool(own) and own != api_key
+
+
+def custom_provider_pool_key_candidates_for_owner(
+    base_url: Optional[str],
+    *,
+    provider_name: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> List[str]:
+    """Return custom-pool candidates owned by this runtime, not merely its URL.
+
+    Named provider identity is authoritative. A bare ``custom`` runtime may instead
+    prove ownership with its resolved key. URL-only matching is retained only for
+    legacy callers that have neither ownership hint.
+    """
+    normalized_url = _norm_url(base_url)
+    if not normalized_url:
+        return []
+
+    requested = str(provider_name or "").strip()
+    requested_norm = _normalize_custom_pool_name(requested)
+    if requested_norm not in {"", "custom", "auto"}:
+        aliases = _requested_custom_name_aliases(requested)
+        for norm_name, entry in _iter_custom_providers():
+            if not (aliases & _custom_entry_name_aliases(norm_name, entry)):
+                continue
+            if _norm_url(entry.get("base_url")) != normalized_url:
+                return []
+            return _pool_keys_for_custom_entry(norm_name, entry)
+        return []
+
+    owner_key = api_key.strip() if isinstance(api_key, str) else ""
+    if owner_key and not (owner_key.startswith("${") and owner_key.endswith("}")):
+        for norm_name, entry in _iter_custom_providers():
+            if _norm_url(entry.get("base_url")) != normalized_url:
+                continue
+            if not _custom_provider_declares_other_credential(entry, owner_key):
+                return _pool_keys_for_custom_entry(norm_name, entry)
+        return []
+
+    return custom_provider_pool_key_candidates(base_url)
+
 def get_custom_provider_pool_key(base_url: Optional[str], provider_name: Optional[str] = None) -> Optional[str]:
     """Preferred pool key for a custom provider: durable slug, else ``custom:<name>``.
 
@@ -680,6 +736,8 @@ def credential_pool_matches_provider(
     provider: Optional[str],
     *,
     base_url: Optional[str] = None,
+    requested_provider: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> bool:
     """Return whether a pool belongs to the requested runtime provider.
 
@@ -702,6 +760,16 @@ def credential_pool_matches_provider(
     provider_norm = str(provider or "").strip().lower()
     if not pool_provider or not provider_norm:
         return False
+    owner_named = str(requested_provider or "").strip().lower() not in {"", "custom", "auto"}
+    owner_key = api_key.strip() if isinstance(api_key, str) else ""
+    if provider_norm == "custom" and (owner_named or owner_key):
+        try:
+            owner_keys = custom_provider_pool_key_candidates_for_owner(
+                base_url, provider_name=requested_provider, api_key=api_key
+            )
+        except Exception:
+            return False
+        return pool_provider in {str(key).strip().lower() for key in owner_keys}
     if not pool_provider.startswith(CUSTOM_POOL_PREFIX):
         if pool_provider == provider_norm:
             return True
@@ -722,7 +790,13 @@ def credential_pool_matches_provider(
     return _legacy_custom_pool_matches(pool_provider, provider_norm, runtime_url)
 
 
-def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str]) -> str:
+def resolve_runtime_pool_key(
+    provider: Optional[str],
+    base_url: Optional[str],
+    *,
+    requested_provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> str:
     """Resolve the credential-pool key for a runtime provider identity.
 
     Named custom runtimes retain their configured alias while their pool may
@@ -736,13 +810,18 @@ def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str]) -
         return ""
 
     def _accepts(candidate: str) -> bool:
-        return credential_pool_matches_provider(candidate, provider_norm, base_url=base_url)
+        return credential_pool_matches_provider(
+            candidate, provider_norm, base_url=base_url,
+            requested_provider=requested_provider, api_key=api_key,
+        )
 
     try:
         if provider_norm == "custom":
-            candidate = get_custom_provider_pool_key(base_url)
-            if candidate and _accepts(candidate):
-                return str(candidate).strip().lower()
+            for candidate in custom_provider_pool_key_candidates_for_owner(
+                base_url, provider_name=requested_provider, api_key=api_key
+            ):
+                if candidate and _accepts(candidate):
+                    return str(candidate).strip().lower()
         else:
             # Named/exact custom runtimes are keyed by identity: search the
             # configured candidates by identity before endpoint so a sibling
@@ -3000,7 +3079,10 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
                 # seeding is skipped when the pool holds the other identity.
                 # Check if this model's base_url matches our custom provider. See #100413.
                 matched_keys = {
-                    str(key).strip().lower() for key in custom_provider_pool_key_candidates(model_base_url)
+                    str(key).strip().lower()
+                    for key in custom_provider_pool_key_candidates_for_owner(
+                        model_base_url, api_key=model_api_key
+                    )
                 }
                 if pool_key in matched_keys:
                     seed.upsert("model_config", {

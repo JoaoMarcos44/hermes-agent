@@ -156,6 +156,7 @@ def _resolve_openrouter_runtime(
                 and base_url == (env_openrouter_base_url or "").rstrip("/"))
         )
     )
+    from hermes_cli.runtime_provider_custom import _model_cfg_key_env_for
     if is_openrouter_context:
         # OPENAI_API_KEY is a legacy home for an OpenRouter key. When OPENAI_BASE_URL binds it, it
         # goes only to that host. Unbound, openrouter.ai gets it only when it is OpenRouter-shaped
@@ -166,8 +167,17 @@ def _resolve_openrouter_runtime(
             openai_key_ok = openai_base_host == base_url_hostname(base_url)
         else:
             openai_key_ok = not is_openrouter_url or rp.looks_like_openrouter_key(openai_key)
-        candidates = [explicit_api_key, get_secret_str("OPENROUTER_API_KEY"),
-                      openai_key if openai_key_ok else ""]
+        cfg_key_ok = (
+            requested_norm == "custom"
+            and use_config_base_url
+            and base_url == cfg_base_url.strip().rstrip("/")
+        )
+        cfg_literal = cfg_api_key if cfg_key_ok and "${" not in cfg_api_key else ""
+        cfg_env_key = _model_cfg_key_env_for(model_cfg, base_url) if cfg_key_ok else ""
+        candidates = [
+            explicit_api_key, cfg_literal, cfg_env_key, get_secret_str("OPENROUTER_API_KEY"),
+            openai_key if openai_key_ok else "",
+        ]
     else:
         # ``model.api_key`` and ``model.key_env`` back a trusted config base_url only; the key_env
         # rung is what a bare ``provider: custom`` block relies on (#67453).
@@ -183,7 +193,17 @@ def _resolve_openrouter_runtime(
         return rp._runtime("openrouter", cfg_api_mode or rp._detect_api_mode_for_url(base_url) or "chat_completions", base_url,
                            api_key, source=source)
     if base_url:
-        pool_result = rp._try_resolve_from_custom_pool(base_url, "custom", cfg_api_mode, provider_name=None)
+        configured_owner_key = ""
+        if use_config_base_url:
+            configured_owner_key = (
+                (cfg_api_key if "${" not in cfg_api_key else "")
+                or _model_cfg_key_env_for(model_cfg, base_url)
+            )
+        owner_api_key = (explicit_api_key or "").strip() or configured_owner_key or api_key
+        pool_result = rp._try_resolve_from_custom_pool(
+            base_url, "custom", cfg_api_mode, provider_name=None,
+            owner_api_key=owner_api_key or None,
+        )
         if pool_result:
             return pool_result
     # Local no-auth servers get a placeholder key — the OpenAI SDK requires a non-empty string.
