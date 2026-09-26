@@ -97,8 +97,8 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 
 # Every classify_persistence_error bucket; consumers enumerate this tuple.
 PERSISTENCE_ERROR_CAUSES = (
-    "locked", "compression", "compression_closed", "turn_lease", "corrupt", "fts_index",
-    "replaced", "deleted_wal", "disk", "unknown",
+    "locked", "compression", "compression_closed", "turn_lease", "session_row_missing",
+    "corrupt", "fts_index", "replaced", "deleted_wal", "disk", "unknown",
 )
 
 
@@ -253,6 +253,7 @@ _PERSISTENCE_CAUSE_BY_TYPE = (
 )
 _PERSISTENCE_CAUSE_BY_PHRASE = (
     (("turn lease",), "turn_lease"),
+    (("foreign key constraint failed",), "session_row_missing"),
     (("closed by compression",), "compression_closed"),
     (("being compressed", "compression lease"), "compression"),
     # RPC-wrapped errors lose their exception type; retain the same sidecar/main-file split.
@@ -281,6 +282,11 @@ def classify_persistence_error(exc_or_str) -> str:
     for exc_type, cause in _PERSISTENCE_CAUSE_BY_TYPE:
         if isinstance(exc_or_str, exc_type):
             return cause
+    if (
+        isinstance(exc_or_str, sqlite3.IntegrityError)
+        and getattr(exc_or_str, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+    ):
+        return "session_row_missing"
     # Provenance before prose: an FTS-scoped result code (or, without one, an fts5 report
     # naming messages_fts*) is index damage, never whole-file corruption (#97794).
     if is_fts_scoped_corruption_error(exc_or_str):

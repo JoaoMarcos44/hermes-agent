@@ -5,7 +5,6 @@ import hashlib
 
 import logging
 import re
-import sqlite3
 from contextlib import nullcontext
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -297,23 +296,32 @@ def _db_flush_adopt_compression_tip(agent) -> bool:
     return True
 
 
-def _db_flush_recreate_missing_session(agent, error: Exception, retry_budget: int) -> bool:
-    """Recreate a vanished session parent after a proven transcript FK reject.
+def _db_flush_recreate_missing_session(
+    agent, error: Exception, messages: List[Dict], retry_budget: int,
+) -> Optional[bool]:
+    """Handle a missing session parent; None means the error is unrelated."""
+    from hermes_state_errors import classify_persistence_error
 
-    This stays at the agent boundary so the replacement row is rebuilt with the
-    agent's real source, routing identity, model config, prompt, and parent
-    metadata.  Raw SessionDB appenders keep their existing semantics.
-    """
-    if (
-        not isinstance(error, sqlite3.IntegrityError)
-        or getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
-    ):
-        return False
+    if classify_persistence_error(error) != "session_row_missing":
+        return None
 
-    # The FK proves the cached existence claim is stale even if this call has
-    # already spent its one immediate rebuild attempt.
+    # The row and every message row are gone together. Invalidate BOTH the
+    # existence cache and per-message durability so the rebuilt session gets
+    # the full live transcript, not only the unflushed tail.
+    agent._last_persistence_error_cause = "session_row_missing"
     agent._session_db_created = False
+    agent._flushed_db_message_ids = set()
+    agent._last_flushed_db_idx = 0
+    agent._db_flush_scan_prefix = None
+    for message in messages:
+        if isinstance(message, dict):
+            message.pop(_DB_PERSISTED_MARKER, None)
+
     if retry_budget <= 0:
+        logger.warning(
+            "Session row %s disappeared again after the persistence retry; stopping flush",
+            agent.session_id,
+        )
         return False
 
     agent._ensure_db_session()
@@ -321,7 +329,7 @@ def _db_flush_recreate_missing_session(agent, error: Exception, retry_budget: in
         return False
 
     logger.warning(
-        "Recreated missing session row %s after transcript FK failure; retrying flush once",
+        "Recreated missing session row %s; retrying the full live transcript once",
         agent.session_id,
     )
     return True
@@ -415,8 +423,7 @@ class SessionPersistenceMixin:
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
 
     def _flush_messages_to_session_db_unlocked(
-        self, messages: List[Dict], conversation_history: Optional[List[Dict]] = None,
-        _adoption_budget: int = 1, _session_recreate_budget: int = 1,
+        self, messages: List[Dict], conversation_history: Optional[List[Dict]] = None, _adoption_budget: int = 1,
     ):
         """Persist un-flushed messages to SQLite. Dedup is the intrinsic ``_DB_PERSISTED_MARKER`` on each written
         dict — not positional slices (drift after sequence repair) nor an ``id(msg)`` set (address reuse). The
@@ -449,15 +456,18 @@ class SessionPersistenceMixin:
             self._db_flush_scan_prefix = messages[:]
             return True
         except Exception as e:
-            if _db_flush_recreate_missing_session(self, e, _session_recreate_budget):
+            _recreated = _db_flush_recreate_missing_session(self, e, messages, _adoption_budget)
+            if _recreated is not None:
+                if not _recreated:
+                    return False
+                # The previous durable generation vanished. Ignore history identity
+                # on the retry so every live row is written into the new generation.
                 return self._flush_messages_to_session_db_unlocked(
-                    messages, conversation_history,
-                    _adoption_budget=_adoption_budget, _session_recreate_budget=0,
+                    messages, conversation_history=None, _adoption_budget=0,
                 )
             if _db_flush_failed(self, e, batch_rows, _adoption_budget):
                 return self._flush_messages_to_session_db_unlocked(
-                    messages, conversation_history,
-                    _adoption_budget=0, _session_recreate_budget=_session_recreate_budget,
+                    messages, conversation_history, _adoption_budget=0,
                 )
             return False
 

@@ -378,6 +378,8 @@ class AIAgent(
             self._session_db_created = True
         except Exception as e:
             # Transient failure (e.g. SQLite lock): _session_db_created stays False so the next turn retries.
+            from hermes_state_errors import classify_persistence_error
+            self._last_persistence_error_cause = classify_persistence_error(e)
             logger.warning("Session DB creation failed (will retry next turn): %s", e)
 
     def _transition_context_engine_session(

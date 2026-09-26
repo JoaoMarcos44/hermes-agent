@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import SessionDB, classify_persistence_error
 
 
 def _make_agent(db, session_id="live-session", **kwargs):
@@ -34,8 +34,10 @@ def _make_agent(db, session_id="live-session", **kwargs):
         )
 
 
-def test_flush_recreates_deleted_session_with_real_agent_metadata(tmp_path):
-    """A stale created-flag recovers through AIAgent, not a synthetic state row."""
+def test_flush_recreates_deleted_session_with_full_live_transcript(tmp_path):
+    """A vanished generation is rebuilt from live memory with real agent metadata."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+
     db = SessionDB(db_path=tmp_path / "state.db")
     agent = _make_agent(
         db,
@@ -47,12 +49,20 @@ def test_flush_recreates_deleted_session_with_real_agent_metadata(tmp_path):
     )
     try:
         agent._ensure_db_session()
-        assert agent._session_db_created is True
+        history = [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "reply one"},
+        ]
+        assert agent._flush_messages_to_session_db(history, []) is True
+        assert all(message.get(_DB_PERSISTED_MARKER) for message in history)
         assert db.delete_session(agent.session_id) is True
         assert agent._session_db_created is True  # stale by construction
 
-        messages = [{"role": "user", "content": "after delete"}]
-        assert agent._flush_messages_to_session_db(messages, []) is True
+        messages = history + [
+            {"role": "user", "content": "two"},
+            {"role": "assistant", "content": "reply two"},
+        ]
+        assert agent._flush_messages_to_session_db(messages, history) is True
 
         row = db.get_session(agent.session_id)
         assert row is not None
@@ -60,7 +70,14 @@ def test_flush_recreates_deleted_session_with_real_agent_metadata(tmp_path):
         assert row["session_key"] == "agent:main:telegram:dm:chat-1"
         assert row["chat_id"] == "chat-1"
         assert row["user_id"] == "user-1"
-        assert [message["content"] for message in db.get_messages(agent.session_id)] == ["after delete"]
+        assert [message["content"] for message in db.get_messages(agent.session_id)] == [
+            "one", "reply one", "two", "reply two",
+        ]
+        assert all(message.get(_DB_PERSISTED_MARKER) for message in messages)
+
+        # The rebuilt generation is idempotent after the recovery flush.
+        assert agent._flush_messages_to_session_db(messages, history) is True
+        assert len(db.get_messages(agent.session_id)) == 4
     finally:
         agent.close()
         db.close()
@@ -73,6 +90,8 @@ def test_raw_sessiondb_append_keeps_missing_parent_fk_contract(tmp_path):
         with pytest.raises(sqlite3.IntegrityError) as raised:
             db.append_message("missing-session", role="user", content="orphan")
         assert raised.value.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
+        assert classify_persistence_error(raised.value) == "session_row_missing"
+        assert classify_persistence_error("wrapped: FOREIGN KEY constraint failed") == "session_row_missing"
         assert db.get_session("missing-session") is None
     finally:
         db.close()
@@ -97,6 +116,7 @@ def test_failed_session_creation_stops_before_batch_append(tmp_path, monkeypatch
             [{"role": "user", "content": "cannot attach"}], []
         ) is False
         assert append_attempts == 0
+        assert agent._last_persistence_error_cause == "session_row_missing"
         assert db.get_session(agent.session_id) is None
     finally:
         agent.close()
@@ -131,6 +151,7 @@ def test_missing_session_retry_is_bounded_when_recreate_fails(tmp_path, monkeypa
         assert agent._flush_messages_to_session_db(messages, []) is False
         assert (append_attempts, create_attempts) == (1, 1)
         assert agent._session_db_created is False
+        assert agent._last_persistence_error_cause == "locked"
 
         assert agent._flush_messages_to_session_db(messages, []) is False
         assert (append_attempts, create_attempts) == (1, 2)

@@ -129,6 +129,18 @@ def test_explanation_persistence_turn_lease_cause_is_specific():
     assert "hermes doctor" not in lower
 
 
+def test_explanation_persistence_missing_session_row_is_specific():
+    out = AIAgent._format_turn_completion_explanation(
+        "session_persistence_failed", "session_row_missing"
+    )
+    lower = out.lower()
+    assert "storage record disappeared" in lower
+    assert "not saved" in lower
+    assert "disk" not in lower
+    assert "compression" not in lower
+    assert "hermes doctor" not in lower
+
+
 def test_explanation_persistence_disk_cause_keeps_disk_wording():
     out = AIAgent._format_turn_completion_explanation(
         "session_persistence_failed", "disk"

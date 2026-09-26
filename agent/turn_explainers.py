@@ -107,6 +107,11 @@ _PERSISTENCE_CAUSE_EXPLANATIONS: Dict[str, str] = {
         "for the other process to finish, then send your message "
         "again."
     ),
+    "session_row_missing": (
+        "the turn was stopped because this session's storage record disappeared "
+        "and Hermes could not rebuild it safely. Your reply was not saved — "
+        "refresh or start a new session, then send your message again."
+    ),
     "locked": (
         "the turn was stopped because session storage was busy "
         "(another Hermes process was writing to the state "
