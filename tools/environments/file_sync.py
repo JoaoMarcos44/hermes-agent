@@ -108,6 +108,7 @@ def _preserve_destination_only_xattrs(target: Path, prepared: Path) -> None:
             raise
         setxattr(prepared, name, value)
 
+
 def _sync_back_max_bytes() -> int:
     """Extraction cap; config.yaml ``terminal.sync_back_max_bytes`` overrides it for trees that
     legitimately exceed 2 GiB (a skipped extraction silently discards the whole download)."""

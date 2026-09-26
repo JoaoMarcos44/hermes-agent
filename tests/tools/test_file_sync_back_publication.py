@@ -117,6 +117,7 @@ def test_complete_publication_preserves_links_and_retries(transfer, monkeypatch,
         assert target.stat().st_mode & 0o777 == remote.stat().st_mode & 0o777
     assert set(host.parent.iterdir()) == {host, target, host.parent / "anchor.py"}
 
+
 @pytest.mark.platforms("linux")
 def test_complete_publication_preserves_destination_only_xattrs(transfer):
     manager, host, remote, _observations = transfer
