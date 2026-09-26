@@ -841,16 +841,16 @@ def _source_marker_starts_are_code(source: str, marker_positions: list[int]) -> 
 def _published_launcher_source_matches(source: str) -> bool:
     """Match the generated launcher program in order, with main() as its terminal action."""
     stripped = source.strip()
-    lowered = stripped.lower()
     cursor = 0
     marker_positions: list[int] = []
     for marker in _PUBLISHED_LAUNCHER_MARKERS:
-        position = lowered.find(marker, cursor)
-        if position < 0:
+        match = re.search(re.escape(marker), stripped[cursor:], flags=re.IGNORECASE)
+        if match is None:
             return False
+        position = cursor + match.start()
         marker_positions.append(position)
-        cursor = position + len(marker)
-    if not lowered.endswith("sys.exit(main())"):
+        cursor += match.end()
+    if not stripped.lower().endswith("sys.exit(main())"):
         return False
 
     # When argv boundaries preserve the source (for example a quoted Windows command line), AST
