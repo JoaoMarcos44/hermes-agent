@@ -66,7 +66,6 @@ def test_flush_recreates_deleted_session_with_real_agent_metadata(tmp_path):
         db.close()
 
 
-
 def test_raw_sessiondb_append_keeps_missing_parent_fk_contract(tmp_path):
     """Only the agent may reconstruct identity; raw store writes stay strict."""
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -77,7 +76,6 @@ def test_raw_sessiondb_append_keeps_missing_parent_fk_contract(tmp_path):
         assert db.get_session("missing-session") is None
     finally:
         db.close()
-
 
 
 def test_failed_session_creation_stops_before_batch_append(tmp_path, monkeypatch):

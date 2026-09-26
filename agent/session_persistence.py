@@ -305,13 +305,17 @@ def _db_flush_recreate_missing_session(agent, error: Exception, retry_budget: in
     metadata.  Raw SessionDB appenders keep their existing semantics.
     """
     if (
-        retry_budget <= 0
-        or not isinstance(error, sqlite3.IntegrityError)
+        not isinstance(error, sqlite3.IntegrityError)
         or getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
     ):
         return False
 
+    # The FK proves the cached existence claim is stale even if this call has
+    # already spent its one immediate rebuild attempt.
     agent._session_db_created = False
+    if retry_budget <= 0:
+        return False
+
     agent._ensure_db_session()
     if not agent._session_db_created:
         return False
