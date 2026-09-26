@@ -447,12 +447,21 @@ def _is_container(path: Path) -> bool:
 
 
 def _is_skill_container(path: Path, rel: Tuple[str, ...]) -> bool:
-    """A category/container below ``skills/`` is any directory without ``SKILL.md``.
+    """Whether *path* is a category/container in the skills tree.
 
-    This matches the Skills Hub ownership boundary: a directory with ``SKILL.md`` is one skill
-    root; a directory without it is a category and may also contain category metadata files.
+    A skill root is the first directory in the ancestry that contains ``SKILL.md``. Directories
+    below that root (``scripts/``, ``references/``, ...) are skill content, not categories, even
+    though they do not contain another ``SKILL.md``. This mirrors the ancestor guard used by the
+    Skills Hub installer to prevent nesting a category inside an existing skill.
     """
-    return bool(rel) and rel[0] == "skills" and path.is_dir() and not (path / "SKILL.md").is_file()
+    if not rel or rel[0] != "skills" or not path.is_dir():
+        return False
+    current = path
+    for _ in rel[1:]:
+        if (current / "SKILL.md").is_file():
+            return False
+        current = current.parent
+    return True
 
 
 def _is_merge_container(path: Path, rel: Tuple[str, ...]) -> bool:

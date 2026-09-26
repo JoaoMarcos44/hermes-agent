@@ -513,29 +513,32 @@ class TestUpdate:
         assert (mine / "SKILL.md").read_text(encoding="utf-8") == "mine\n"
         assert (research / "README.md").read_text(encoding="utf-8") == "research category v2\n"
 
-    def test_nested_non_skill_owned_path_remains_authoritative(self, profile_env):
-        """The special per-entry merge belongs to skills, not arbitrary nested owned dirs."""
+    def test_explicit_owned_support_dir_inside_skill_is_not_a_category(self, profile_env):
+        """A nested support directory remains content of its ancestor skill root."""
         mf = DistributionManifest(
-            name="owned-template",
+            name="owned-support",
             version="0.1.0",
-            distribution_owned=["SOUL.md", "templates/fragments/"],
+            distribution_owned=["SOUL.md", "skills/research/web-search/"],
         )
-        staged = _make_staging_dir(profile_env, "owned-template", manifest=mf)
-        shipped = staged / "templates" / "fragments" / "default"
-        shipped.mkdir(parents=True)
-        (shipped / "prompt.md").write_text("v1\n", encoding="utf-8")
-        plan = install_distribution(str(staged), name="owned-template")
-        local = plan.target_dir / "templates" / "fragments" / "local-only"
-        local.mkdir()
-        (local / "prompt.md").write_text("local\n", encoding="utf-8")
-        (shipped / "prompt.md").write_text("v2\n", encoding="utf-8")
+        staged = _make_staging_dir(profile_env, "owned-support", manifest=mf)
+        skill = staged / "skills" / "research" / "web-search"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("web search\n", encoding="utf-8")
+        scripts = skill / "scripts"
+        scripts.mkdir()
+        (scripts / "run.py").write_text("print(1)\n", encoding="utf-8")
+        plan = install_distribution(str(staged), name="owned-support")
 
-        update_distribution("owned-template")
+        installed_scripts = plan.target_dir / "skills" / "research" / "web-search" / "scripts"
+        (installed_scripts / "local-only.py").write_text("local\n", encoding="utf-8")
+        mf.distribution_owned = ["SOUL.md", "skills/research/web-search/scripts/"]
+        write_manifest(staged, mf)
+        (scripts / "run.py").write_text("print(2)\n", encoding="utf-8")
 
-        assert not local.exists()
-        assert (plan.target_dir / "templates" / "fragments" / "default" / "prompt.md").read_text(
-            encoding="utf-8"
-        ) == "v2\n"
+        update_distribution("owned-support")
+
+        assert not (installed_scripts / "local-only.py").exists()
+        assert (installed_scripts / "run.py").read_text(encoding="utf-8") == "print(2)\n"
 
     def test_explicit_owned_skill_category_refuses_nested_symlink_before_writes(
         self, profile_env, tmp_path
