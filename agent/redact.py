@@ -347,7 +347,7 @@ _CODE_CREDENTIAL_PLACEHOLDER_RE = re.compile(
 
 def _is_credential_reference(value: str, *, allow_placeholders: bool = False) -> bool:
     """True for an explicit variable/template reference rather than secret bytes."""
-    candidate = value.strip().rstrip("\\\"\';)")
+    candidate = value.strip().rstrip("\"');")
     candidate = candidate.split(",", 1)[0]
     if re.fullmatch(_SHELL_VAR_REF, candidate):
         return True
@@ -360,9 +360,9 @@ def _is_credential_reference(value: str, *, allow_placeholders: bool = False) ->
     return bool(allow_placeholders and _CODE_CREDENTIAL_PLACEHOLDER_RE.fullmatch(candidate))
 
 
-_SOURCE_CALL_VALUE_RE = re.compile(r"^[A-Za-z_$][\\w.$]*(?:\\([^()\\r\\n]*\\))[,;]?$\")
+_SOURCE_CALL_VALUE_RE = re.compile(r"^[A-Za-z_$][\w.$]*(?:\([^()\r\n]*\))[,;]?$")
 _SOURCE_PLACEHOLDER_VALUE_RE = re.compile(
-    r"^(?:placeholder\\b.*|example\\b.*|ephemeral\\b.*|generated\\b.*)$",
+    r"^(?:placeholder\b.*|example\b.*|ephemeral\b.*|generated\b.*)$",
     re.IGNORECASE,
 )
 
@@ -728,7 +728,12 @@ def _redact_python_repr_fields(text: str, *, source_file: bool = False) -> str:
 
         # Mapping repr can contain code-shaped fixture values too. Preserve
         # programmatic env lookups just like the ENV/JSON/YAML passes do.
-        if _ENV_LOOKUP_VALUE_RE.match(value) or (source_file and _is_source_nonsecret_value(value)):
+        if _ENV_LOOKUP_VALUE_RE.match(value):
+            return match.group(0)
+        if source_file and (
+            _is_credential_reference(value, allow_placeholders=True)
+            or _is_source_nonsecret_value(value)
+        ):
             return match.group(0)
         # An upstream pass (MCP probe header scrub, _mask_token) already masked this
         # value; re-masking would erase the scheme word it deliberately kept
@@ -913,7 +918,7 @@ def _redact_url_credentials(text: str, code_file: bool, source_file: bool = Fals
         pw = m.group(2)
         if _is_credential_reference(pw, allow_placeholders=code_file or source_file):
             return m.group(0)
-        if code_file and pw.startswith("{") and pw.endswith("}"):
+        if (code_file or source_file) and pw.startswith("{") and pw.endswith("}"):
             return m.group(0)
         return f"{m.group(1)}***{m.group(3)}"
 
@@ -925,6 +930,7 @@ def _redact_url_credentials(text: str, code_file: bool, source_file: bool = Fals
 
     text = _DB_CONNSTR_RE.sub(_redact_db, text)
     return _URL_BARE_TOKEN_RE.sub(_redact_bare_token, text)
+
 
 def _redact_phone(m):
     phone = m.group(1)
