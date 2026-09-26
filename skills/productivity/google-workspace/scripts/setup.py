@@ -55,7 +55,9 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
 ]
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+CALENDAR_READONLY_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+DRIVE_READONLY_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 CONTACTS_SCOPES = ["https://www.googleapis.com/auth/contacts.readonly"]
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DOCS_SCOPES = ["https://www.googleapis.com/auth/documents"]
@@ -73,7 +75,9 @@ SERVICE_SCOPE_MAP = {
     "email": GMAIL_SCOPES,
     "gmail": GMAIL_SCOPES,
     "calendar": CALENDAR_SCOPES,
+    "calendar-readonly": CALENDAR_READONLY_SCOPES,
     "drive": DRIVE_SCOPES,
+    "drive-readonly": DRIVE_READONLY_SCOPES,
     "contacts": CONTACTS_SCOPES,
     "people": CONTACTS_SCOPES,
     "sheets": SHEETS_SCOPES,
@@ -613,8 +617,9 @@ def main():
         "--services",
         default="all",
         help=(
-            "Google services for --auth-url: all, email/gmail, calendar, drive, "
-            "contacts/people, sheets, docs/documents; comma-separated"
+            "Google services for --auth-url: all, email/gmail, calendar, "
+            "calendar-readonly, drive, drive-readonly, contacts/people, "
+            "sheets, docs/documents; comma-separated"
         ),
     )
     parser.add_argument(

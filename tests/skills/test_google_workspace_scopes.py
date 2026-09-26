@@ -203,3 +203,16 @@ def test_live_check_uses_oauth_refresh_not_calendar_scope(setup_module, monkeypa
     assert setup_module.check_auth_live() is True
     assert refreshed == [True]
     assert "OAuth refresh succeeded" in capsys.readouterr().out
+
+
+def test_readonly_service_variants_do_not_request_write_scopes(setup_module, capsys):
+    setup_module.get_auth_url("calendar-readonly,drive-readonly", "json")
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["services"] == ["calendar-readonly", "drive-readonly"]
+    assert payload["scopes"] == [
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    assert setup_module.CALENDAR_SCOPES[0] not in payload["scopes"]
+    assert setup_module.DRIVE_SCOPES[0] not in payload["scopes"]
