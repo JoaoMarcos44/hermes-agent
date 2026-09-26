@@ -589,72 +589,118 @@ def command_line_runs_inline_source(tokens: list[str]) -> bool:
     return inline_source_flag_index(tokens) is not None
 
 
-def _inline_source_tail_names_a_program(basenames: list[str]) -> bool:
-    """Whether a ``python -c`` tail names a program the source will spawn later.
+def _nested_inline_source_start(cased_tokens: list[str], flag_index: int) -> int:
+    """First nested Python -c command carried as data, or len(tokens).
 
-    The restart watcher (#107002) is ``python -c <src> <old-pid> <python> ... gateway run``;
-    Hermes' own in-process launchers instead leave only plain lifecycle args such as
-    ``gateway run --replace``.  Since process APIs flatten argv to one string, this structural
-    distinction is the fail-closed boundary before inspecting any Hermes-owned inline source.
+    A restart watcher can carry a complete future inline launcher after its own source. Only that
+    later interpreter owns the second -c; source text and install paths before it must never be
+    mistaken for a child-program boundary.
     """
-    return any(
-        name == "-m"
-        or name.removesuffix(".exe") in ("hermes", "hermes-gateway")
-        or name.startswith(("python", "pypy"))
-        for name in basenames
+    for index in range(flag_index + 2, len(cased_tokens)):
+        basename = cased_tokens[index].lower().rsplit("/", 1)[-1].removesuffix(".exe")
+        if basename.startswith(("python", "pypy")) and inline_source_flag_index(
+            cased_tokens[index:]
+        ) is not None:
+            return index
+    return len(cased_tokens)
+
+
+def _hermes_argv0(value: str) -> bool:
+    normalized = value.replace("\\", "/").lower()
+    basename = normalized.rsplit("/", 1)[-1]
+    return basename in ("hermes", "hermes.exe", "hermes-gateway", "hermes-gateway.exe") or (
+        normalized.endswith("/hermes_cli/main.py")
     )
 
 
-def _python_c_sys_argv(command: str) -> list[str] | None:
-    """Recover the literal argv from Hermes' redirector ``python -c`` form.
-
-    Some Windows/venv launchers execute ``hermes_cli.main`` in-process after assigning a literal
-    ``sys.argv``.  This is called only after the outer inline-source tail has been proven not to
-    name another program, so a restart watcher's nested future command cannot donate its identity.
-    """
-    if "sys.argv" not in command or "hermes_cli.main" not in command:
+def _literal_sys_argv_from_source(source: str) -> list[str] | None:
+    """Literal sys.argv used by a Hermes relaunch source that actually executes the entrypoint."""
+    if len(source) > 32_768:
         return None
-    if re.search(r"\brunpy\.run_module\(\s*(['\"])hermes_cli\.main\1", command) is None:
-        return None
-    match = re.search(r"\bsys\.argv\s*=", command)
-    if match is None:
-        return None
-    start = command.find("[", match.end())
-    if start < 0:
+    try:
+        tree = ast.parse(source)
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
         return None
 
-    depth = 0
-    quote: str | None = None
-    escape = False
-    for index, char in enumerate(command[start:], start=start):
-        if quote is not None:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == quote:
-                quote = None
-            continue
-        if char in {"'", '"'}:
-            quote = char
-        elif char == "[":
-            depth += 1
-        elif char == "]":
-            depth -= 1
-            if depth == 0:
-                try:
-                    value = ast.literal_eval(command[start:index + 1])
-                except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError):
-                    return None
-                if isinstance(value, (list, tuple)) and all(isinstance(part, str) for part in value):
-                    return list(value)
+    argv: list[str] | None = None
+    argv_position: tuple[int, int] | None = None
+    launch_position: tuple[int, int] | None = None
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "sys"
+            and target.attr == "argv"
+            for target in statement.targets
+        ):
+            try:
+                value = ast.literal_eval(statement.value)
+            except (MemoryError, RecursionError, TypeError, ValueError):
                 return None
+            if not isinstance(value, (list, tuple)) or not value or not all(
+                isinstance(part, str) for part in value
+            ):
+                return None
+            argv = list(value)
+            argv_position = (statement.lineno, statement.col_offset)
+            continue
+
+        call = statement.value if isinstance(statement, ast.Expr) else None
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+            continue
+        if not (
+            isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "runpy"
+            and call.func.attr in {"run_module", "run_path"}
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        ):
+            continue
+        target = call.args[0].value.replace("\\", "/").lower()
+        if call.func.attr == "run_module":
+            if target != "hermes_cli.main":
+                continue
+        elif not _hermes_argv0(target):
+            continue
+        launch_position = (statement.lineno, statement.col_offset)
+
+    if (
+        argv is None
+        or argv_position is None
+        or launch_position is None
+        or argv_position >= launch_position
+        or not _hermes_argv0(argv[0])
+    ):
+        return None
+    return argv
+
+
+def _python_c_sys_argv(
+    raw_tokens: list[str], cased_tokens: list[str], flag_index: int, source_end: int
+) -> list[str] | None:
+    """Recover literal argv from the outer Hermes redirector/relaunch Python -c source.
+
+    Process-table APIs flatten argv, so reconstruct progressively until a real Python program parses.
+    AST inspection requires a top-level literal sys.argv assignment followed by an executed Hermes
+    run_module/run_path call; marker text inside strings or nested future commands cannot donate
+    identity.
+    """
+    for end in range(flag_index + 2, source_end + 1):
+        source = " ".join(raw_tokens[flag_index + 1:end]).strip()
+        if len(source) >= 2 and source[0] == source[-1] and source[0] in {"'", '"'}:
+            source = source[1:-1]
+        argv = _literal_sys_argv_from_source(source)
+        if argv is not None:
+            return argv
     return None
 
 
-def _hermes_inline_bootstrap_argv(cased_tokens: list[str], flag_index: int) -> list[str] | None:
+def _hermes_inline_bootstrap_argv(
+    cased_tokens: list[str], flag_index: int, source_end: int
+) -> list[str] | None:
     """Return lifecycle argv after one of Hermes' two generated in-process bootstrap programs."""
-    tail = cased_tokens[flag_index + 1:]
+    tail = cased_tokens[flag_index + 1:source_end]
     source = " ".join(tail).lower()
     if "import hermes_bootstrap" not in source:
         return None
@@ -664,17 +710,15 @@ def _hermes_inline_bootstrap_argv(cased_tokens: list[str], flag_index: int) -> l
         ("runpy.run_module('hermes_cli.main'" in source or 'runpy.run_module("hermes_cli.main"' in source)
         and "alter_sys=true" in source
     ):
-        # ``runtime_command()``: the source ends at the in-process run_module call.
         marker = "alter_sys=true)"
     elif "from hermes_cli.main import main" in source:
-        # Published ``.hermes/bin/hermes`` launcher: its final source statement calls main().
         marker = "sys.exit(main())"
     if marker is None:
         return None
 
-    for position in range(flag_index + 1, len(cased_tokens)):
+    for position in range(flag_index + 1, source_end):
         if marker in cased_tokens[position].lower():
-            return cased_tokens[position + 1:]
+            return cased_tokens[position + 1:source_end]
     return None
 
 
@@ -717,8 +761,13 @@ def _gateway_command_subcommand_from_tokens(
         elif not token.startswith(("--profile=", "-p=")):
             filtered.append(token)
     for index, token in enumerate(filtered):
-        if token == "gateway":
-            return filtered[index + 1] if index + 1 < len(filtered) else "run"
+        if token != "gateway":
+            continue
+        neighbor = filtered[index + 1] if index + 1 < len(filtered) else "run"
+        # Flattened embedded list literals can expose a bare gateway followed by punctuation.
+        # That is data residue, never a lifecycle subcommand.
+        if re.fullmatch(r"[a-z][a-z0-9-]*", neighbor):
+            return neighbor
     return None
 
 
@@ -741,19 +790,17 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
 
     flag_index = inline_source_flag_index(cased_tokens)
     if flag_index is not None:
-        basenames = [t.lower().rsplit("/", 1)[-1] for t in cased_tokens]
-        # Check this BEFORE reading an embedded sys.argv: a restart watcher may itself carry a
-        # complete future redirector/bootstrap command whose source contains those exact markers.
-        if _inline_source_tail_names_a_program(basenames[flag_index + 1:]):
-            return None
+        # Keep inspection inside this interpreter's source region. A restart watcher can carry a
+        # second Python -c launcher as trailing data; only that child may claim its markers.
+        source_end = _nested_inline_source_start(cased_tokens, flag_index)
 
-        embedded_argv = _python_c_sys_argv(command)
+        embedded_argv = _python_c_sys_argv(raw_tokens, cased_tokens, flag_index, source_end)
         if embedded_argv is not None:
             return _gateway_command_subcommand_from_tokens(
                 embedded_argv, hermes_entrypoint_inferred=True
             )
 
-        bootstrap_argv = _hermes_inline_bootstrap_argv(cased_tokens, flag_index)
+        bootstrap_argv = _hermes_inline_bootstrap_argv(cased_tokens, flag_index, source_end)
         if bootstrap_argv is not None:
             return _gateway_command_subcommand_from_tokens(
                 bootstrap_argv, hermes_entrypoint_inferred=True
