@@ -655,7 +655,14 @@ def _python_inline_source_flag_index(cased_tokens: list[str]) -> int | None:
 
 
 def _literal_sys_argv_from_source(source: str) -> list[str] | None:
-    """Literal sys.argv used by a Hermes relaunch source that actually executes the entrypoint."""
+    """Literal argv from the exact relaunch/redirector program shapes Hermes emits.
+
+    This is process-identity authority, so merely finding a later runpy call is insufficient:
+    unreachable code after an exit/raise must not make a foreign inline process look like the
+    gateway.  The supported producers are intentionally small and stable: import sys/runpy,
+    optional checkout-path insertion, literal sys.argv rebinding, then runpy as the terminal
+    top-level action.
+    """
     if len(source) > 32_768:
         return None
     try:
@@ -663,70 +670,90 @@ def _literal_sys_argv_from_source(source: str) -> list[str] | None:
     except (MemoryError, RecursionError, SyntaxError, ValueError):
         return None
 
-    argv: list[str] | None = None
-    argv_position: tuple[int, int] | None = None
-    launch_position: tuple[int, int] | None = None
-    for statement in tree.body:
-        if isinstance(statement, ast.Assign) and any(
-            isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id == "sys"
-            and target.attr == "argv"
-            for target in statement.targets
-        ):
-            try:
-                value = ast.literal_eval(statement.value)
-            except (MemoryError, RecursionError, TypeError, ValueError):
-                return None
-            if not isinstance(value, (list, tuple)) or not value or not all(
-                isinstance(part, str) for part in value
-            ):
-                return None
-            argv = list(value)
-            argv_position = (statement.lineno, statement.col_offset)
-            continue
+    body = tree.body
+    if len(body) not in {3, 4}:
+        return None
 
-        call = statement.value if isinstance(statement, ast.Expr) else None
-        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
-            continue
+    imports = body[0]
+    if not (
+        isinstance(imports, ast.Import)
+        and len(imports.names) == 2
+        and {alias.name for alias in imports.names} == {"sys", "runpy"}
+        and all(alias.asname is None for alias in imports.names)
+    ):
+        return None
+
+    index = 1
+    if len(body) == 4:
+        path_stmt = body[index]
+        path_call = path_stmt.value if isinstance(path_stmt, ast.Expr) else None
         if not (
-            isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "runpy"
-            and call.func.attr in {"run_module", "run_path"}
-            and call.args
-            and isinstance(call.args[0], ast.Constant)
-            and isinstance(call.args[0].value, str)
+            isinstance(path_call, ast.Call)
+            and isinstance(path_call.func, ast.Attribute)
+            and path_call.func.attr == "insert"
+            and isinstance(path_call.func.value, ast.Attribute)
+            and path_call.func.value.attr == "path"
+            and isinstance(path_call.func.value.value, ast.Name)
+            and path_call.func.value.value.id == "sys"
+            and len(path_call.args) == 2
+            and isinstance(path_call.args[0], ast.Constant)
+            and path_call.args[0].value == 0
+            and isinstance(path_call.args[1], ast.Constant)
+            and isinstance(path_call.args[1].value, str)
+            and not path_call.keywords
         ):
-            continue
-        target = call.args[0].value.replace("\\", "/").lower()
-        if call.func.attr == "run_module":
-            if target != "hermes_cli.main":
-                continue
-        elif not _hermes_argv0(target):
-            continue
-        # runpy only executes Hermes' CLI entrypoint when the producer runs it as __main__.
-        # Without this, an introspection/import helper such as
-        # runpy.run_module("hermes_cli.main") is mistaken for a live gateway and can become a
-        # termination target even though hermes_cli.main's __main__ guard never ran.
-        if not any(
+            return None
+        index += 1
+
+    argv_stmt = body[index]
+    if not (
+        isinstance(argv_stmt, ast.Assign)
+        and len(argv_stmt.targets) == 1
+        and isinstance(argv_stmt.targets[0], ast.Attribute)
+        and isinstance(argv_stmt.targets[0].value, ast.Name)
+        and argv_stmt.targets[0].value.id == "sys"
+        and argv_stmt.targets[0].attr == "argv"
+    ):
+        return None
+    try:
+        value = ast.literal_eval(argv_stmt.value)
+    except (MemoryError, RecursionError, TypeError, ValueError):
+        return None
+    if not isinstance(value, (list, tuple)) or not value or not all(
+        isinstance(part, str) for part in value
+    ):
+        return None
+    argv = list(value)
+    if not _hermes_argv0(argv[0]):
+        return None
+
+    launch_stmt = body[index + 1]
+    call = launch_stmt.value if isinstance(launch_stmt, ast.Expr) else None
+    if not (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "runpy"
+        and call.func.attr in {"run_module", "run_path"}
+        and len(call.args) == 1
+        and isinstance(call.args[0], ast.Constant)
+        and isinstance(call.args[0].value, str)
+        and any(
             keyword.arg == "run_name"
             and isinstance(keyword.value, ast.Constant)
             and keyword.value.value == "__main__"
             for keyword in call.keywords
-        ):
-            continue
-        launch_position = (statement.lineno, statement.col_offset)
-
-    if (
-        argv is None
-        or argv_position is None
-        or launch_position is None
-        or argv_position >= launch_position
-        or not _hermes_argv0(argv[0])
+        )
     ):
         return None
-    return argv
 
+    target = call.args[0].value.replace("\\", "/").lower()
+    if call.func.attr == "run_module":
+        if target != "hermes_cli.main":
+            return None
+    elif not _hermes_argv0(target):
+        return None
+    return argv
 
 def _python_c_sys_argv(
     raw_tokens: list[str], cased_tokens: list[str], flag_index: int, source_end: int
