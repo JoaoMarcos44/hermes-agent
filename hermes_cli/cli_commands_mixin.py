@@ -835,7 +835,7 @@ class CLICommandsMixin:
         print(f"  Snapshot created: {snap_id}" if snap_id else "  No state files found to snapshot.")
 
     def _snapshot_restore(self, parts) -> None:
-        from hermes_cli.backup import list_quick_snapshots, restore_quick_snapshot
+        from hermes_cli.backup import _quick_snapshot_root, list_quick_snapshots, restore_quick_snapshot
         if len(parts) < 3:
             print("  Usage: /snapshot restore <snapshot-id>")
             snaps = list_quick_snapshots(limit=1)
@@ -862,7 +862,20 @@ class CLICommandsMixin:
             _pr(f"  Restored state from: {snap_id}",
                 "  Restart recommended for gateway/dashboard processes to pick up state.db changes.")
         else:
-            print(f"  Snapshot not found: {snap_id}")
+            # restore_quick_snapshot() is False both when the snapshot does
+            # not exist and when it existed but a file was refused/failed
+            # (e.g. a corrupt state.db source, #122868). Never claim success
+            # here, and never blame a missing snapshot for a refusal.
+            root = _quick_snapshot_root()
+            snap_exists = root.exists() and any(
+                d.name == snap_id and d.is_dir() and (d / "manifest.json").exists()
+                for d in root.iterdir()
+            )
+            if snap_exists:
+                print(f"  Snapshot restore incomplete: {snap_id} — some files "
+                      "were not restored (see messages above).")
+            else:
+                print(f"  Snapshot not found: {snap_id}")
 
     def _snapshot_prune(self, parts) -> None:
         from hermes_cli.backup import prune_quick_snapshots

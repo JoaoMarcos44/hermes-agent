@@ -34,6 +34,7 @@ from hermes_cli.backup_restore import (
     _detect_prefix,
     _extract_member_atomically,
     _import_db_member,
+    _read_only_uri,
     _safe_restore_db,
     _validate_backup_zip,
 )
@@ -345,10 +346,16 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
 # --- SQLite safe copy ---
 
 def _query_ro_sqlite(path: Path, fn):
-    """Run ``fn(conn)`` on a read-only connection to *path*; return ``(value, None)`` or ``(None, exc)``."""
+    """Run ``fn(conn)`` on a read-only connection to *path*; return ``(value, None)`` or ``(None, exc)``.
+
+    The URI is percent-encoded (``_read_only_uri``) so validation and any
+    later publish agree on which file is meant: an unescaped ``file:{path}``
+    drops everything from a ``#`` and silently probes a same-named decoy
+    (#122868).
+    """
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        conn = sqlite3.connect(_read_only_uri(path), uri=True, timeout=1.0)
         return fn(conn), None
     except Exception as exc:
         return None, exc
@@ -1454,8 +1461,11 @@ def restore_quick_snapshot(
 ) -> bool:
     """Restore state from a quick snapshot.
 
-    Overwrites current state files with the snapshot's copies.
-    Returns True if at least one file was restored.
+    Overwrites current state files with the snapshot's copies.  Every file the
+    loop attempts is recovered when it can be (a recovery path recovers
+    everything it can — matching ``run_import``), but a refused or failed
+    restore is a partial restore, not a success: returns True only when at
+    least one file was restored AND nothing that was attempted failed.
     """
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
@@ -1486,6 +1496,7 @@ def restore_quick_snapshot(
         meta = json.load(f)
 
     restored = 0
+    failures = 0
     for rel in meta.get("files", {}):
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
@@ -1514,18 +1525,25 @@ def restore_quick_snapshot(
                 # restored data instead of continuing to serve stale
                 # cached pages from a replaced inode (issue #65942).
                 if not _safe_restore_db(src, dst):
-                    # Refused (live holder) or failed: the destination was
-                    # left as it was. Count it as a failure, not a restore.
+                    # Refused (live holder, corrupt source) or failed: the
+                    # destination was left as it was. Count it as a failure,
+                    # not a restore, and keep recovering the other files.
                     logger.error("Failed to restore %s: live-safe restore refused", rel)
+                    failures += 1
                     continue
             else:
                 shutil.copy2(src, dst)
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
+            failures += 1
 
     logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
-    return restored > 0
+    # Anything we attempted and did not land makes this a partial restore
+    # (#122868): the aggregate must not report success over a refused file,
+    # but it still recovers every other file first (same contract as
+    # run_import's "N restored ... M not restored" report).
+    return restored > 0 and failures == 0
 
 
 def _count_cron_jobs(path: Path) -> Optional[int]:

@@ -16,13 +16,41 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from utils import (
     _preserve_file_mode, _preserve_file_owner, _restore_file_mode, _restore_file_owner, atomic_replace,
 )
 
 logger = logging.getLogger(__name__)
+
+# Bytes that may appear literally in a SQLite ``file:`` URI path: unreserved
+# characters plus the path separators and the Windows drive colon.  Everything
+# else — notably ``#``, ``?``, ``%``, control and non-ASCII bytes — is
+# percent-encoded by :func:`_read_only_uri`.
+_URI_PATH_SAFE_BYTES = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~" + b"/\\:"
+)
+
+
+def _read_only_uri(path: Path) -> str:
+    """Percent-encoded ``file:`` URI for a read-only SQLite connection to *path*.
+
+    SQLite's URI parser gives ``#``, ``?`` and ``%`` syntactic meaning in the
+    filename: everything from a ``#`` on is a fragment the parser drops, so an
+    unescaped ``file:{path}?mode=ro`` silently opens — and validates against —
+    whatever file sits at the pre-fragment path (a same-named decoy) instead of
+    the file the caller named (#122868).  Encoding every byte outside the
+    unreserved set, keeping only the path separators and the Windows drive
+    colon literal, makes the decoded path exact on POSIX and Windows alike.
+    """
+    raw = os.fspath(path)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "surrogateescape")
+    encoded = "".join(
+        chr(byte) if byte in _URI_PATH_SAFE_BYTES else f"%{byte:02X}" for byte in raw
+    )
+    return f"file:{encoded}?mode=ro"
 
 def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
     """PIDs of OTHER processes holding *db_path* or its WAL/SHM open.
@@ -96,7 +124,21 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     process or in-process connection holds the file: replacing the inode
     under a live holder is the #90950 split-brain, so that branch fails
     closed (returns ``False``) and the caller reports the file as skipped.
+
+    A source that does not pass ``verify_sqlite_integrity`` is refused
+    outright (#122868): both mutation routes below would otherwise publish
+    corrupt bytes over a healthy live database — ``backup()`` copies
+    malformed pages without raising, and the fallback copies the rejected
+    source verbatim.  Validated here, before the destination is opened,
+    so every caller gets the same admission decision.
     """
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    verdict = verify_sqlite_integrity(src)
+    if not verdict["valid"]:
+        logger.error("Refusing SQLite restore from %s: %s", src, verdict["message"])
+        return False
+
     dst_conn: Optional[sqlite3.Connection] = None
     try:
         dst_conn = sqlite3.connect(str(dst))
@@ -106,7 +148,7 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
             dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
             pass
-        src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        src_conn = sqlite3.connect(_read_only_uri(src), uri=True)
         try:
             src_conn.backup(dst_conn)
         finally:
@@ -270,6 +312,7 @@ def _extract_member_atomically(
     member: str,
     target: Path,
     new_file_mode: Optional[int] = None,
+    validate: Optional[Callable[[Path], None]] = None,
 ) -> None:
     """Restore one zip member onto *target* with no truncation window.
 
@@ -353,6 +396,13 @@ def _extract_member_atomically(
                 shutil.copyfileobj(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
+        if validate is not None:
+            # Policy gate against the *staged* bytes, before publish: a caller
+            # that must not install certain content (e.g. a SQLite source that
+            # fails admission, #122868) can refuse here and the target never
+            # sees the member's bytes.  A raise lands in the cleanup handler
+            # below, which unlinks the staged temp before propagating.
+            validate(Path(tmp_name))
         real_path = Path(atomic_replace(tmp_name, target))
         # Owner first, mode second — the ordering ``atomic_yaml_write`` uses,
         # because chown drops setuid/setgid and a mode restore that ran first
@@ -393,6 +443,26 @@ def _count_session_rows(path: Path) -> Optional[Tuple[int, int]]:
         conn.close()
 
 
+def _validate_db_member_staging(staged: Path) -> None:
+    """Refuse to publish a staged ``.db`` member that does not verify (#122868).
+
+    The missing-target branch used to publish a fresh ``.db`` member with no
+    validation at all, so ``hermes import`` into a fresh home would install a
+    corrupt database and report success.  Raises ``OSError`` — the same
+    reporting shape the existing-target branch raises when its live-safe
+    restore is refused — so ``run_import`` records the member as skipped and
+    returns 1 instead of counting it as restored.
+    """
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    verdict = verify_sqlite_integrity(staged)
+    if not verdict["valid"]:
+        raise OSError(
+            f"refused: database member failed integrity check ({verdict['message']}); "
+            "nothing was published."
+        )
+
+
 def _import_db_member(
     zf: zipfile.ZipFile,
     member: str,
@@ -431,7 +501,14 @@ def _import_db_member(
                 f"{', '.join(str(pid) for pid in sorted(holders))}; publishing a new file would "
                 "leave them writing an invisible database. Stop those processes and re-run the import."
             )
-        _extract_member_atomically(zf, member, target, new_file_mode)
+        # A fresh target is still a database the user will open: the member
+        # must pass the same source admission as the existing-target branch
+        # (#122868) before anything is published.  The staged-then-publish
+        # route keeps ``_extract_member_atomically``'s new-file mode/ownership
+        # rules intact.
+        _extract_member_atomically(
+            zf, member, target, new_file_mode, validate=_validate_db_member_staging
+        )
         return
 
     # The database keeps its own mode/ownership: the bytes come from the
