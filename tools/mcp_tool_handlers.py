@@ -495,9 +495,13 @@ def _capped_structured_content(result):
 
 
 def _json_value_matches_text(text: str, value) -> bool:
-    """Compare one MCP text block with a JSON value without Python's bool/int coercion."""
-    if isinstance(value, str):
-        return text == value
+    """Compare one MCP text block with a JSON value without Python's bool/int coercion.
+
+    Real Python strings are rendered verbatim, while non-string values that validate to a
+    JSON string (notably ``bytes``) are rendered as JSON text. Try both representations.
+    """
+    if isinstance(value, str) and text == value:
+        return True
     try:
         parsed = json.loads(text)
         left = json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -505,8 +509,6 @@ def _json_value_matches_text(text: str, value) -> bool:
         return left == right
     except (TypeError, ValueError):
         return False
-
-
 def _content_dual_emits_structured(result, structured) -> bool:
     """True when some text block is the same JSON value as structuredContent."""
     return any(
@@ -539,7 +541,7 @@ def _sdk_wrapped_result_projection(result, structured):
         if not _json_value_matches_text(raw, item):
             return False, None
         clean = strip_unicode_tags(raw)
-        if isinstance(item, str):
+        if isinstance(item, str) and raw == item:
             projected.append(clean)
         else:
             try:

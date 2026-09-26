@@ -287,19 +287,37 @@ class TestContentStructuredArbitration:
         sdk = MCPServer("typed-wrapper")
 
         @sdk.tool()
+        def text() -> str:
+            return "hi"
+
+        @sdk.tool()
         def count() -> int:
             return 42
 
         @sdk.tool()
         def names() -> list[str]:
-            return ["ann\nbob", "carol"]
+            return ["ann\\nbob", "carol"]
+
+        @sdk.tool()
+        def blob() -> bytes:
+            return b"abc"
+
+        @sdk.tool()
+        def blobs() -> list[bytes]:
+            return [b"a", b"b"]
 
         session = _patch_mcp_server
         handler = _mcp_handlers._make_tool_handler("test-server", "my-tool", 30.0)
-        for tool, expected in (("count", 42), ("names", ["ann\nbob", "carol"])):
+        cases = (
+            ("text", "hi"),
+            ("count", 42),
+            ("names", ["ann\\nbob", "carol"]),
+            ("blob", "abc"),
+            ("blobs", ["a", "b"]),
+        )
+        for tool, expected in cases:
             session.call_tool = AsyncMock(return_value=asyncio.run(sdk.call_tool(tool, {})))
             assert json.loads(handler({})) == {"result": expected}
-
         session.call_tool = AsyncMock(
             return_value=_FakeCallToolResult(
                 content=[_FakeContentBlock("")],
@@ -316,6 +334,7 @@ class TestContentStructuredArbitration:
         for content, structured in (
             ([_FakeContentBlock("2 names")], {"result": ["ann", "bob"]}),
             ([_FakeContentBlock("1")], {"result": True}),
+            ([_FakeContentBlock("0")], {"result": False}),
         ):
             session.call_tool = AsyncMock(
                 return_value=_FakeCallToolResult(content=content, structuredContent=structured)
