@@ -400,3 +400,28 @@ def test_a_real_tool_error_is_still_a_failure():
     assert _detect_tool_failure("read_file", real)[0] is True
     # The marker is only honoured as the literal boolean, never as truthy prose.
     assert classify_tool_failure("read_file", '{"error": "x", "guardrail_refusal": "yes"}')[0] is True
+
+
+def test_delegate_task_poll_duration_remains_semantic_for_loop_hash():
+    """#124072/#124276: shared result hashing must not erase another tool's progress."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=3)
+    )
+    args = {"action": "list"}
+    for i in range(1, 7):
+        result = json.dumps({
+            "status": "running",
+            "results": [{
+                "subagent_id": "child-1",
+                "status": "running",
+                "summary": "still working",
+                "duration_seconds": float(i),
+            }],
+        })
+        observation = controller.observe_call(
+            "delegate_task", args, result, tool_call_id=f"delegate-list-{i}"
+        )
+        assert observation.notice is None, (
+            f"delegate_task progress collapsed into an identical replay at iteration {i}"
+        )
+        assert controller.halt_decision is None
