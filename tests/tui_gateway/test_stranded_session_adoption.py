@@ -399,8 +399,8 @@ def test_donor_growth_between_export_and_retire_blocks_retirement(stores, monkey
 
     real_export = default_db.export_session_lineage
 
-    def _export_then_append(session_id):
-        payload = real_export(session_id)
+    def _export_then_append(session_id, **kwargs):
+        payload = real_export(session_id, **kwargs)
         # Another backend appends AFTER the export snapshot is taken.
         default_db.append_message(STRANDED_ID, "user", "raced question")
         default_db.append_message(STRANDED_ID, "assistant", "raced answer")
@@ -420,3 +420,39 @@ def test_donor_growth_between_export_and_retire_blocks_retirement(stores, monkey
     second = profile_db.adopt_session_lineage_from(default_db, STRANDED_ID)
     assert second["donor_retired"] is False
     assert not default_db.get_session(STRANDED_ID)["archived"]
+
+
+def test_adoption_carries_compacted_history_before_retiring_the_donor(gateway):
+    """A retired donor is unrecoverable, so the profile copy must show the same
+    history the donor showed — turns in-place compaction archived included — and
+    feed the model the same live context. A live-rows-only copy left those turns
+    visible nowhere once the donor was stamped adopted_by_profile (#122679)."""
+    mod, default_db, profile_home = gateway
+    _seed_stranded(default_db, turns=4)
+    tail = default_db.get_messages(STRANDED_ID)[-2:]
+    default_db.archive_and_compact(
+        STRANDED_ID, [{"role": "user", "content": "[summary of turns 1-3]"}, *tail], tail_count=2)
+
+    def _rows(db, **flags):
+        return [(m["role"], m["content"], m.get("active", 1), m.get("compacted", 0))
+                for m in db.get_messages(STRANDED_ID, **flags)]
+
+    shown_before = _rows(default_db, include_compacted=True)
+    live_before = _rows(default_db)
+    assert len(shown_before) > len(live_before), "compacted turns must be archived, not deleted"
+
+    resp = mod.handle_request(
+        {"id": "20", "method": "session.resume",
+         "params": {"session_id": STRANDED_ID, "profile": "developer", "lazy": True}})
+
+    assert not resp.get("error"), resp.get("error")
+    donor = default_db.get_session(STRANDED_ID)
+    assert donor["archived"] and donor["end_reason"] == "adopted_by_profile"
+    pdb = SessionDB(db_path=profile_home / "state.db")
+    try:
+        assert _rows(pdb, include_inactive=True) == _rows(default_db, include_inactive=True), \
+            "every donor row must be present with its state"
+        assert _rows(pdb, include_compacted=True) == shown_before, "display history must match the donor"
+        assert _rows(pdb) == live_before, "archived turns must not re-enter live model context"
+    finally:
+        pdb.close()
