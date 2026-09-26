@@ -161,6 +161,7 @@ def _fake_run(task_index, goal, child=None, parent_agent=None, **kw):
         "duration_seconds": 0.1, "model": "m", "exit_reason": "completed",
     }
 
+
 def test_delegate_manifest_uses_effective_parent_route_when_delegation_is_unpinned(monkeypatch):
     """Pure inheritance must record the route the child will actually run, not null overrides."""
     import tools.delegate_tool as dt
