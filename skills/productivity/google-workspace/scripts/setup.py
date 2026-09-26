@@ -443,30 +443,6 @@ def get_auth_url(services: str | None = "all", output_format: str = "text"):
     print(json.dumps(payload) if output_format == "json" else payload["auth_url"])
 
 
-def get_auth_url():
-    """Print the OAuth authorization URL. User visits this in a browser."""
-    if not CLIENT_SECRET_PATH.exists():
-        print("ERROR: No client secret stored. Run --client-secret first.")
-        sys.exit(1)
-
-    _ensure_deps()
-    from google_auth_oauthlib.flow import Flow
-
-    flow = Flow.from_client_secrets_file(
-        str(CLIENT_SECRET_PATH),
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-        autogenerate_code_verifier=True,
-    )
-    auth_url, state = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-    )
-    _save_pending_auth(state=state, code_verifier=flow.code_verifier)
-    # Print just the URL so the agent can extract it cleanly
-    print(auth_url)
-
-
 def exchange_auth_code(code: str, output_format: str = "text"):
     """Exchange the authorization code for a token and save the exact grant."""
     if not CLIENT_SECRET_PATH.exists():
