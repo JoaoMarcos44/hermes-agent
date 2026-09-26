@@ -169,15 +169,17 @@ def test_inert_full_published_launcher_fingerprint_stays_anonymous():
 def test_flattened_real_launcher_text_inside_string_stays_anonymous():
     """Flattening must not turn an inert copy of the real producer source into identity."""
     producer_source = _launcher_script("hermes", Path("/opt/hermes"), None).strip()
-    flattened_producer = " ".join(producer_source.splitlines())
+    producer_lines = producer_source.splitlines()
+    flattened_producer = " ".join(producer_lines)
     inert_source = (
-        "import sys, time if False: note = \"\"\""
-        + flattened_producer
-        + "\"\"\" main = lambda: time.sleep(3600) sys.exit(main())"
+        producer_lines[0]
+        + " note = \"\"\""
+        + " ".join(producer_lines[1:])
+        + "\"\"\" main = lambda: 0; sys.exit(main())"
     )
 
-    # The real flattened producer is still recognized, while the exact same fingerprint inside a
-    # Python string is data rather than executable launcher code.
+    # The real flattened producer is still recognized. Keeping its genuine first import outside
+    # the string makes this exercise the lexical fallback rather than only the prefix guard.
     assert published_source_matches(flattened_producer) is True
     assert published_source_matches(inert_source) is False
 
