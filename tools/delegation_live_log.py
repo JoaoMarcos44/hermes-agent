@@ -278,6 +278,7 @@ def update_manifest_route(delegation_id: Optional[str], *, model: Optional[str],
         manifest["provider"] = provider
         _dump_json(mp, manifest)
 
+
 def update_manifest_statuses(delegation_id: Optional[str],
                              results: List[Dict[str, Any]]) -> None:
     """Best-effort per-task status update once the batch has aggregated."""
