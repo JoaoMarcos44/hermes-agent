@@ -253,6 +253,18 @@ def test_restart_watcher_with_unquoted_relaunch_data_preserves_spawn_intent():
     assert spawn_intent(watcher) == "run"
 
 
+def test_unreachable_relaunch_entrypoint_does_not_grant_identity():
+    """A syntactic runpy call after an unconditional exit is not executed gateway identity."""
+    cmd = (
+        "python -c import sys, runpy; "
+        "sys.argv = ['/opt/hermes/hermes_cli/main.py', 'gateway', 'run']; "
+        "__import__('time').sleep(3600); raise SystemExit; "
+        "runpy.run_module('hermes_cli.main', run_name='__main__')"
+    )
+    assert matches(cmd) is False
+    assert matches_runtime(cmd) is False
+
+
 def test_marker_text_inside_inline_source_is_not_gateway_identity():
     cmd = (
         "python -c import sys; "
