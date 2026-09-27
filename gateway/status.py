@@ -1,6 +1,7 @@
 """Gateway runtime status helpers: PID/lock/marker files under ``{HERMES_HOME}`` (one set per
 home/profile) that tell whether the gateway daemon is running."""
 
+import ast
 import asyncio
 import contextlib
 import copy
@@ -500,8 +501,19 @@ def get_process_start_time(pid: int) -> Optional[int]:
     return _get_process_start_time(pid)
 
 
+def _process_argv_to_command_line(parts: list[str]) -> str:
+    """Render argv without losing argument boundaries before the identity matcher reparses it.
+
+    The matcher intentionally tokenizes with ``shlex.split(..., posix=False)`` so Windows command
+    lines and quoted paths have one cross-platform grammar. ``list2cmdline`` is the matching
+    boundary-preserving representation: unlike a bare space join, a large ``-c`` source remains
+    one argument even when it contains spaces and quotes.
+    """
+    return subprocess.list2cmdline([str(part) for part in parts])
+
+
 def _read_process_cmdline(pid: int) -> Optional[str]:
-    """Process command line as one string: /proc, then psutil, then ``ps``.
+    """Process command line as one boundary-preserving string: /proc, then psutil, then ``ps``.
 
     Order is by cost, and this runs per live gateway on every roster/status poll. ``psutil`` reads
     the process table in-process (a ``sysctl`` on macOS) where ``ps`` costs a fork+exec — measured
@@ -511,12 +523,18 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     with contextlib.suppress(OSError):
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         if raw:
-            return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+            raw_parts = raw.split(b"\x00")
+            if raw_parts and raw_parts[-1] == b"":
+                raw_parts.pop()
+            if raw_parts:
+                return _process_argv_to_command_line([
+                    part.decode("utf-8", errors="ignore") for part in raw_parts
+                ])
     with contextlib.suppress(Exception):
         import psutil  # type: ignore
         cmdline_parts = psutil.Process(pid).cmdline()
         if cmdline_parts:
-            return " ".join(cmdline_parts)
+            return _process_argv_to_command_line(cmdline_parts)
     if not _IS_WINDOWS:
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             result = subprocess.run(
@@ -588,6 +606,106 @@ def command_line_runs_inline_source(tokens: list[str]) -> bool:
     return inline_source_flag_index(tokens) is not None
 
 
+def _qualified_ast_name(node: ast.AST) -> Optional[str]:
+    """Dotted name for a simple Name/Attribute expression, else None."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _qualified_ast_name(node.value)
+        return f"{parent}.{node.attr}" if parent else None
+    return None
+
+
+def _call_named(stmt: ast.stmt, name: str) -> Optional[ast.Call]:
+    if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+        return None
+    return stmt.value if _qualified_ast_name(stmt.value.func) == name else None
+
+
+def _is_runtime_launcher_source(source: str) -> bool:
+    """Whether *source* is the bootstrap emitted by ``_launchers.runtime_command``.
+
+    Arbitrary ``python -c`` wrappers must remain non-identity (#107002): their trailing argv
+    can describe a child they will launch later.  The installation launcher is different because
+    its source itself transfers control to ``hermes_cli.main`` in this process.  Match that
+    contract structurally rather than by source substrings, so dead branches, comments, and string
+    literals that merely mention the entry point cannot turn an unrelated process into a gateway.
+    """
+    try:
+        body = ast.parse(source).body
+    except (SyntaxError, ValueError):
+        return False
+    if len(body) != 8:
+        return False
+
+    imports = body[0]
+    if not isinstance(imports, ast.Import) or [alias.name for alias in imports.names] != ["os", "sys", "runpy"]:
+        return False
+
+    for stmt, key in zip(body[1:4], ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")):
+        call = _call_named(stmt, "os.environ.pop")
+        if (
+            call is None or len(call.args) != 2
+            or not isinstance(call.args[0], ast.Constant) or call.args[0].value != key
+            or not isinstance(call.args[1], ast.Constant) or call.args[1].value is not None
+        ):
+            return False
+
+    path_insert = _call_named(body[4], "sys.path.insert")
+    if (
+        path_insert is None or len(path_insert.args) != 2
+        or not isinstance(path_insert.args[0], ast.Constant) or path_insert.args[0].value != 0
+    ):
+        return False
+
+    home_stmt = body[5]
+    if not isinstance(home_stmt, ast.Assign) or len(home_stmt.targets) != 1:
+        return False
+    home_target = home_stmt.targets[0]
+    if (
+        not isinstance(home_target, ast.Subscript)
+        or _qualified_ast_name(home_target.value) != "os.environ"
+        or not isinstance(home_target.slice, ast.Constant)
+        or home_target.slice.value != "HERMES_HOME"
+    ):
+        return False
+
+    bootstrap_import = body[6]
+    if (
+        not isinstance(bootstrap_import, ast.Import)
+        or [alias.name for alias in bootstrap_import.names] != ["hermes_bootstrap"]
+    ):
+        return False
+
+    entry = _call_named(body[7], "runpy.run_module")
+    if (
+        entry is None or len(entry.args) != 1
+        or not isinstance(entry.args[0], ast.Constant)
+        or entry.args[0].value != "hermes_cli.main"
+    ):
+        return False
+    keywords = {kw.arg: kw.value for kw in entry.keywords if kw.arg is not None}
+    return (
+        set(keywords) == {"run_name", "alter_sys"}
+        and isinstance(keywords["run_name"], ast.Constant)
+        and keywords["run_name"].value == "__main__"
+        and isinstance(keywords["alter_sys"], ast.Constant)
+        and keywords["alter_sys"].value is True
+    )
+
+
+def _runtime_launcher_program_tokens(cased_tokens: list[str]) -> Optional[list[str]]:
+    """Program argv carried by Hermes' own in-process ``-c`` launcher, else None."""
+    flag_index = inline_source_flag_index(cased_tokens)
+    source_index = None if flag_index is None else flag_index + 1
+    if source_index is None or source_index >= len(cased_tokens):
+        return None
+    if not _is_runtime_launcher_source(cased_tokens[source_index]):
+        return None
+    trailing = cased_tokens[source_index + 1:]
+    return trailing or None
+
+
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
@@ -606,11 +724,18 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     if not tokens:
         return None
     basenames = [t.rsplit("/", 1)[-1] for t in tokens]
-    # ``python -c <src> … -m hermes_cli.main gateway run``: the trailing argv belongs to the program
-    # the inline source will spawn later, not to this process (#107002). Case-preserving tokens:
-    # the operand-taking ``-X``/``-W``/``-Q`` must not be conflated with ``-q``/``-b``.
+    # Arbitrary ``python -c <src> ...`` keeps the #107002 refusal: trailing argv may name a
+    # future child. Hermes' own runtime launcher is the narrow exception because its structurally
+    # verified source transfers control to hermes_cli.main in THIS process.
+    entrypoint_in_source = False
     if command_line_runs_inline_source(cased_tokens):
-        return None
+        program_tokens = _runtime_launcher_program_tokens(cased_tokens)
+        if program_tokens is None:
+            return None
+        cased_tokens = program_tokens
+        tokens = [t.lower() for t in cased_tokens]
+        basenames = [t.rsplit("/", 1)[-1] for t in tokens]
+        entrypoint_in_source = True
     # The launchd job's osascript wrapper (gateway_launchd.launchd_program_arguments) carries the gateway argv
     # inside one JXA script string; the gateway itself is its child and is matched on its own command line.
     if basenames[0] == "osascript":
@@ -627,7 +752,7 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     if any(b in ("hermes-gateway", "hermes-gateway.exe") for b in basenames):
         return "run"
     joined = " ".join(tokens)
-    if "hermes_cli.main" not in joined and "hermes_cli/main.py" not in joined and not any(
+    if not entrypoint_in_source and "hermes_cli.main" not in joined and "hermes_cli/main.py" not in joined and not any(
         b in ("hermes", "hermes.exe") for b in basenames
     ):
         return None
