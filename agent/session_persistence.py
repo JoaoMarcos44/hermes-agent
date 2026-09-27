@@ -208,6 +208,11 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         and sanitize_context(content).strip() != content.strip()
     ):
         api_content = content
+    display_metadata = msg.get("display_metadata")
+    if isinstance(display_metadata, dict) and "todo_snapshot" in display_metadata:
+        from agent.message_metadata import has_trusted_todo_snapshot_provenance
+        if not has_trusted_todo_snapshot_provenance(msg):
+            display_metadata = {k: v for k, v in display_metadata.items() if k != "todo_snapshot"} or None
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
         "role": role, "content": _durable_content(content), "tool_name": msg.get("tool_name"),
@@ -216,7 +221,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
-        "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
+        "display_kind": _summary_display_kind(msg), "display_metadata": display_metadata,
         "platform_message_id": msg.get("platform_message_id"),  # load-bearing for restart drain-window recovery dedup
     }
     if isinstance(msg.get("_row_id"), int):

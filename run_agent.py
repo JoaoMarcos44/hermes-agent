@@ -1068,11 +1068,14 @@ class AIAgent(
         _set_interrupt(False)
 
     def _latest_todo_response(self, history: List[Dict[str, Any]]) -> Optional[tuple]:
-        """Walk history backwards for the newest paired, size-bounded todo result → ``(todos, revision)``."""
+        """Newest trusted compression carrier or paired, size-bounded Todo result."""
         from tools.todo_tool import MAX_TODO_RESULT_CHARS
 
         for idx in range(len(history) - 1, -1, -1):
             msg = history[idx]
+            persisted = self._validated_persisted_todo_snapshot(msg)
+            if persisted is not None:
+                return persisted["todos"], persisted["revision"]
             content = msg.get("content", "")
             if msg.get("role") != "tool" or not isinstance(content, str) or not self._tool_response_matches_todo_call(history, idx):
                 continue
@@ -1089,6 +1092,35 @@ class AIAgent(
             if "todos" in data and isinstance(data["todos"], list):
                 return data["todos"], data.get("revision", 1)
         return None
+
+    @staticmethod
+    def _validated_persisted_todo_snapshot(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Validate structured state on one process-local trusted Todo compression carrier."""
+        from agent.message_metadata import has_trusted_todo_snapshot_provenance
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS, TodoStore
+
+        if not has_trusted_todo_snapshot_provenance(message):
+            return None
+        metadata = message.get("display_metadata")
+        snapshot = metadata.get("todo_snapshot") if isinstance(metadata, dict) else None
+        if not isinstance(snapshot, dict) or set(snapshot) != {"todos", "revision"}:
+            return None
+        todos, revision = snapshot.get("todos"), snapshot.get("revision")
+        if not isinstance(todos, list) or type(revision) is not int or revision < 1:
+            return None
+        try:
+            encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+        if len(encoded) > MAX_TODO_RESULT_CHARS:
+            return None
+        candidate = TodoStore()
+        try:
+            candidate.restore(todos, revision=revision)
+        except Exception:
+            return None
+        canonical = candidate.snapshot()
+        return canonical if canonical == snapshot else None
 
     @classmethod
     def _tool_response_matches_todo_call(cls, history: List[Dict[str, Any]], tool_index: int) -> bool:

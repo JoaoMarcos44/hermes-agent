@@ -3067,9 +3067,45 @@ def _run_summary_dispatch(
     return compressed
 
 
+def _bounded_todo_snapshot(agent: Any) -> Optional[dict]:
+    """Structured Todo state for persistence metadata, bounded by the existing hydration limit."""
+    from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
+    try:
+        snapshot = agent._todo_store.snapshot()
+        encoded = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if len(encoded) > MAX_TODO_RESULT_CHARS:
+        logger.warning(
+            "Skipping oversized Todo compression carrier metadata: session=%s chars=%d",
+            getattr(agent, "session_id", None) or "none", len(encoded),
+        )
+        return None
+    return snapshot
+
+
+def _set_todo_snapshot_metadata(message: dict, snapshot: Optional[dict]) -> None:
+    from agent.message_metadata import clear_todo_snapshot_provenance, stamp_live_todo_snapshot
+
+    metadata = message.get("display_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    if snapshot is None:
+        metadata.pop("todo_snapshot", None)
+        clear_todo_snapshot_provenance(message)
+    else:
+        metadata["todo_snapshot"] = snapshot
+        stamp_live_todo_snapshot(message)
+    if metadata:
+        message["display_metadata"] = metadata
+    else:
+        message.pop("display_metadata", None)
+
+
 def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
     """Strip stale todo snapshots from ``compressed`` and fold the live one in (in place)."""
     todo_snapshot = agent._todo_store.format_for_injection()
+    todo_state = _bounded_todo_snapshot(agent) if todo_snapshot else None
     # Non-empty store (even all done) is authoritative: drop the old snapshot. A
     # truly empty store may be un-rehydrated post-compaction: keep the snapshot.
     _todo_has_items = getattr(agent._todo_store, "has_items", None)
@@ -3100,6 +3136,7 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
                 # No longer todo-only scaffolding; other synthetic flags stay authoritative and
                 # _is_real_user_message() recomputes provenance from content + flags.
                 _todo_message.pop("_todo_snapshot_synthetic", None)
+            _set_todo_snapshot_metadata(_todo_message, None)
             break
     if todo_snapshot:
         # If this boundary pruned skill bodies, the policy behind the todos is gone:
@@ -3128,6 +3165,7 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
             if _is_real_user_message(_probe):
                 _snapshot_text = f"\n\n{todo_snapshot}" if isinstance(_stripped, str) and _stripped else todo_snapshot
                 _replace_message_content(_tail, _append_text_to_content(_stripped, _snapshot_text))
+                _set_todo_snapshot_metadata(_tail, todo_state)
                 merged = True
             elif (
                 _stripped != _tail.get("content") and not _message_text({"role": "user", "content": _stripped}).strip()
@@ -3136,9 +3174,12 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
                 # refresh it in place instead of stacking a duplicate.
                 _replace_message_content(_tail, todo_snapshot)
                 _tail["_todo_snapshot_synthetic"] = True
+                _set_todo_snapshot_metadata(_tail, todo_state)
                 merged = True
         if not merged:
-            compressed.append({"role": "user", "content": todo_snapshot, "_todo_snapshot_synthetic": True})
+            carrier = {"role": "user", "content": todo_snapshot, "_todo_snapshot_synthetic": True}
+            _set_todo_snapshot_metadata(carrier, todo_state)
+            compressed.append(carrier)
 
 
 def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
