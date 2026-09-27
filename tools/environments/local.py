@@ -311,6 +311,15 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
                          _plugin_terminal_env_strip_keys(), lambda p: p)
 
 
+def _sanitize_terminal_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
+    """Sanitize a local terminal background/PTY child and fix Python precedence."""
+    return _scrubbed_env(
+        [(base_env or {}, False), (extra_env or {}, True)],
+        _plugin_terminal_env_strip_keys(),
+        _prefer_dependency_python,
+    )
+
+
 def hermes_subprocess_env(
     *, inherit_credentials: bool = False, base_env: dict[str, str] | None = None
 ) -> dict[str, str]:
@@ -620,6 +629,48 @@ def _managed_runtime_path_entries() -> list[str]:
         return []
 
 
+def _prefer_dependency_python(existing_path: str) -> str:
+    """Put the committed dependency venv before PM's standalone Python only.
+
+    Operator PATH entries keep precedence, unrelated managed tools keep their
+    order, and a missing committed environment or PM Python leaves PATH alone.
+    """
+    if _IS_WINDOWS:
+        return existing_path
+    try:
+        import pm
+        from pm.environments import committed_venv, venv_bin_dir
+
+        venv = committed_venv(_hermes_repo_root)
+        if venv is None:
+            return existing_path
+        installed = pm.installed_package("python")
+        if installed is None or installed.binary is None:
+            return existing_path
+        dependency_bin = venv_bin_dir(venv)
+        if not dependency_bin.is_dir():
+            return existing_path
+
+        entries = [entry for entry in existing_path.split(":") if entry]
+        dependency_path = str(dependency_bin)
+        tool_path = str(installed.binary.parent)
+        try:
+            tool_index = entries.index(tool_path)
+        except ValueError:
+            return existing_path
+
+        if dependency_path in entries:
+            dependency_index = entries.index(dependency_path)
+            if dependency_index < tool_index:
+                return existing_path
+            entries.pop(dependency_index)
+            tool_index = entries.index(tool_path)
+        entries.insert(tool_index, dependency_path)
+        return ":".join(entries)
+    except (KeyError, OSError, RuntimeError, ValueError):
+        return existing_path
+
+
 def _user_local_bin_entries() -> list[str]:
     """``~/.local/bin`` when it exists — the pip --user / pipx / uv-tool install
     target. A backend launched by a non-interactive SSH session, systemd or a GUI
@@ -679,8 +730,12 @@ def _make_run_env(env: dict) -> dict:
     the LAUNCH profile's; under a routed home override its ``.env`` residue is dropped first
     (``strip_launch_profile_env``, a no-op for the launch profile) so the backend's own ``env``
     and the served profile's declared passthrough names are what the child sees."""
-    return _scrubbed_env([(dict(strip_launch_profile_env(os.environ.copy()) | env), True)], frozenset(),
-                         lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    return _scrubbed_env(
+        [(dict(strip_launch_profile_env(os.environ.copy()) | env), True)],
+        frozenset(),
+        lambda p: _prepend_git_bash_dirs(
+            _prefer_dependency_python(_append_missing_sane_path_entries(p))),
+    )
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---
