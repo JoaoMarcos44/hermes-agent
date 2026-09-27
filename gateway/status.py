@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
-from utils import atomic_json_write
 
 if sys.platform == "win32":
     import msvcrt
@@ -878,6 +877,9 @@ def _read_json_file(path: Path, *, bare_pid_ok: bool = False) -> Optional[dict[s
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    # Keep gateway.status importable by bare/early runtimes (restart watcher, updater).
+    from utils import atomic_json_write
+
     atomic_json_write(path, payload, indent=None, separators=(",", ":"))
 
 

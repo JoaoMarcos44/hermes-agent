@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -10,6 +12,37 @@ from types import SimpleNamespace
 import pytest
 
 from gateway import status
+
+
+def test_pid_probe_imports_without_application_dependencies():
+    """#124649: the detached update watcher needs status._pid_exists before bootstrap."""
+    script = """
+import builtins
+import os
+
+real_import = builtins.__import__
+
+def stripped_import(name, *args, **kwargs):
+    if name in {"utils", "psutil"}:
+        raise ModuleNotFoundError(name)
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = stripped_import
+from gateway.status import _pid_exists
+assert _pid_exists(os.getpid())
+"""
+    env = {k: v for k, v in os.environ.items() if k not in {"PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"}}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 class TestGatewayPidState:
