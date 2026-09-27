@@ -2141,10 +2141,10 @@ def get_running_pid(
 ) -> Optional[int]:
     """PID of a running gateway (lock + PID file verified against the live process), or None.
     An explicit ``pid_path`` is a scoped query into that home's identity files: records are
-    validated against the probed home (not the serve process's), and a live record is never
-    cleanup-unlinked, so polling another profile must not delete its gateway.pid/gateway.lock
-    (#106406). The unscoped path keeps main's poison-file housekeeping: a live record owned by
-    another home inside this home's gateway.pid is unlinked on refusal (#89315)."""
+    validated against the probed home (not the serve process's). While the runtime lock is
+    active, any live recorded PID keeps the identity files non-destructive: identity/parser
+    rejection is not proof of staleness (#106406, #125610). Dead records and inactive-lock
+    metadata still follow the normal stale cleanup path (#89315)."""
     resolved_pid_path = pid_path or _get_pid_path()
     resolved_lock_path = _get_gateway_lock_path(resolved_pid_path)
     if is_gateway_runtime_lock_active(resolved_lock_path):
@@ -2165,11 +2165,15 @@ def get_running_pid(
                 record, pid, expected_home=expected_home
             ):
                 return pid
-            # Scoped only: a live record we could not adopt may still be a real gateway;
-            # unlinking its identity files would break that home's double-run protection
-            # while the PID is alive. Unscoped keeps the #89315 poison-file cleanup.
+            # A live record we could not adopt may still be a real gateway. The active
+            # runtime lock means this read is not allowed to turn an identity mismatch
+            # into destructive stale cleanup.
             saw_live_pid = True
-        if expected_home is None or not saw_live_pid:
+        # An active lock plus a live recorded PID is not stale-file authority. Identity/home
+        # rejection can be caused by parser/version skew (#125610) or by probing another
+        # profile. Keep live identity files non-destructive; the inactive-lock cleanup path
+        # remains responsible for genuinely stale metadata.
+        if not saw_live_pid:
             _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
         return get_runtime_status_running_pid() if pid_path is None else None
     # Lock inactive: the runtime-status fallback runs BEFORE cleanup here.
