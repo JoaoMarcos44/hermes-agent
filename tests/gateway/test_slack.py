@@ -3269,6 +3269,22 @@ class TestSlashCommands:
 
 
     @pytest.mark.asyncio
+    async def test_native_slash_carries_replay_identity_without_message_anchor(self, adapter):
+        command = {
+            "command": "/restart",
+            "text": "",
+            "user_id": "U1",
+            "channel_id": "C1",
+            "trigger_id": "13345224609.738474920.8088930838d88f008e0",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.platform_event_id == command["trigger_id"]
+        assert event.message_id is None
+
+    @pytest.mark.asyncio
     async def test_legacy_hermes_prefix_still_works(self, adapter):
         """Backward compat: /hermes btw foo must still route to /btw foo.
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 import asyncio
+import hashlib
 import contextlib
 import json
 import os
@@ -1187,18 +1188,22 @@ class GatewayBusySessionMixin:
         ]
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:
-        """True if this /restart is a Telegram re-delivery we already handled.
+        """True when this /restart matches a durable ingress already handled.
 
-        The previous gateway wrote ``.restart_last_processed.json`` (platform + update_id). A
-        /restart with update_id <= that value is a redelivery when this process booted from that
-        restart; otherwise the marker must be < 5 minutes old. Telegram only (numeric ordering).
+        Telegram has a monotonic update id, so older/equal ids are stale. Native slash/interaction
+        payloads have no message to anchor: their adapter-stamped platform_event_id is compared by
+        equality instead. The persisted native identity is a SHA-256 digest because Slack's trigger
+        id is a short-lived capability and must not be written to disk verbatim.
         """
         from gateway.run import _hermes_home
-        if event is None or event.source is None or event.platform_update_id is None:
+        if event is None or event.source is None:
+            return False
+        update_id = event.platform_update_id
+        platform_event_id = getattr(event, "platform_event_id", None)
+        if update_id is None and not platform_event_id:
             return False
         try:
-            if event.source.platform.value != "telegram":
-                return False
+            event_platform = event.source.platform.value
         except Exception:
             return False
 
@@ -1206,13 +1211,9 @@ class GatewayBusySessionMixin:
             marker_path = _hermes_home / ".restart_last_processed.json"
             if not marker_path.exists():
                 # Missing marker: a redelivered /restart would otherwise re-restart forever. Suppress
-                # ONLY when this process booted from a chat /restart AND is within a short post-boot
+                # only when this process booted from a chat /restart and is in the short post-boot
                 # window; consume the flag one-shot so a later legitimate /restart is honored.
                 if (
-                    # Belt-and-suspenders for when the dedup marker goes missing (manually cleaned up, or
-                    # the previous cycle's write failed). Without a marker the update_id comparison below
-                    # can't run, so a redelivered /restart would sail through and re-restart the gateway —
-                    # an infinite loop (issue #18528).
                     getattr(self, "_booted_from_restart", False)
                     and time.time() - getattr(self, "_startup_time", 0.0) < 60
                 ):
@@ -1223,13 +1224,23 @@ class GatewayBusySessionMixin:
         except Exception:
             return False
 
-        recorded_uid = data.get("update_id")
-        if (
-            data.get("platform") != "telegram"
-            or not isinstance(recorded_uid, int)
-            or event.platform_update_id > recorded_uid
-        ):
+        if data.get("platform") != event_platform:
             return False
+        if update_id is not None:
+            recorded_uid = data.get("update_id")
+            if (
+                event_platform != "telegram"
+                or not isinstance(recorded_uid, int)
+                or update_id > recorded_uid
+            ):
+                return False
+        else:
+            recorded_event_hash = data.get("platform_event_id_sha256")
+            current_event_hash = hashlib.sha256(
+                str(platform_event_id).encode("utf-8")
+            ).hexdigest()
+            if not recorded_event_hash or recorded_event_hash != current_event_hash:
+                return False
 
         # A service-managed restart can outlast the 5-minute trust window; consume the boot
         # signal one-shot.

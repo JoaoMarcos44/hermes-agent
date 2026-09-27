@@ -384,6 +384,7 @@ async def test_dispatch_thread_session_builds_thread_event(adapter):
 
 def test_build_slash_event_preserves_thread_context(adapter):
     interaction = SimpleNamespace(
+        id=987654321012345678,
         channel=_FakeThreadChannel(channel_id=555, name="Planning"),
         channel_id=555,
         user=SimpleNamespace(display_name="Jezza", id=42),
@@ -392,6 +393,8 @@ def test_build_slash_event_preserves_thread_context(adapter):
     event = adapter._build_slash_event(interaction, "/status")
 
     assert event.text == "/status"
+    assert event.platform_event_id == "987654321012345678"
+    assert event.message_id is None
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"

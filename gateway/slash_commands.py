@@ -6,6 +6,7 @@ the one-off commands.  run.py helpers are imported lazily."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import contextlib
 import dataclasses
 import inspect
@@ -539,10 +540,12 @@ class GatewaySlashCommandsMixin(
         # ACK failing on the way out. Ignoring it prevents a loop where every fresh gateway re-restarts.
         if self._is_stale_restart_redelivery(event):
             src = event.source
-            logger.info("Ignoring redelivered /restart (platform=%s, update_id=%s) — "
+            identity_kind = (
+                "update_id" if event.platform_update_id is not None else "platform_event_id"
+            )
+            logger.info("Ignoring redelivered /restart (platform=%s, identity=%s) — "
                         "already processed by a previous gateway instance.",
-                        src.platform.value if src and src.platform else "?",
-                        event.platform_update_id)
+                        src.platform.value if src and src.platform else "?", identity_kind)
             return ""
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
@@ -564,18 +567,26 @@ class GatewaySlashCommandsMixin(
             return data
 
         def _dedup_payload() -> dict:
-            # Platform + update_id of the triggering /restart, for redelivery detection.
+            # Persist only the identity needed to recognize the same ingress after restart.
             data = {"platform": event.source.platform.value if event.source.platform else None,
                     "requested_at": time.time()}
             if event.platform_update_id is not None:
                 data["update_id"] = event.platform_update_id
+            else:
+                platform_event_id = getattr(event, "platform_event_id", None)
+                if platform_event_id:
+                    # Slack trigger_id is a short-lived capability. Store a one-way digest, not
+                    # the raw token; equality is all the replay guard needs.
+                    data["platform_event_id_sha256"] = hashlib.sha256(
+                        str(platform_event_id).encode("utf-8")
+                    ).hexdigest()
             return data
 
         # Save the requester's routing info so the new gateway process can notify them once back.
         await _write_marker(".restart_notify.json", _notify_payload, "notify file")
-        # Record the triggering platform + update_id in a dedicated dedup marker. Unlike
-        # .restart_notify.json (unlinked once the new gateway sends its notification) this persists
-        # so a delayed Telegram redelivery is still detectable. Overwritten on every /restart.
+        # Record the triggering platform + durable ingress identity in a dedicated dedup marker.
+        # Unlike .restart_notify.json (unlinked once the new gateway sends its notification), this
+        # persists so a delayed redelivery is still detectable. Overwritten on every /restart.
         await _write_marker(".restart_last_processed.json", _dedup_payload, "dedup marker")
         active_agents = self._running_agent_count()
         # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /

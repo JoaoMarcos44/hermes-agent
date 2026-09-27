@@ -4684,9 +4684,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         )
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
+        interaction_id = getattr(interaction, "id", None)
         return MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=interaction,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            platform_event_id=str(interaction_id) if interaction_id is not None else None,
         )
 
     # --- Thread creation helpers ---

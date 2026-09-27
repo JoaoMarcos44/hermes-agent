@@ -1,10 +1,11 @@
-"""Tests for /restart idempotency guard against Telegram update re-delivery.
+"""Tests for /restart idempotency across platform re-delivery.
 
-When PTB's graceful-shutdown ACK call (the final `get_updates` on exit) fails
-with a network error, Telegram re-delivers the `/restart` message to the new
-gateway process.  Without a dedup guard, the new gateway would process
-`/restart` again and immediately restart — a self-perpetuating loop.
+Telegram can re-deliver an update after its graceful-shutdown ACK fails; native
+Slack/Discord slash interactions can likewise arrive again without a message
+identity. The durable guard must recognize the same ingress after process
+restart without swallowing a genuinely new /restart.
 """
+import hashlib
 import json
 import time
 from unittest.mock import MagicMock
@@ -12,7 +13,9 @@ from unittest.mock import MagicMock
 import pytest
 
 import gateway.run as gateway_run
+from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -75,8 +78,8 @@ async def test_stale_marker_older_than_5min_does_not_block(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_event_without_update_id_bypasses_dedup(tmp_path, monkeypatch):
-    """Events with no platform_update_id (non-Telegram, CLI fallback) aren't gated."""
+async def test_event_without_replay_identity_bypasses_dedup(tmp_path, monkeypatch):
+    """Events with neither update nor platform-event identity aren't gated."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
@@ -90,7 +93,7 @@ async def test_event_without_update_id_bypasses_dedup(tmp_path, monkeypatch):
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
-    # No update_id — the dedup check should NOT kick in
+    # No update_id or platform_event_id — the dedup check should NOT kick in.
     event = _make_restart_event(update_id=None)
     await runner._handle_restart_command(event)
 
@@ -100,9 +103,6 @@ async def test_event_without_update_id_bypasses_dedup(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_different_platform_bypasses_dedup(tmp_path, monkeypatch):
     """Marker from Telegram doesn't block a /restart from another platform."""
-    from gateway.config import Platform
-    from gateway.session import SessionSource
-
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
@@ -131,6 +131,91 @@ async def test_different_platform_bypasses_dedup(tmp_path, monkeypatch):
         platform_update_id=12345,
     )
     await runner._handle_restart_command(event)
+
+    runner.request_restart.assert_called_once()
+
+
+def _make_native_restart_event(platform: Platform, platform_event_id: str) -> MessageEvent:
+    return MessageEvent(
+        text="/restart",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=platform,
+            chat_id="native-channel",
+            chat_type="group",
+            user_id="native-user",
+        ),
+        platform_event_id=platform_event_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_restart_replay_uses_hashed_platform_event_identity(tmp_path, monkeypatch):
+    """A native slash replay survives process restart without persisting Slack's raw trigger id."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    trigger_id = "13345224609.738474920.8088930838d88f008e0"
+    event = _make_native_restart_event(Platform.SLACK, trigger_id)
+
+    first, _adapter = make_restart_runner()
+    first.request_restart = MagicMock(return_value=True)
+    await first._handle_restart_command(event)
+
+    marker_text = (tmp_path / ".restart_last_processed.json").read_text(encoding="utf-8")
+    marker = json.loads(marker_text)
+    assert trigger_id not in marker_text
+    assert marker["platform"] == "slack"
+    assert marker["platform_event_id_sha256"] == hashlib.sha256(trigger_id.encode()).hexdigest()
+    assert "update_id" not in marker
+
+    replay, _adapter = make_restart_runner()
+    replay.request_restart = MagicMock(return_value=True)
+    result = await replay._handle_restart_command(
+        _make_native_restart_event(Platform.SLACK, trigger_id)
+    )
+
+    assert result == ""
+    replay.request_restart.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fresh_native_restart_identity_is_not_swallowed(tmp_path, monkeypatch):
+    """A later native slash with a different interaction identity is a new command."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    marker = tmp_path / ".restart_last_processed.json"
+    marker.write_text(json.dumps({
+        "platform": "discord",
+        "platform_event_id_sha256": hashlib.sha256(b"111").hexdigest(),
+        "requested_at": time.time(),
+    }))
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    await runner._handle_restart_command(
+        _make_native_restart_event(Platform.DISCORD, "222")
+    )
+
+    runner.request_restart.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_native_restart_identity_is_platform_scoped(tmp_path, monkeypatch):
+    """The same opaque identity on another platform cannot match the marker."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    marker = tmp_path / ".restart_last_processed.json"
+    marker.write_text(json.dumps({
+        "platform": "slack",
+        "platform_event_id_sha256": hashlib.sha256(b"same").hexdigest(),
+        "requested_at": time.time(),
+    }))
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    await runner._handle_restart_command(
+        _make_native_restart_event(Platform.DISCORD, "same")
+    )
 
     runner.request_restart.assert_called_once()
 

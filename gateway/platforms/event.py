@@ -92,6 +92,10 @@ class MessageEvent:
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
     reply_expected: Optional[bool] = None
+    # Stable identity of a non-message platform ingress (native slash/interaction). Unlike
+    # message_id this is NEVER a reply anchor or delivery-ledger id; it exists only so durable
+    # control actions can recognize a replay after the gateway process restarts.
+    platform_event_id: Optional[str] = None
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)

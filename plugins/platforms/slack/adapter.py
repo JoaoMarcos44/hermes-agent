@@ -6040,10 +6040,12 @@ class SlackAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id, chat_type="dm" if is_dm else "group", user_id=user_id,
             thread_id=thread_id, scope_id=team_id or None)
+        trigger_id = command.get("trigger_id")
         event = MessageEvent(
             text=text,
             message_type=(MessageType.COMMAND if text.startswith("/") else MessageType.TEXT),
-            source=source, raw_message=command)
+            source=source, raw_message=command,
+            platform_event_id=str(trigger_id) if trigger_id else None)
         # Stash response_url so the first reply for this channel+user goes ephemeral. COMMAND
         # events only: free-form "/hermes <question>" replies must stay public.
         response_url = command.get("response_url", "")
