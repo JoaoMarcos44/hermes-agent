@@ -1,6 +1,7 @@
 """Gateway runtime status helpers: PID/lock/marker files under ``{HERMES_HOME}`` (one set per
 home/profile) that tell whether the gateway daemon is running."""
 
+import ast
 import asyncio
 import contextlib
 import copy
@@ -609,7 +610,39 @@ _BOOTSTRAPS = (
     # hermes_cli._launchers._write_cmd_launcher: the launcher script, base64-encoded
     ("base64", re.compile(rf"import base64; exec\(base64\.b64decode\({_Q}(?P<target>[A-Za-z0-9+/=]+){_Q}\)\)")),
 )
-_ASSIGNED_ARGV = re.compile(r"\bsys\.argv\s*=\s*\[(.*?)\]\s*;")
+_ASSIGNED_ARGV = re.compile(r"\bsys\.argv\s*=")
+
+
+def _literal_assigned_argv(source: str) -> list[str] | None:
+    """Return the literal ``sys.argv`` list emitted by ``venv_sync.relaunch_command``.
+
+    The producer writes ``argv!r``. Delimiter splitting changes string data into argv
+    tokens, so parse the literal as Python and reject computed or ambiguous assignments.
+    """
+    try:
+        module = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    assignments = [
+        statement for statement in module.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "sys"
+            and target.attr == "argv"
+            for target in statement.targets
+        )
+    ]
+    if len(assignments) != 1:
+        return None
+    try:
+        value = ast.literal_eval(assignments[0].value)
+    except (SyntaxError, ValueError, TypeError):
+        return None
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+        return None
+    return value
 
 
 def _bootstrap_entry(source: str, argv: list[str]) -> list[str] | None:
@@ -628,8 +661,11 @@ def _bootstrap_entry(source: str, argv: list[str]) -> list[str] | None:
             return None
     if kind == "entry":  # the launcher script's own ``--run-module <module>`` switch
         return ["-m", argv[1], *argv[2:]] if argv[:1] == ["--run-module"] and len(argv) > 1 else ["-m", target, *argv]
-    if assigned := _ASSIGNED_ARGV.search(source):
-        argv = [item.strip().strip("'\"") for item in assigned.group(1).split(",")][1:]
+    if _ASSIGNED_ARGV.search(source):
+        assigned_argv = _literal_assigned_argv(source)
+        if assigned_argv is None:
+            return None
+        argv = assigned_argv[1:]
     return [target, *argv] if kind == "path" else ["-m", target, *argv]
 
 
@@ -652,6 +688,57 @@ def inline_bootstrap_argv(tokens: list[str]) -> list[str] | None:
     return None
 
 
+def _split_windows_command_line(command: str) -> list[str]:
+    """Inverse of the quoting rules used by ``subprocess.list2cmdline``.
+
+    Process-table APIs on Windows expose one CreateProcess command-line string. ``shlex``
+    does not implement the CRT backslash-before-quote rules and can split a valid ``-c``
+    source in the middle of a Python string literal.
+    """
+    tokens: list[str] = []
+    index = 0
+    while index < len(command):
+        while index < len(command) and command[index].isspace():
+            index += 1
+        if index >= len(command):
+            break
+        token: list[str] = []
+        quoted = False
+        while index < len(command) and (quoted or not command[index].isspace()):
+            if command[index] == "\\":
+                start = index
+                while index < len(command) and command[index] == "\\":
+                    index += 1
+                slashes = index - start
+                if index < len(command) and command[index] == '"':
+                    token.append("\\" * (slashes // 2))
+                    if slashes % 2:
+                        token.append('"')
+                    else:
+                        quoted = not quoted
+                    index += 1
+                else:
+                    token.append("\\" * slashes)
+            elif command[index] == '"':
+                quoted = not quoted
+                index += 1
+            else:
+                token.append(command[index])
+                index += 1
+        tokens.append("".join(token))
+    return tokens
+
+
+def _command_line_tokens(command: str) -> list[str]:
+    """Tokenize process-table command lines without losing a quoted Windows ``-c`` source."""
+    if re.search(r'(?:^|\s)-c\s+"', command):
+        return _split_windows_command_line(command)
+    try:
+        return shlex.split(command, posix=False)
+    except ValueError:
+        return command.split()
+
+
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
@@ -660,10 +747,7 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     argv since ``_apply_profile_override`` removes them before argparse."""
     if not command:
         return None
-    try:
-        raw_tokens = shlex.split(command, posix=False)
-    except ValueError:
-        raw_tokens = command.split()
+    raw_tokens = _command_line_tokens(command)
     # Strip surrounding quotes, normalize slashes + case per token.
     cased_tokens = [t.strip("\"'").replace("\\", "/") for t in raw_tokens]
     tokens = [t.lower() for t in cased_tokens]
