@@ -59,15 +59,66 @@ def _admit(agent, history=None):
     )
 
 
-def test_no_lease_without_durable_row_or_when_persist_disabled():
+def test_fresh_session_takes_lease_without_losing_caller_seed():
     seed = [{"role": "user", "content": "hi"}]
-    admission = _admit(_agent(_Db(exists=False)), seed)
-    assert admission.lease is None and admission.early_result is None
-    assert admission.conversation_history is seed
+    db = _Db(exists=False)
+    agent = _agent(db, _session_db_created=True)
 
+    admission = _admit(agent, seed)
+
+    assert isinstance(admission.lease, DurableTurnLease)
+    assert admission.early_result is None
+    assert admission.conversation_history is seed
+    assert agent._session_db_created is False
+    admission.lease.release()
+    assert [event[0] for event in db.events] == ["acquire", "release"]
+
+
+def test_persist_disabled_still_skips_lease():
+    seed = [{"role": "user", "content": "hi"}]
     db = _Db()
     admission = _admit(_agent(db, _persist_disabled=True), seed)
     assert admission.lease is None and db.events == []
+
+
+def test_session_existence_is_observed_after_admission_not_before_it():
+    """A row removed during acquisition must not leave the agent's existence cache stale."""
+    db = _Db(exists=True)
+    agent = _agent(db, _session_db_created=True)
+    seed = [{"role": "user", "content": "caller seed"}]
+
+    def acquire_then_remove(session_id, holder, **kwargs):
+        db.events.append(("acquire", session_id, holder))
+        db.exists = False
+        return True
+
+    db.acquire_session_turn_lease = acquire_then_remove
+    admission = _admit(agent, seed)
+
+    assert isinstance(admission.lease, DurableTurnLease)
+    assert agent._session_db_created is False
+    assert admission.conversation_history is seed
+    admission.lease.release()
+
+
+def test_post_admission_state_probe_failure_releases_lease():
+    """Unknown state after admission is fail-closed, never a turn with a guessed row state."""
+    db = _Db()
+
+    def broken_get_session(_session_id):
+        raise OSError("state store unavailable")
+
+    db.get_session = broken_get_session
+    agent = _agent(db)
+
+    import pytest
+
+    with pytest.raises(OSError, match="state store unavailable"):
+        _admit(agent)
+
+    assert [event[0] for event in db.events] == ["acquire", "release"]
+    assert agent._active_session_turn_lease_holder is None
+    assert agent._active_session_turn_lease_ttl_seconds is None
 
 
 def test_admission_sets_holder_attrs_and_release_clears_them(monkeypatch):

@@ -123,8 +123,8 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
     assert any(kind == "lifecycle" and text for kind, text in status_events)
 
 
-def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
-    """A locked / non-WAL get_session must not skip the durable lease."""
+def test_run_conversation_fails_closed_when_post_admission_probe_raises(monkeypatch):
+    """Once admitted, an unreadable session row is unknown state, not permission to guess."""
     db = _DB()
 
     def locked_get_session(_session_id):
@@ -133,44 +133,24 @@ def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
     db.get_session = locked_get_session
     agent = _agent_with_db(db)
 
-    # Simulate a contended wait so the resolve+reload path is exercised.
-    def acquire_with_wait(session_id, holder, **kwargs):
-        db.events.append(("acquire", session_id, holder))
-        on_wait = kwargs.get("on_wait")
-        if on_wait is not None:
-            on_wait(0.0)
-        return True
+    def boom(*_args, **_kwargs):
+        raise AssertionError("turn must not start when durable state cannot be established")
 
-    db.acquire_session_turn_lease = acquire_with_wait
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", boom)
 
-    observed = {}
+    import pytest
 
-    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
-        observed["history"] = history
-        observed["session_id"] = _agent.session_id
-        return {"final_response": "ok", "messages": history, "failed": False}
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        AIAgent.run_conversation(
+            agent,
+            "new message",
+            conversation_history=[{"role": "user", "content": "stale"}],
+        )
 
-    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
-    result = AIAgent.run_conversation(
-        agent,
-        "new message",
-        conversation_history=[{"role": "user", "content": "stale"}],
-    )
-
-    assert result["final_response"] == "ok"
-    assert observed == {
-        "history": [{"role": "user", "content": "durable latest"}],
-        "session_id": "compressed-tip",
-    }
-    assert [event[0] for event in db.events] == [
-        "acquire",
-        "resolve",
-        "reload",
-        "release",
-    ]
+    assert [event[0] for event in db.events] == ["acquire", "release"]
 
 
-def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
+def test_fresh_session_takes_lease_and_keeps_caller_seed(monkeypatch):
     db = _DB(session_exists=False)
     agent = _agent_with_db(db, session_id="fresh", platform="subagent")
     agent._session_db_created = False
@@ -181,6 +161,7 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
 
     def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
         observed["history"] = history
+        observed["db_created"] = _agent._session_db_created
         return {"final_response": "ok", "messages": history, "failed": False}
 
     monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
@@ -188,8 +169,40 @@ def test_fresh_session_keeps_caller_seed_without_durable_lease(monkeypatch):
 
     AIAgent.run_conversation(agent, "work", conversation_history=seed)
 
-    assert observed["history"] is seed
-    assert db.events == []
+    assert observed == {"history": seed, "db_created": False}
+    assert [event[0] for event in db.events] == ["acquire", "release"]
+
+
+def test_waited_fresh_session_rechecks_under_lease_and_reloads_new_row(monkeypatch):
+    """If the first holder creates the row while we wait, the waiter must reload it after admission."""
+    db = _DB(session_exists=False)
+    agent = _agent_with_db(db, session_id="fresh")
+    agent._session_db_created = False
+    observed = {}
+
+    def acquire_after_wait(session_id, holder, **kwargs):
+        db.events.append(("acquire", session_id, holder))
+        kwargs["on_wait"](0.0)
+        db.session_exists = True
+        return True
+
+    db.acquire_session_turn_lease = acquire_after_wait
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        observed["session_id"] = _agent.session_id
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    AIAgent.run_conversation(
+        agent, "work", conversation_history=[{"role": "user", "content": "caller seed"}]
+    )
+
+    assert observed == {
+        "history": [{"role": "user", "content": "durable latest"}],
+        "session_id": "compressed-tip",
+    }
+    assert [event[0] for event in db.events] == ["acquire", "resolve", "reload", "release"]
 
 
 def test_run_conversation_lease_timeout_returns_resend_notice(monkeypatch):

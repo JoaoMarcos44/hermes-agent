@@ -218,47 +218,28 @@ class TurnLeaseAdmission:
     conversation_history: Optional[List[Dict[str, Any]]] = None
 
 
-def _durable_session_exists(db, session_id: str) -> bool:
-    try:
-        return db.get_session(session_id) is not None
-    except Exception:
-        # A locked / non-WAL read is not proof the row is absent; treating probe failure as "fresh"
-        # ran fail-open at the exact contention point. Acquire, or fail closed.
-        logger.warning(
-            # Acquire (or fail closed if acquire itself cannot) rather than start load/run/flush
-            # unsynchronized. get_session returns None — it does not raise — when the row is missing. See
-            # #84234.
-            "Could not check durable session before turn lease; "
-            "will acquire rather than run without serialization",
-            exc_info=True,
-        )
-        return True
-
-
 def admit_durable_turn_lease(
     agent, *, session_id: str, relay_turn_id: str, task_context: Dict[str, Any],
     conversation_history: Optional[List[Dict[str, Any]]],
 ) -> TurnLeaseAdmission:
-    """Acquire the session turn lease when the session is durable; build (not start) its threads.
+    """Acquire first, then observe durable session state while this turn owns the lease.
 
-    Mutates ``task_context["session_id"]`` and ``agent.session_id`` when the wait forced a resume-id
-    reload. Returns an ``early_result`` (interrupted / timed out) instead of a lease when admission
-    fails; the caller returns it verbatim."""
+    Fresh ids take the same serialization boundary as resumed ids: two first turns can otherwise
+    create the row concurrently. Session existence is intentionally read only *after* admission so
+    ``_session_db_created`` and reload decisions never depend on a stale pre-lease snapshot.
+    Mutates ``task_context["session_id"]`` / ``agent.session_id`` only for a waited durable reload.
+    """
     db = getattr(agent, "_session_db", None)
     admission = TurnLeaseAdmission(conversation_history=conversation_history)
     if db is None or not session_id:
         return admission
-    # A fresh session id has no durable transcript to race over, and callers may supply an
-    # in-memory seed before the row exists — reloading would erase it. Check the concrete type:
-    # MagicMock-style shims accept any attribute without the protocol.
+    # Check the concrete type: MagicMock-style shims accept any attribute without the protocol.
     if (
         getattr(agent, "_persist_disabled", False)
-        or not _durable_session_exists(db, session_id)
         or not callable(getattr(type(db), "acquire_session_turn_lease", None))
     ):
         return admission
-    # Row proven to exist — suppress the redundant create attempt.
-    agent._session_db_created = True
+
     holder = (
         f"pid={os.getpid()}:turn={relay_turn_id}:platform={task_context['platform'] or 'unknown'}"
     )
@@ -287,10 +268,16 @@ def admit_durable_turn_lease(
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
-        if waited:
+        # The lease is the authority boundary. A row can be created, deleted, or rotated while this
+        # turn waits, so any pre-admission existence probe is TOCTOU. Fail closed if this post-admission
+        # read itself cannot establish the current state.
+        durable = db.get_session(session_id) is not None
+        agent._session_db_created = durable
+
+        if waited and durable:
             agent._emit_status("Session is free; loading the latest transcript...")
-            # The holder may have compressed/rotated the session while we waited: reload only
-            # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
+            # The holder may have compressed/rotated the session while we waited: resolve only
+            # AFTER admission. A fresh row-less id keeps its caller-provided seed intact.
             latest_session_id = db.resolve_resume_session_id(session_id)
             if latest_session_id:
                 agent.session_id = latest_session_id
