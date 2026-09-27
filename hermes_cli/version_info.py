@@ -67,8 +67,10 @@ def _run_git(repo_dir: Path, *args: str) -> str | None:
 
 
 def _resolve_repo_dir() -> Path | None:
-    """Use the executing checkout before a profile's optional clone."""
-    repo_dir = Path(__file__).parent.parent.resolve()
+    """Use PM's active checkout before a profile's optional clone."""
+    from pm.paths import repo_root
+
+    repo_dir = repo_root().resolve()
     if (repo_dir / ".git").exists():
         return repo_dir
     # The PROCESS home: this is the running code's identity and is cached

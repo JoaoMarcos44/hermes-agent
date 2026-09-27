@@ -16,6 +16,22 @@ def setup_function():
     _reset_version_info_cache()
 
 
+def test_git_version_fallback_uses_pm_request_repository(tmp_path, monkeypatch):
+    """A PM worker must judge dependency gates against the checkout that owns its request."""
+    requested = tmp_path / "requested"
+    (requested / ".git").mkdir(parents=True)
+    seen = []
+    monkeypatch.setattr("pm.paths.repo_root", lambda: requested)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.version_info._git_version_info",
+        lambda root: seen.append(root) or VersionInfo("9.9.9", "9.9.9", 0, "a" * 40, "main", "git"),
+    )
+
+    assert get_version_info().base_version == "9.9.9"
+    assert seen == [requested.resolve()]
+
+
 def test_derived_version_shows_plus_question_for_dirty_unknown_distance():
     assert _derived_version("0.19.0", None, dirty=True) == "0.19.0+?"
     assert _derived_version("0.19.0", None, dirty=False) == "0.19.0"
