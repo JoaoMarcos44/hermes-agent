@@ -50,10 +50,20 @@ def all_packages() -> list[str]:
     return sorted(_builtins_loaded())
 
 
-def source_install_packages(names: list[str]) -> list[str]:
+def source_install_packages(names: list[str], *, target: str | None = None) -> list[str]:
     """Select runtime roots; internal tools enter only through dependencies."""
-    return [name for name in names
-            if not get_package(name).internal and (name == "python" or not get_package(name).optional)]
+    if target is None:
+        from pm.store import current_target
+
+        target = current_target()
+    selected = []
+    for name in names:
+        package = get_package(name)
+        if package.internal:
+            continue
+        if not package.optional or (package.source_required and package.missing_reason(target) is None):
+            selected.append(name)
+    return selected
 
 
 def tool_roots(names: list[str]) -> list[str]:

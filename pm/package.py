@@ -51,6 +51,8 @@ class Package:
     name: unique id.
     deps: packages installed before this one.
     optional: not part of the root closure; installed on demand.
+    source_required: optional package a source install must carry on targets
+        where it exists. It remains optional for unrelated package provisioning.
     default: an optional package the default install also carries (installers,
         bare `pm install`, `hermes update`) unless the user declined it
         (pm/defaults.py). It stays optional: a failed download warns instead of
@@ -69,6 +71,7 @@ class Package:
     name: str = ""
     deps: tuple[str, ...] = ()
     optional: bool = False
+    source_required: bool = False
     default: bool = False
     internal: bool = False
     on_path: bool = True

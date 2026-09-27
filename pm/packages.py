@@ -222,6 +222,7 @@ class Python(_BionicDebArm, BinaryPackage, DebPackage):
 
     name = "python"
     optional = True
+    source_required = True
     probe_version = False
     binary_rel = {"win32": "python.exe", "posix": "bin/python3"}
     # The staged .deb's main binary: DebPackage.verify checks it.
@@ -610,6 +611,7 @@ class Git(BinaryPackage):
 
     name = "git"
     optional = True
+    source_required = True
     binary_rel = {"win32": "cmd/git.exe"}
     flatten = False
     gaps = {

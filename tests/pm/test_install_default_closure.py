@@ -55,6 +55,16 @@ def test_default_closure_includes_the_boot_interpreter(install_spy):
     assert install_spy["activated"] == [{"allow_incomplete": True}]
 
 
+def test_source_closure_carries_git_only_on_supported_hosts():
+    from pm.registry import source_install_packages
+
+    names = pm.cli._lockfile().names()
+    assert "git" in source_install_packages(names, target="win32-x64")
+    assert "git" in source_install_packages(names, target="win32-arm64")
+    assert "git" not in source_install_packages(names, target="linux-x64")
+    assert "git" not in source_install_packages(names, target="darwin-arm64")
+
+
 @pytest.mark.parametrize("names", [["npm", "ripgrep"], ["dmgbuild"]])
 def test_explicit_names_pass_through_untouched(install_spy, names) -> None:
     assert pm.cli.cmd_install(argparse.Namespace(names=names, tools_only=False)) == 0
