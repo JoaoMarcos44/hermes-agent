@@ -1,10 +1,10 @@
-"""Tests for /restart idempotency guard against Telegram update re-delivery.
+"""Tests for /restart idempotency across message and native-interaction redelivery.
 
-When PTB's graceful-shutdown ACK call (the final `get_updates` on exit) fails
-with a network error, Telegram re-delivers the `/restart` message to the new
-gateway process.  Without a dedup guard, the new gateway would process
-`/restart` again and immediately restart — a self-perpetuating loop.
+Telegram has ordered update ids. Native Slack/Discord interactions instead carry a
+platform delivery identity; both must survive a gateway restart strongly enough to
+recognize the exact request again without suppressing a genuinely new /restart.
 """
+import hashlib
 import json
 import time
 from unittest.mock import MagicMock
@@ -75,8 +75,8 @@ async def test_stale_marker_older_than_5min_does_not_block(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_event_without_update_id_bypasses_dedup(tmp_path, monkeypatch):
-    """Events with no platform_update_id (non-Telegram, CLI fallback) aren't gated."""
+async def test_event_without_restart_identity_bypasses_dedup(tmp_path, monkeypatch):
+    """Events with neither update id nor native delivery id are not gated."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("INVOCATION_ID", raising=False)
 
@@ -90,11 +90,96 @@ async def test_event_without_update_id_bypasses_dedup(tmp_path, monkeypatch):
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
 
-    # No update_id — the dedup check should NOT kick in
+    # No update id or platform delivery id — the dedup check should NOT kick in.
     event = _make_restart_event(update_id=None)
     await runner._handle_restart_command(event)
 
     runner.request_restart.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_native_delivery_redelivery_is_ignored_by_fingerprint(tmp_path, monkeypatch):
+    """Native slash/interaction retries have identity even when there is no message id."""
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    raw_id = "slack-trigger-capability"
+    fingerprint = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()
+    (tmp_path / ".restart_last_processed.json").write_text(json.dumps({
+        "platform": "slack",
+        "delivery_id_hash": fingerprint,
+        "requested_at": time.time(),
+    }))
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.SLACK, chat_id="C1", chat_type="group", user_id="U1"),
+        platform_delivery_id=raw_id,
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert result == ""
+    runner.request_restart.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_native_delivery_id_is_not_suppressed(tmp_path, monkeypatch):
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    old_hash = hashlib.sha256(b"old-trigger").hexdigest()
+    (tmp_path / ".restart_last_processed.json").write_text(json.dumps({
+        "platform": "slack",
+        "delivery_id_hash": old_hash,
+        "requested_at": time.time(),
+    }))
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.SLACK, chat_id="C1", chat_type="group", user_id="U1"),
+        platform_delivery_id="new-trigger",
+    )
+
+    await runner._handle_restart_command(event)
+
+    runner.request_restart.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_restart_marker_hashes_native_delivery_id(tmp_path, monkeypatch):
+    """Do not persist Slack's short-lived trigger capability verbatim."""
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    raw_id = "sensitive-short-lived-trigger"
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.SLACK, chat_id="C1", chat_type="group", user_id="U1"),
+        platform_delivery_id=raw_id,
+    )
+
+    await runner._handle_restart_command(event)
+
+    marker_text = (tmp_path / ".restart_last_processed.json").read_text()
+    marker = json.loads(marker_text)
+    assert raw_id not in marker_text
+    assert marker["delivery_id_hash"] == hashlib.sha256(raw_id.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.asyncio

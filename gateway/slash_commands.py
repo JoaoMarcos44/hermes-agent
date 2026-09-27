@@ -564,18 +564,23 @@ class GatewaySlashCommandsMixin(
             return data
 
         def _dedup_payload() -> dict:
-            # Platform + update_id of the triggering /restart, for redelivery detection.
+            # Platform + transport identity of the triggering /restart. Telegram update ids
+            # remain ordered integers; native Slack/Discord interactions use equality on a
+            # fingerprint so short-lived platform capabilities are never persisted verbatim.
             data = {"platform": event.source.platform.value if event.source.platform else None,
                     "requested_at": time.time()}
             if event.platform_update_id is not None:
                 data["update_id"] = event.platform_update_id
+            delivery_fingerprint = event.platform_delivery_fingerprint()
+            if delivery_fingerprint is not None:
+                data["delivery_id_hash"] = delivery_fingerprint
             return data
 
         # Save the requester's routing info so the new gateway process can notify them once back.
         await _write_marker(".restart_notify.json", _notify_payload, "notify file")
-        # Record the triggering platform + update_id in a dedicated dedup marker. Unlike
+        # Record the triggering platform + replay identity in a dedicated dedup marker. Unlike
         # .restart_notify.json (unlinked once the new gateway sends its notification) this persists
-        # so a delayed Telegram redelivery is still detectable. Overwritten on every /restart.
+        # so a delayed platform redelivery is still detectable. Overwritten on every /restart.
         await _write_marker(".restart_last_processed.json", _dedup_payload, "dedup marker")
         active_agents = self._running_agent_count()
         # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /

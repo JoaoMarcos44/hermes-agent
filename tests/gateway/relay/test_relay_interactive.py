@@ -225,6 +225,7 @@ def test_discord_component_interaction_decodes_prompt_token():
     }
     assert event.text == "/deny"
     assert event.message_type == MessageType.COMMAND
+    assert event.platform_delivery_id == "i1"
 
 
 # ── react ack lifecycle ──────────────────────────────────────────────────

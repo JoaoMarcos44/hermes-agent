@@ -3222,6 +3222,22 @@ class TestSlashCommands:
         msg = adapter.handle_message.call_args[0][0]
         assert msg.text == "/compress"
 
+    @pytest.mark.asyncio
+    async def test_native_slash_carries_trigger_as_platform_delivery_id(self, adapter):
+        command = {
+            "command": "/restart",
+            "text": "",
+            "user_id": "U1",
+            "channel_id": "C1",
+            "trigger_id": "13345224609.738474920.replay",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_id is None
+        assert event.platform_delivery_id == "13345224609.738474920.replay"
+
 
 
     # ------------------------------------------------------------------

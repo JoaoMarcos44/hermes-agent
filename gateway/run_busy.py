@@ -1187,32 +1187,27 @@ class GatewayBusySessionMixin:
         ]
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:
-        """True if this /restart is a Telegram re-delivery we already handled.
+        """True when this /restart matches the transport identity we already handled.
 
-        The previous gateway wrote ``.restart_last_processed.json`` (platform + update_id). A
-        /restart with update_id <= that value is a redelivery when this process booted from that
-        restart; otherwise the marker must be < 5 minutes old. Telegram only (numeric ordering).
+        Telegram keeps numeric update-id ordering. Native Slack/Discord interactions have no
+        message id, so adapters provide a platform delivery id and the restart marker stores only
+        its fingerprint; equality identifies an exact redelivery without assuming id ordering.
         """
         from gateway.run import _hermes_home
-        if event is None or event.source is None or event.platform_update_id is None:
+        if event is None or event.source is None:
+            return False
+        delivery_fingerprint = event.platform_delivery_fingerprint()
+        if event.platform_update_id is None and delivery_fingerprint is None:
             return False
         try:
-            if event.source.platform.value != "telegram":
-                return False
+            platform = event.source.platform.value
         except Exception:
             return False
 
         try:
             marker_path = _hermes_home / ".restart_last_processed.json"
             if not marker_path.exists():
-                # Missing marker: a redelivered /restart would otherwise re-restart forever. Suppress
-                # ONLY when this process booted from a chat /restart AND is within a short post-boot
-                # window; consume the flag one-shot so a later legitimate /restart is honored.
                 if (
-                    # Belt-and-suspenders for when the dedup marker goes missing (manually cleaned up, or
-                    # the previous cycle's write failed). Without a marker the update_id comparison below
-                    # can't run, so a redelivered /restart would sail through and re-restart the gateway —
-                    # an infinite loop (issue #18528).
                     getattr(self, "_booted_from_restart", False)
                     and time.time() - getattr(self, "_startup_time", 0.0) < 60
                 ):
@@ -1223,21 +1218,26 @@ class GatewayBusySessionMixin:
         except Exception:
             return False
 
-        recorded_uid = data.get("update_id")
-        if (
-            data.get("platform") != "telegram"
-            or not isinstance(recorded_uid, int)
-            or event.platform_update_id > recorded_uid
-        ):
+        matches = False
+        if platform == "telegram" and event.platform_update_id is not None:
+            recorded_uid = data.get("update_id")
+            matches = (
+                data.get("platform") == "telegram"
+                and isinstance(recorded_uid, int)
+                and event.platform_update_id <= recorded_uid
+            )
+        elif delivery_fingerprint is not None:
+            matches = (
+                data.get("platform") == platform
+                and data.get("delivery_id_hash") == delivery_fingerprint
+            )
+        if not matches:
             return False
 
-        # A service-managed restart can outlast the 5-minute trust window; consume the boot
-        # signal one-shot.
         if getattr(self, "_booted_from_restart", False):
             self._booted_from_restart = False
             return True
 
-        # Staleness guard: an old marker (crash recovery) must not swallow a fresh /restart.
         requested_at = data.get("requested_at")
         return not (isinstance(requested_at, (int, float)) and time.time() - requested_at > 300)
 

@@ -4,6 +4,7 @@ A leaf module: adapters, helpers and the runner import it, so it must not import
 gateway.platforms.*.
 """
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -92,11 +93,20 @@ class MessageEvent:
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
     reply_expected: Optional[bool] = None
+    # Platform-native identity for a non-message delivery (Slack slash trigger_id, Discord
+    # interaction id). Kept out of repr because some platform ids are short-lived capabilities.
+    # It is never written to disk directly; restart dedup persists only its fingerprint.
+    platform_delivery_id: Optional[str] = field(default=None, repr=False)
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+
+    def platform_delivery_fingerprint(self) -> Optional[str]:
+        """Stable non-secret fingerprint for replay detection of interaction deliveries."""
+        value = str(self.platform_delivery_id or "")
+        return hashlib.sha256(value.encode("utf-8")).hexdigest() if value else None
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one."""
