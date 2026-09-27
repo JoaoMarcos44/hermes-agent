@@ -521,6 +521,66 @@ class TestRemoveFile:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("origin", "expected_owner"),
+    [
+        ("assistant_tool", "learn"),
+        ("subagent", "agent"),
+        ("cron", "agent"),
+    ],
+)
+def test_create_records_runtime_ownership_provenance(
+    tmp_path, monkeypatch, origin, expected_owner
+):
+    """#125785: unattended creates must not masquerade as user-taught skills."""
+    from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
+    from tools.skill_usage import get_record, is_curator_managed
+
+    home = tmp_path / ".hermes"
+    skills_root = home / "skills"
+    skills_root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    name = f"{origin.replace('_', '-')}-created"
+    content = VALID_SKILL_CONTENT.replace("name: test-skill", f"name: {name}")
+
+    token = set_current_write_origin(origin)
+    try:
+        with _skill_dir(skills_root):
+            result = json.loads(skill_manage(action="create", name=name, content=content))
+    finally:
+        reset_current_write_origin(token)
+
+    assert result["success"] is True, result
+    assert get_record(name)["created_by"] == expected_owner
+    assert is_curator_managed(name) is (expected_owner == "agent")
+
+
+def test_batch_create_records_autonomous_ownership(tmp_path, monkeypatch):
+    """The operations array path used by the tool schema keeps subagent provenance."""
+    from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
+    from tools.skill_usage import get_record
+
+    home = tmp_path / ".hermes-batch"
+    skills_root = home / "skills"
+    skills_root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    name = "delegated-batch-created"
+    skill_text = VALID_SKILL_CONTENT.replace("name: test-skill", f"name: {name}")
+
+    token = set_current_write_origin("subagent")
+    try:
+        with _skill_dir(skills_root):
+            result = json.loads(skill_manage(
+                action="",
+                name="",
+                operations=[{"action": "create", "name": name, "content": skill_text}],
+            ))
+    finally:
+        reset_current_write_origin(token)
+
+    assert result["success"] is True, result
+    assert get_record(name)["created_by"] == "agent"
+
 class TestSkillManageDispatcher:
 
     @pytest.mark.parametrize("op, stray_key, destination", [

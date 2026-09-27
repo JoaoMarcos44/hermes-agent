@@ -139,6 +139,48 @@ def test_load_on_disk_store_honors_configured_limits_and_permissions(hermes_home
 # Shared command handler
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize(
+    ("origin", "expected_owner"),
+    [("subagent", "agent"), ("cron", "agent"), ("assistant_tool", "learn")],
+)
+def test_skill_approval_preserves_creation_origin(
+    hermes_home, monkeypatch, origin, expected_owner
+):
+    """Delayed approval must preserve autonomous vs foreground creation ownership."""
+    from pathlib import Path
+
+    from agent import skill_utils
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import skill_manager_tool as smt
+    from tools import write_approval as wa
+    from tools.skill_usage import get_record
+
+    skills_root = Path(hermes_home) / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(smt, "SKILLS_DIR", skills_root)
+    monkeypatch.setattr(skill_utils, "get_all_skills_dirs", lambda: [skills_root])
+
+    name = f"{origin.replace('_', '-')}-approved"
+    content = (
+        "---\n"
+        f"name: {name}\n"
+        "description: A staged skill for provenance testing.\n"
+        "---\n\n"
+        "# Staged provenance\n\n"
+        "Do the task.\n"
+    )
+    record = wa.stage_write(
+        wa.SKILLS,
+        {"action": "create", "name": name, "content": content},
+        summary=f"create {origin} skill",
+        origin=origin,
+    )
+
+    out = handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+
+    assert "Approved 1" in out, out
+    assert get_record(name)["created_by"] == expected_owner
+
 def test_handle_approve_all(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools.memory_tool import MemoryStore

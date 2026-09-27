@@ -2,8 +2,10 @@
 """Write-approval gate + pending store for memory and skill writes.
 
 A per-subsystem boolean ``write_approval`` gates the agent's cross-session writes —
-**memory** (MEMORY.md / USER.md) and **skills** (SKILL.md + files) — from either
-origin (**foreground** turn or **background_review** fork). ``false`` (default)
+**memory** (MEMORY.md / USER.md) and **skills** (SKILL.md + files). Skill writes
+also carry runtime provenance (foreground/assistant_tool, subagent, cron, or
+background_review) so a delayed approval can preserve who authored the write.
+``false`` (default)
 writes freely; ``true`` never commits directly: it prompts inline (memory,
 interactive CLI only) or **stages** the write under
 ``<HERMES_HOME>/pending/{memory,skills}/<id>.json`` for out-of-band review.
@@ -72,7 +74,7 @@ def _pending_files(subsystem: str) -> list:
 
 def stage_write(subsystem: str, payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
-    kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
+    kwargs to replay the write on approval; ``origin`` is the captured runtime write provenance.
     Best-effort: on disk failure it logs and still returns a record — the write is lost, which is
     the safe failure for an approval gate (nothing silently committed)."""
     pid = uuid.uuid4().hex[:8]
@@ -140,8 +142,7 @@ def pending_count(subsystem: str) -> int:
 # --- Write origin ---
 
 def current_origin() -> str:
-    """``foreground`` or ``background_review`` — reuses the skill-provenance ContextVar
-    the background review fork sets; foreground turns leave it at the default."""
+    """Return the current skill-write provenance captured by the turn ContextVar."""
     with suppress(Exception):
         from tools.skill_provenance import get_current_write_origin
         return get_current_write_origin()

@@ -1,12 +1,17 @@
-"""Skill write-origin provenance: a ContextVar separating background-review skill writes from foreground
-user-directed writes (the curator only curates skills the self-improvement review fork created; skills a user
-asked for belong to the user). run_agent.py binds the origin before each tool loop, mirroring
-AIAgent._memory_write_origin: ``token = set_current_write_origin(...)`` / ``reset_current_write_origin(token)``."""
+"""Skill write-origin provenance for user-directed, delegated, cron, and review writes.
+
+The ContextVar is bound at turn start from AIAgent._memory_write_origin. Background
+review remains a distinct authority boundary: subagent/cron origins may affect ownership
+of a newly-created skill, but do not inherit background-review edit/delete privileges.
+"""
 
 import contextvars
 
 _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar("skill_write_origin", default="foreground")
 BACKGROUND_REVIEW = "background_review"  # sentinel used by run_agent._spawn_background_review
+SUBAGENT = "subagent"
+CRON = "cron"
+_AGENT_MANAGED_CREATION_ORIGINS = frozenset({BACKGROUND_REVIEW, SUBAGENT, CRON})
 
 
 def set_current_write_origin(origin: str) -> contextvars.Token[str]:
@@ -18,12 +23,22 @@ def reset_current_write_origin(token: contextvars.Token[str]) -> None:
 
 
 def get_current_write_origin() -> str:
-    """"foreground" for any regular agent (CLI, gateway, cron, subagent); "background_review" for the review fork."""
+    """Current write provenance (foreground/assistant_tool/subagent/cron/background_review)."""
     return _write_origin.get()
 
 
 def is_background_review() -> bool:
     return get_current_write_origin() == BACKGROUND_REVIEW
+
+
+def is_agent_managed_creation() -> bool:
+    """True when a new skill was authored without a foreground user owner.
+
+    This is broader than is_background_review() for attribution only. It must not
+    be used to authorize edits of existing skills: delegated/cron agents do not
+    gain background-review ownership privileges.
+    """
+    return get_current_write_origin() in _AGENT_MANAGED_CREATION_ORIGINS
 
 
 # Attendedness is orthogonal to origin: an explicit ``/refine`` fork IS a background review (every

@@ -60,3 +60,37 @@ def test_attended_review_is_still_a_background_review():
     finally:
         reset_current_write_origin(token)
     assert not is_background_review() and not is_unattended_review()
+
+
+def test_autonomous_creation_provenance_does_not_grant_review_authority():
+    from tools.skill_provenance import (
+        BACKGROUND_REVIEW,
+        CRON,
+        SUBAGENT,
+        is_agent_managed_creation,
+        is_background_review,
+        reset_current_write_origin,
+        set_current_write_origin,
+    )
+
+    for origin in (SUBAGENT, CRON):
+        token = set_current_write_origin(origin)
+        try:
+            assert is_agent_managed_creation() is True
+            assert is_background_review() is False
+        finally:
+            reset_current_write_origin(token)
+
+    token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        assert is_agent_managed_creation() is True
+        assert is_background_review() is True
+    finally:
+        reset_current_write_origin(token)
+
+    token = set_current_write_origin("assistant_tool")
+    try:
+        assert is_agent_managed_creation() is False
+        assert is_background_review() is False
+    finally:
+        reset_current_write_origin(token)

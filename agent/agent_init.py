@@ -51,6 +51,16 @@ logger = logging.getLogger("run_agent")
 # Deduped: the gateway builds a fresh AIAgent per message, so it would warn every turn.
 _warned_unavailable_providers: set[str] = set()
 
+# These runtimes execute without a foreground user owning each tool write. Memory
+# providers already use the same platform contract to suppress automatic writes;
+# skill provenance uses it to distinguish autonomous creates from user-taught ones.
+_AUTONOMOUS_WRITE_PLATFORMS = frozenset({"cron", "subagent"})
+
+
+def _write_origin_for_platform(platform: Optional[str]) -> str:
+    """Write provenance for a normal agent turn; review forks override this later."""
+    return platform if platform in _AUTONOMOUS_WRITE_PLATFORMS else "assistant_tool"
+
 
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn once per provider that a configured memory provider is unavailable.
@@ -1273,7 +1283,7 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
         # platform="cron" (scheduler) / "subagent" (delegate_task) → providers skip writes (MemoryProvider.initialize).
-        "agent_context": platform if platform in ("cron", "subagent") else "primary",
+        "agent_context": platform if platform in _AUTONOMOUS_WRITE_PLATFORMS else "primary",
     }
     if kwargs["platform"] == "cli":
         kwargs["warning_callback"] = agent._emit_warning
@@ -2472,6 +2482,10 @@ def init_agent(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
     )
+    # _init_session_state installs _SESSION_STATE defaults, including the foreground
+    # write origin. Bind autonomous runtime provenance only after those defaults exist
+    # so cron/subagent identity survives into turn_context's ContextVar binding.
+    agent._memory_write_origin = _write_origin_for_platform(platform)
 
     # Load config once for memory, skills, and compression sections
     try:
