@@ -9,9 +9,14 @@ process and ``status``/``start`` report false positives.
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from gateway.status import (
+    _process_argv_to_command_line,
+    _read_process_cmdline,
     gateway_spawn_intent_subcommand as spawn_intent,
     looks_like_gateway_command_line as matches,
     looks_like_gateway_runtime_command_line as matches_runtime,
@@ -165,3 +170,63 @@ def test_accepts_atomic_desktop_gateway():
     assert matches_runtime(ATOMIC_DESKTOP) is True
 
 
+
+
+def _runtime_launcher(*args: str, python: str = "python") -> list[str]:
+    """Build the exact source-install runtime shape rather than duplicating its bootstrap in tests."""
+    from hermes_cli._launchers import runtime_command
+
+    return runtime_command(
+        Path.cwd() / "Hermes Agent",
+        list(args),
+        python=python,
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "subcommand", "strict", "runtime"),
+    [
+        (("gateway", "run", "--replace"), "run", True, True),
+        (("--profile", "work", "gateway", "run"), "run", True, True),
+        (("gateway", "restart"), "restart", False, True),
+        (("gateway", "status"), "status", False, False),
+    ],
+)
+def test_runtime_launcher_is_classified_from_its_real_builder(args, subcommand, strict, runtime):
+    command = _process_argv_to_command_line(_runtime_launcher(*args))
+    assert spawn_intent(command) == subcommand
+    assert matches(command) is strict
+    assert matches_runtime(command) is runtime
+
+
+def test_runtime_launcher_keeps_a_spacey_windows_interpreter_as_one_argument():
+    command = _process_argv_to_command_line(
+        _runtime_launcher("gateway", "run", "--replace", python=r"C:\\Program Files\\Hermes\\python.exe")
+    )
+    assert matches(command) is True
+    assert matches_runtime(command) is True
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import runpy\nif False:\n    runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)",
+        "print(\"runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)\")",
+    ],
+)
+def test_inline_source_that_only_mentions_the_entrypoint_is_not_gateway_identity(source):
+    command = _process_argv_to_command_line(["python", "-c", source, "gateway", "run"])
+    assert matches(command) is False
+    assert matches_runtime(command) is False
+
+
+def test_proc_cmdline_reader_preserves_runtime_launcher_argument_boundaries(monkeypatch):
+    parts = _runtime_launcher("gateway", "run", "--replace")
+    raw = b"\x00".join(str(part).encode("utf-8") for part in parts) + b"\x00"
+    monkeypatch.setattr(Path, "read_bytes", lambda _self: raw)
+
+    command = _read_process_cmdline(4242)
+
+    assert command is not None
+    assert matches(command) is True
+    assert matches_runtime(command) is True
