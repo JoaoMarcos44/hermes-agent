@@ -765,9 +765,10 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha, *, target_r
         sys.exit(1)
 
 
-def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
-    """Post-pull syntax guard: roll back to *pre_pull_sha* and ``sys.exit(1)`` when a critical
-    file no longer compiles (a bad admin-merge past CI must not brick the CLI)."""
+def _rollback_if_pulled_syntax_error(
+    git_cmd, pre_pull_sha, *, rollback_branch=None
+) -> None:
+    """Post-pull syntax guard: restore the checkout that was running before the update."""
     syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
     if syntax_ok:
         return
@@ -780,13 +781,19 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
     print()
     if pre_pull_sha:
         print(f"→ Rolling back to {pre_pull_sha[:10]}...")
-        rollback_result = _git_run(git_cmd, ["reset", "--hard", pre_pull_sha])
+        if rollback_branch is None:
+            rollback_args = ["reset", "--hard", pre_pull_sha]
+        elif rollback_branch == "HEAD":
+            rollback_args = ["checkout", "--detach", pre_pull_sha]
+        else:
+            rollback_args = ["checkout", rollback_branch]
+        rollback_result = _git_run(git_cmd, rollback_args)
         if rollback_result.returncode == 0:
             print("  ✓ Rollback complete — your install is unchanged.")
             print("  Try ``hermes update`` again later once a fix lands.")
         else:
             print("  ✗ Rollback failed. Recover manually with:")
-            print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
+            print(f"    cd {_m().PROJECT_ROOT} && git {shlex.join(rollback_args)}")
             if rollback_result.stderr.strip():
                 print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
     else:
@@ -797,8 +804,8 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
 
 def _pull_updates(
     git_cmd, branch, auto_stash_ref, *, prompt_for_restore, gw_input_fn, discard_local_changes,
-    keep_stash, target_ref=None, pre_sync_sha=None, sync_upstream=False, assume_yes=False,
-    in_place_update=False, _windows_gateway_resume=None):
+    keep_stash, target_ref=None, pre_sync_sha=None, rollback_branch=None, sync_upstream=False,
+    assume_yes=False, in_place_update=False, _windows_gateway_resume=None):
     """Fast-forward onto ``origin/<branch>`` and settle the autostash. Divergence by shape:
     custom branch -> merge, same branch -> rescue ref then reset; a
     post-pull syntax error in a critical file rolls back. Exits on failure; returns pre-pull SHA."""
@@ -813,6 +820,12 @@ def _pull_updates(
     # A release update moves the tree to its tag, not the branch tip: the marker names what git writes.
     merge_ref = target_ref if target_ref is not None else f"origin/{branch}"
     target_sha = (_git_run(git_cmd, ["rev-parse", f"{merge_ref}^{{commit}}"]).stdout or "").strip()
+    # `pre_sync_sha` may describe code that moved before this function (for
+    # example a detached checkout switching onto an existing local branch).
+    # Keep that proof separate from the immediate pre-pull baseline so a later
+    # fork sync can legitimately round-trip to the original SHA.
+    movement_already_applied = bool(
+        pre_sync_sha and pre_pull_sha and pre_sync_sha != pre_pull_sha)
     with _best_effort('Could not write the interrupted-pull marker: %s'):
         pull_marker.write_text(
             f"pid={os.getpid()}\npre={pre_pull_sha}\ntarget={target_sha}\nstash={auto_stash_ref or ''}\n",
@@ -835,18 +848,26 @@ def _pull_updates(
             raise
         pull_marker.unlink(missing_ok=True)  # git is done: the tree is whole again
         if sync_upstream:
-            # Do not let a second mutation hide a failed origin merge or move an
-            # unexpected branch. Keep local edits parked through the final check.
+            # The origin phase must either move HEAD now or have inherited a
+            # movement that already happened while preparing the checkout.
             _verify_head_after_pull(
-                git_cmd, branch, pre_sync_sha or pre_pull_sha, in_place_update=in_place_update,
+                git_cmd, branch, pre_pull_sha, in_place_update=in_place_update,
+                movement_already_applied=movement_already_applied,
                 _windows_gateway_resume=_windows_gateway_resume)
+            movement_already_applied = True
             _m()._sync_with_upstream_if_needed(
                 git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
         # Refuse an unexpected branch before syntax rollback can reset its ref.
+        # When the origin phase already proved movement, a no-op (or a
+        # round-trip to the original SHA) in the optional upstream phase is
+        # legitimate; only target/branch identity still needs checking.
         _verify_head_after_pull(
-            git_cmd, branch, pre_sync_sha or pre_pull_sha, in_place_update=in_place_update,
+            git_cmd, branch, pre_pull_sha, in_place_update=in_place_update,
+            movement_already_applied=movement_already_applied,
             _windows_gateway_resume=_windows_gateway_resume)
-        _rollback_if_pulled_syntax_error(git_cmd, pre_sync_sha or pre_pull_sha)
+        _rollback_if_pulled_syntax_error(
+            git_cmd, pre_sync_sha or pre_pull_sha,
+            **({"rollback_branch": rollback_branch} if rollback_branch is not None else {}))
         update_succeeded = True
     finally:
         if auto_stash_ref is not None:
@@ -879,6 +900,7 @@ class _CheckoutPlan:
     switch_block_reason: "str | None"
     upstream_checked: bool
     pre_sync_sha: str | None = None
+    rollback_branch: str | None = None
 
 
 def _apply_parked_branch_guard(
@@ -949,13 +971,16 @@ def _prepare_checkout_for_update(
         _park_detached_head(git_cmd, _m().PROJECT_ROOT, branch)
     auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
     moved_from_sha = None
-    if (
-        not release_tag and not in_place_update and current_branch != branch
-        and _git_run(git_cmd, ["checkout", branch]).returncode != 0):
-        # `checkout -B` lands ON the target, so HEAD..target would count 0 and the update would
-        # finish as "Already up to date!" with nothing synced (#125112): count from here instead.
+    rollback_branch = None
+    if not release_tag and not in_place_update and current_branch != branch:
+        # Any updater-driven checkout can move the running tree before the
+        # origin comparison. Capture both code identity and branch identity
+        # before attempting either checkout form.
         moved_from_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        track_result = _git_run(git_cmd, ["checkout", "-B", branch, f"origin/{branch}"])
+        rollback_branch = current_branch
+        track_result = _git_run(git_cmd, ["checkout", branch])
+        if track_result.returncode != 0:
+            track_result = _git_run(git_cmd, ["checkout", "-B", branch, f"origin/{branch}"])
         if track_result.returncode != 0:
             # Restore the stash before bailing so the user isn't stranded.
             if auto_stash_ref is not None:
@@ -993,6 +1018,13 @@ def _prepare_checkout_for_update(
         # counted == 0 means local-ahead: falls through to the up-to-date path.
         commit_count = counted if counted is not None else -1
 
+    # A branch switch can change the running checkout even when the fetched
+    # target contributes no commits relative to the code that was running.
+    if commit_count == 0 and moved_from_sha:
+        landed_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        if landed_sha and landed_sha != moved_from_sha:
+            commit_count = -1
+
     # A fork can match origin yet trail upstream, so the sync can move HEAD with
     # commit_count == 0; detect that BEFORE the no-update return so deps, restarts AND the
     # fleet matrix still run (it used to live in the early-return branch and verified nothing).
@@ -1013,13 +1045,13 @@ def _prepare_checkout_for_update(
                 git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
             # HEAD moving is proof of an update even if the count can't be read.
             commit_count = max(1, synced_count)
-            moved_from_sha = pre_sync_sha
+            moved_from_sha = moved_from_sha or pre_sync_sha
 
     return _CheckoutPlan(
         auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
         parked_branch_switched=parked_branch_switched, prompt_for_restore=prompt_for_restore,
         switch_block_reason=switch_block_reason, upstream_checked=upstream_checked,
-        pre_sync_sha=moved_from_sha)
+        pre_sync_sha=moved_from_sha, rollback_branch=rollback_branch)
 
 
 @dataclass
@@ -1135,9 +1167,10 @@ def _prepare_git_command() -> tuple[bool, list, bool]:
 
 
 def _verify_head_after_pull(
-    git_cmd, branch: str, pre_pull_sha, *, in_place_update: bool, _windows_gateway_resume
+    git_cmd, branch: str, pre_pull_sha, *, in_place_update: bool,
+    movement_already_applied: bool = False, _windows_gateway_resume
 ) -> str | None:
-    """Return the post-pull HEAD SHA; ``sys.exit(1)`` if the pull was a no-op or landed off-branch."""
+    """Verify movement once per transaction plus final checkout identity."""
     # A detached checkout pinned to a SHA can report "N new commit(s)" and a successful
     # merge --ff-only yet stay put; surface the no-op instead of claiming "Code updated!".
     # Verify HEAD actually moved (issue #79678). ``merge --ff-only`` succeeding only means the merge
@@ -1148,7 +1181,7 @@ def _verify_head_after_pull(
     # doctor`` healthy. Compare pre-pull and post-pull HEAD; if they match, surface the no-op instead of
     # claiming success.
     post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-    if pre_pull_sha and post_pull_sha == pre_pull_sha:
+    if not movement_already_applied and pre_pull_sha and post_pull_sha == pre_pull_sha:
         print()
         print("✗ Code did not move — update was a no-op.")
         print(
@@ -1256,9 +1289,12 @@ def _finish_already_up_to_date(
 def _apply_pulled_update(
     git_cmd, branch, pre_pull_sha, _plan, *, _windows_gateway_resume, completion_request: dict) -> None:
     """Post-pull phase: verify HEAD, sync Python/Node/web/Desktop, maintenance, fleet restart."""
+    # _pull_updates already proved that this transaction moved code (either
+    # during checkout preparation or during the pull) and verified the final
+    # branch. Re-check identity here without requiring a second SHA movement.
     post_pull_sha = _verify_head_after_pull(
-        git_cmd, branch, _plan.pre_sync_sha or pre_pull_sha, in_place_update=_plan.in_place_update,
-        _windows_gateway_resume=_windows_gateway_resume)
+        git_cmd, branch, pre_pull_sha, in_place_update=_plan.in_place_update,
+        movement_already_applied=True, _windows_gateway_resume=_windows_gateway_resume)
 
     if completion_request is not None:
         observed = _capture_head_sha(git_cmd, _m().PROJECT_ROOT) or post_pull_sha
@@ -1422,6 +1458,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             git_cmd, branch, _plan.auto_stash_ref, prompt_for_restore=_plan.prompt_for_restore,
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
+            rollback_branch=_plan.rollback_branch,
             sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume)
         _apply_pulled_update(
