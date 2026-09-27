@@ -113,3 +113,65 @@ def test_bare_custom_openrouter_uses_its_model_key_before_sibling_pool(monkeypat
     assert result["provider"] == "custom"
     assert result["base_url"] == ENDPOINT
     assert result["api_key"] == MAIN_KEY
+
+def test_non_owner_pool_heals_stale_model_config_without_touching_manual_rows(monkeypatch):
+    stale = cp.PooledCredential(
+        provider="custom:second",
+        id="stale-model",
+        label="model_config",
+        auth_type=cp.AUTH_TYPE_API_KEY,
+        priority=0,
+        source="model_config",
+        access_token=MAIN_KEY,
+        base_url=ENDPOINT,
+    )
+    manual = cp.PooledCredential(
+        provider="custom:second",
+        id="manual-second",
+        label="manual",
+        auth_type=cp.AUTH_TYPE_API_KEY,
+        priority=1,
+        source="manual",
+        access_token="manual-second-key",
+        base_url=ENDPOINT,
+    )
+    provider_entry = _same_url_provider()[0][1]
+    monkeypatch.setattr(cp, "_get_custom_provider_config", lambda _pool_key: provider_entry)
+    monkeypatch.setattr(cp, "_iter_custom_providers", lambda: iter(_same_url_provider()))
+    monkeypatch.setattr(
+        cp,
+        "_load_config_safe",
+        lambda: {"model": {"provider": "custom", "base_url": ENDPOINT, "api_key": MAIN_KEY}},
+    )
+
+    entries = [stale, manual]
+    changed, _active_sources = cp._seed_custom_pool("custom:second", entries)
+
+    assert changed
+    assert all(entry.source != "model_config" for entry in entries)
+    assert any(entry.id == "manual-second" and entry.access_token == "manual-second-key" for entry in entries)
+    assert any(entry.source == "config:Second" and entry.access_token == SECOND_KEY for entry in entries)
+
+
+def test_owner_pool_keeps_model_config_when_runtime_credential_matches(monkeypatch):
+    owner = {
+        "name": "Main",
+        "provider_key": "main",
+        "base_url": ENDPOINT,
+        "api_key": MAIN_KEY,
+    }
+    monkeypatch.setattr(cp, "_get_custom_provider_config", lambda _pool_key: owner)
+    monkeypatch.setattr(cp, "_iter_custom_providers", lambda: iter([("main", owner)]))
+    monkeypatch.setattr(
+        cp,
+        "_load_config_safe",
+        lambda: {"model": {"provider": "custom", "base_url": ENDPOINT, "api_key": MAIN_KEY}},
+    )
+
+    entries = []
+    changed, active_sources = cp._seed_custom_pool("custom:main", entries)
+
+    assert changed
+    assert "model_config" in active_sources
+    assert any(entry.source == "model_config" and entry.access_token == MAIN_KEY for entry in entries)
+

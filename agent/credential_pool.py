@@ -3071,36 +3071,43 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
                 "label": name or f"config:{name}",
             })
 
-    # Seed from model.api_key when model.provider=='custom' and model.base_url matches
+    # Seed from model.api_key only into the pool that owns that runtime.
+    # If this config load succeeds and proves that a persisted model_config row
+    # belongs elsewhere, heal the stale row left by pre-owner-boundary versions.
     try:
         config = _load_config_safe()
-        model_cfg = config.get("model") if config else None
-        if isinstance(model_cfg, dict):
-            model_provider = str(model_cfg.get("provider") or "").strip().lower()
-            model_base_url = _norm_url(model_cfg.get("base_url"))
-            model_api_key = next(
-                (v.strip() for k in ("api_key", "api") for v in (model_cfg.get(k),) if isinstance(v, str) and v.strip()),
-                "",
-            )
-            if model_provider == "custom" and model_base_url and model_api_key:
-                # The pool may be keyed under the durable ``providers.<key>``
-                # slug or legacy ``custom:<name>``; accept any candidate, or
-                # seeding is skipped when the pool holds the other identity.
-                # Check if this model's base_url matches our custom provider. See #100413.
-                matched_keys = {
-                    str(key).strip().lower()
-                    for key in custom_provider_pool_key_candidates_for_owner(
-                        model_base_url, api_key=model_api_key
-                    )
-                }
-                if pool_key in matched_keys:
-                    seed.upsert("model_config", {
-                        "auth_type": AUTH_TYPE_API_KEY,
-                        "access_token": model_api_key,
-                        "base_url": model_base_url,
-                        "label": "model_config",
-                    })
+        if config is not None:
+            model_cfg = config.get("model")
+            owns_model_config = False
+            if isinstance(model_cfg, dict):
+                model_provider = str(model_cfg.get("provider") or "").strip().lower()
+                model_base_url = _norm_url(model_cfg.get("base_url"))
+                model_api_key = next(
+                    (v.strip() for k in ("api_key", "api") for v in (model_cfg.get(k),) if isinstance(v, str) and v.strip()),
+                    "",
+                )
+                if model_provider == "custom" and model_base_url and model_api_key:
+                    # The pool may be keyed under the durable provider slug or
+                    # legacy custom:<name>; ownership must agree before seeding.
+                    matched_keys = {
+                        str(key).strip().lower()
+                        for key in custom_provider_pool_key_candidates_for_owner(
+                            model_base_url, api_key=model_api_key
+                        )
+                    }
+                    if pool_key in matched_keys:
+                        seed.upsert("model_config", {
+                            "auth_type": AUTH_TYPE_API_KEY,
+                            "access_token": model_api_key,
+                            "base_url": model_base_url,
+                            "label": "model_config",
+                        })
+                        owns_model_config = True
+            if not owns_model_config:
+                seed.changed |= _retain_sources_not_in(seed.entries, {"model_config"})
     except Exception:
+        # A read failure is not evidence that the persisted owner changed.
+        # Leave existing rows untouched rather than deleting on uncertainty.
         pass
 
     return seed.result
