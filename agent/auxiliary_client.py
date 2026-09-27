@@ -1699,10 +1699,14 @@ def _translate_anthropic_response_format(anthropic_kwargs: Dict[str, Any], respo
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
-    def __init__(self, real_client: Any, model: str, is_oauth: bool = False, base_url: str | None = None):
+    def __init__(
+        self, real_client: Any, model: str, is_oauth: bool = False,
+        base_url: str | None = None, is_bedrock: bool = False,
+    ):
         self._client = real_client
         self._model = model
         self._is_oauth = is_oauth
+        self._is_bedrock = is_bedrock
         # Caller URL first; fall back to the SDK client's host only for Nous Portal — a blanket
         # fallback would flip MiniMax/Zhipu aux adapters to third-party handling (strips thinking sigs).
         self._base_url = base_url or None
@@ -1771,11 +1775,15 @@ class _AnthropicCompletionsAdapter:
         # unrecognized top-level kwarg was dropped on the floor: the request succeeded but the schema
         # contract silently became prompt compliance (#85626 review, point 2).
         top_level_response_format = kwargs.get("response_format")
-        if top_level_response_format is not None:
+        # AnthropicBedrock rejects output_config.format at the Bedrock endpoint (#124923).
+        # Keep native Anthropic / compatible Messages routes schema-enforced, but let Bedrock
+        # fall back to the same prompt-compliance behavior used after a structured-output 400.
+        if top_level_response_format is not None and not self._is_bedrock:
             _translate_anthropic_response_format(anthropic_kwargs, top_level_response_format)
         caller_extra_body = kwargs.get("extra_body")
         if caller_extra_body and isinstance(caller_extra_body, dict):
-            _translate_anthropic_response_format(anthropic_kwargs, caller_extra_body.get("response_format"))
+            if not self._is_bedrock:
+                _translate_anthropic_response_format(anthropic_kwargs, caller_extra_body.get("response_format"))
             passthrough = {
                 k: v for k, v in caller_extra_body.items()
                 if k not in {"reasoning", "response_format"} and not str(k).startswith("_")
@@ -1814,9 +1822,14 @@ class _AnthropicCompletionsAdapter:
 class AnthropicAuxiliaryClient:
     """OpenAI-client-compatible wrapper over a native Anthropic client."""
 
-    def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False):
+    def __init__(
+        self, real_client: Any, model: str, api_key: str, base_url: str,
+        is_oauth: bool = False, is_bedrock: bool = False,
+    ):
         self._real_client = real_client
-        self.chat = _ChatShim(_AnthropicCompletionsAdapter(real_client, model, is_oauth=is_oauth, base_url=base_url))
+        self.chat = _ChatShim(_AnthropicCompletionsAdapter(
+            real_client, model, is_oauth=is_oauth, base_url=base_url, is_bedrock=is_bedrock,
+        ))
         self.api_key = api_key
         self.base_url = base_url
 
@@ -4817,7 +4830,9 @@ def _build_bedrock_client(provider: str, model: Optional[str], *, raw_codex: boo
         except ImportError as exc:
             logger.warning("resolve_provider_client: cannot create Bedrock client: %s", exc)
             return None, None
-        client = AnthropicAuxiliaryClient(real_client, final_model, api_key="aws-sdk", base_url=base_url)
+        client = AnthropicAuxiliaryClient(
+            real_client, final_model, api_key="aws-sdk", base_url=base_url, is_bedrock=True,
+        )
         logger.debug("resolve_provider_client: bedrock anthropic (%s, %s)", final_model, region)
     else:
         client = BedrockAuxiliaryClient(region, final_model)

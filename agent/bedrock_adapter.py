@@ -1214,8 +1214,10 @@ def probe_bedrock_context_length(model_id: str, region: str) -> Optional[int]:
     for tier_tokens in _BEDROCK_PROBE_TIERS:
         oversized = "data " * int(tier_tokens / _WORDS_PER_TOKEN)
         try:
+            # OpenAI-on-Bedrock models reject output caps below 16 before context-length
+            # validation, which masks the very error this probe needs to parse (#124923).
             client.converse(modelId=model_id, messages=[{"role": "user", "content": [{"text": oversized}]}],
-                            inferenceConfig={"maxTokens": 8})
+                            inferenceConfig={"maxTokens": 16})
             logger.debug("Bedrock context probe for %s accepted ~%s-token prompt; "
                          "window is at least that", model_id, f"{tier_tokens:,}")
             return tier_tokens
