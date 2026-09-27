@@ -214,8 +214,20 @@ class Facts:
                 # Legacy fact: pre-dates digest-bound identity. Not
                 # vouchable — force one reinstall.
                 return False
-            if (fact["target"], tuple(fact["artifacts"])) != (target, tuple(shas)):
-                return False
+            recorded = (fact["target"], tuple(fact["artifacts"]))
+            expected = (target, tuple(shas))
+            if recorded != expected:
+                rows = fact.get("artifact_rows")
+                repaired = (
+                    fact["target"] == target
+                    and tuple(fact.get("replaces", ())) == tuple(shas)
+                    and isinstance(rows, list)
+                    and rows
+                    and all(isinstance(row, dict) for row in rows)
+                    and tuple(row.get("sha256") for row in rows) == tuple(fact["artifacts"])
+                )
+                if not repaired:
+                    return False
         return (store_root / fact["entry"]).exists()
 
     def env_for(self, name: str, store_root: Path) -> dict:
@@ -242,6 +254,8 @@ class Facts:
         target: str | None = None,
         artifacts: list[str] | None = None,
         digest: str | None = None,
+        replaces: list[str] | None = None,
+        artifact_rows: list[dict] | None = None,
     ) -> None:
         """``target``/``artifacts`` record the identity this install came
         from (work item 1); ``digest`` is the realized tree digest of the
@@ -258,6 +272,10 @@ class Facts:
             fact["artifacts"] = list(artifacts)
         if digest is not None:
             fact["digest"] = digest
+        if replaces is not None:
+            fact["replaces"] = list(replaces)
+        if artifact_rows is not None:
+            fact["artifact_rows"] = [dict(row) for row in artifact_rows]
         self._merge_and_write(name, fact)
 
     def record_state(

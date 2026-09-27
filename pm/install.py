@@ -13,12 +13,17 @@ from pathlib import Path
 from typing import Optional
 
 from pm import paths
-from pm.downloader import DownloadPaused, ProgressFn
+from pm.downloader import (
+    DownloadPaused,
+    DownloadSourcesExhausted,
+    DownloadTransportError,
+    ProgressFn,
+)
 from pm.lock import Facts, Lockfile
 from pm.package import InstallError, Package, Runner, StatePackage, compose_env
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection, StagedUpdate
 from pm.registry import get_package, walk
-from pm.store import Store, current_target, merge_tree, tree_digest
+from pm.store import Store, current_target, hash_url, merge_tree, tree_digest
 
 LOG = logging.getLogger(__name__)
 
@@ -285,7 +290,71 @@ def _entry_current(package, lockfile, facts, store, entry, previous, version, pi
     return recorded == pin and not package.verify(entry, target)
 
 
-def _copy_verified_source(package, lockfile, copy_from, staged, version, target) -> None:
+def _artifact_shas(artifacts: list[dict]) -> list[str]:
+    return [artifact["sha256"] for artifact in artifacts]
+
+
+def _valid_artifact_rows(rows) -> bool:
+    return bool(
+        isinstance(rows, list)
+        and rows
+        and all(
+            isinstance(row, dict)
+            and isinstance(row.get("url"), str)
+            and isinstance(row.get("sha256"), str)
+            for row in rows
+        )
+    )
+
+
+def _fact_artifact_repair(previous, version: str, target: str, locked: list[dict]) -> list[dict] | None:
+    if (
+        not previous
+        or previous.get("version") != version
+        or previous.get("target") != target
+        or previous.get("replaces") != _artifact_shas(locked)
+    ):
+        return None
+    rows = previous.get("artifact_rows")
+    if not _valid_artifact_rows(rows) or _artifact_shas(rows) != previous.get("artifacts"):
+        return None
+    return [dict(row) for row in rows]
+
+
+def _stage_pin(version: str, target: str, artifacts: list[dict], locked: list[dict]) -> str:
+    data = {"target": target, "sha256": _artifact_shas(artifacts)}
+    if artifacts != locked:
+        data["repair_version"] = version
+        data["replaces"] = _artifact_shas(locked)
+        data["artifact_rows"] = [dict(row) for row in artifacts]
+    return json.dumps(data)
+
+
+def _stage_artifact_repair(
+    entry: Path,
+    version: str,
+    target: str,
+    locked: list[dict],
+) -> list[dict] | None:
+    try:
+        data = json.loads((entry / ".pm-stage-pin.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    rows = data.get("artifact_rows")
+    if (
+        data.get("repair_version") != version
+        or data.get("target") != target
+        or data.get("replaces") != _artifact_shas(locked)
+        or not _valid_artifact_rows(rows)
+        or _artifact_shas(rows) != data.get("sha256")
+    ):
+        return None
+    return [dict(row) for row in rows]
+
+
+def _copy_verified_source(package, lockfile, copy_from, staged, version, target, locked) -> list[dict] | None:
     source_facts, source_store = copy_from
     source = source_facts.get(package.name)
     if (not source_facts.installed(package.name, version, source_store.root,
@@ -295,6 +364,63 @@ def _copy_verified_source(package, lockfile, copy_from, staged, version, target)
     shutil.copytree(source_store.entry(source["entry"]), staged, symlinks=True)
     if tree_digest(staged) != source["digest"]:
         raise InstallError(package.name, "copied bytes do not match the bundled source")
+    return _fact_artifact_repair(source, version, target, locked)
+
+
+def _retired_origin_failure(
+    exc: DownloadTransportError | DownloadSourcesExhausted,
+    artifacts: list[dict],
+) -> bool:
+    failures = exc.failures if isinstance(exc, DownloadSourcesExhausted) else (exc,)
+    return bool(
+        failures
+        and failures[0].status in (404, 410)
+        and failures[0].url in {artifact["url"] for artifact in artifacts}
+    )
+
+
+def _replacement_artifact_urls(package: Package, version: str, target: str) -> tuple[str, list[str]] | None:
+    exact_version = version
+    if package.version_style == "minor":
+        from pm.update import best_in_minor, minor_of
+
+        locked_minor = minor_of(version)
+        if locked_minor is None:
+            return None
+        exact_version = best_in_minor(
+            list(package.latest_versions(target, locked=version) or []),
+            locked_minor,
+        )
+        if exact_version is None:
+            return None
+    return exact_version, package.fetch_urls(exact_version, target)
+
+
+def _replacement_artifacts(
+    package: Package,
+    version: str,
+    target: str,
+    artifacts: list[dict],
+) -> list[dict] | None:
+    try:
+        replacement = _replacement_artifact_urls(package, version, target)
+        if replacement is None:
+            return None
+        exact_version, urls = replacement
+        if not urls or urls == [artifact["url"] for artifact in artifacts]:
+            return None
+
+        known = {artifact["url"]: artifact["sha256"] for artifact in artifacts}
+        refreshed = []
+        for url in urls:
+            digest = known.get(url) or package.known_sha256(exact_version, url) or hash_url(url)
+            refreshed.append({"url": url, "sha256": digest})
+    except Exception:
+        LOG.debug("could not resolve a replacement artifact for %s", package.name, exc_info=True)
+        return None
+
+    LOG.info("repair: %s selected a live %s artifact for %s", package.name, version, target)
+    return refreshed
 
 
 def _log_repair(package, previous, version, artifacts) -> None:
@@ -337,8 +463,8 @@ def _install(
     entry = store.entry(entry_name)
     if getattr(package, "pin_only", False):
         return entry
-    artifacts = lockfile.artifacts(package.name, target)
-    pin = json.dumps({"target": target, "sha256": [a["sha256"] for a in artifacts]})
+    locked_artifacts = lockfile.artifacts(package.name, target)
+    artifacts = locked_artifacts
 
     with nullcontext() if _lock_held else store.install_lock():
         if pause_event is not None and pause_event.is_set():
@@ -348,6 +474,14 @@ def _install(
         previous = facts.get(package.name) if facts is not None else None
         previous_entry = store.entry(f".previous-{'stage-' if facts is None else ''}{entry_name}")
         _settle_previous_entry(package, store, entry, previous_entry, previous, target)
+        repaired = (
+            _fact_artifact_repair(previous, version, target, locked_artifacts)
+            if facts is not None
+            else _stage_artifact_repair(entry, version, target, locked_artifacts)
+        )
+        if repaired is not None:
+            artifacts = repaired
+        pin = _stage_pin(version, target, artifacts, locked_artifacts)
         if (_entry_current(package, lockfile, facts, store, entry, previous, version, pin, target)
                 and not _fresh_copy):
             _remove_downloads(store, artifacts)
@@ -362,11 +496,27 @@ def _install(
             staged = scratch / "tree"
             try:
                 if copy_from is not None:
-                    _copy_verified_source(package, lockfile, copy_from, staged, version, target)
+                    copied_repair = _copy_verified_source(
+                        package, lockfile, copy_from, staged, version, target, locked_artifacts
+                    )
+                    artifacts = copied_repair if copied_repair is not None else locked_artifacts
+                    pin = _stage_pin(version, target, artifacts, locked_artifacts)
                 else:
-                    staged = _prepare_artifacts(package, store, scratch, artifacts, version, target,
-                                                progress=progress, pause_event=pause_event,
-                                                download_progress=download_progress)
+                    try:
+                        staged = _prepare_artifacts(package, store, scratch, artifacts, version, target,
+                                                    progress=progress, pause_event=pause_event,
+                                                    download_progress=download_progress)
+                    except (DownloadTransportError, DownloadSourcesExhausted) as exc:
+                        if not _retired_origin_failure(exc, artifacts):
+                            raise
+                        refreshed = _replacement_artifacts(package, version, target, artifacts)
+                        if refreshed is None:
+                            raise
+                        artifacts = refreshed
+                        pin = _stage_pin(version, target, artifacts, locked_artifacts)
+                        staged = _prepare_artifacts(package, store, scratch, artifacts, version, target,
+                                                    progress=progress, pause_event=pause_event,
+                                                    download_progress=download_progress)
                 if pause_event is not None and pause_event.is_set():
                     raise DownloadPaused("install paused")
                 if progress is not None:
@@ -378,10 +528,13 @@ def _install(
                     (staged / ".pm-stage-pin.json").write_text(pin, encoding="utf-8")
                 with _publish_entry(package, store, staged, entry, previous_entry, target):
                     if facts is not None:
+                        repaired_pin = artifacts != locked_artifacts
                         facts.record(
                             package.name, version, entry_name, package.env(entry, target), store.root,
-                            target=target, artifacts=[a["sha256"] for a in artifacts],
+                            target=target, artifacts=_artifact_shas(artifacts),
                             digest=tree_digest(entry),
+                            replaces=_artifact_shas(locked_artifacts) if repaired_pin else None,
+                            artifact_rows=artifacts if repaired_pin else None,
                         )
                 _remove_downloads(store, artifacts)
             except (InstallError, DownloadPaused):

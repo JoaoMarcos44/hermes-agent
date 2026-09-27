@@ -753,6 +753,15 @@ class Ffmpeg(_BionicDebArm, BinaryPackage, DebPackage):
             return btbn_versions(target)
         return martin_riedl_versions(target)
 
+    def known_sha256(self, version: str, url: str) -> Optional[str]:
+        prefix = "https://github.com/BtbN/FFmpeg-Builds/releases/download/"
+        if not url.startswith(prefix):
+            return None
+        tag, separator, asset = url.removeprefix(prefix).partition("/")
+        if not separator or not tag or not asset or "/" in asset:
+            return None
+        return _github_release_digests("BtbN/FFmpeg-Builds", tag).get(asset)
+
 
 @register
 class Ripgrep(BinaryPackage):

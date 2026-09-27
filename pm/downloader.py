@@ -118,11 +118,18 @@ class DownloadTransportError(DownloadError):
     def __init__(self, url: str, cause: Exception):
         self.url = url
         self.status = cause.code if isinstance(cause, urllib.error.HTTPError) else None
-        self.fallback_allowed = (
-            self.status in (401, 403, 404, 410) or is_transient(cause)
-        )
+        self.source_refused = self.status in (401, 403, 404, 410)
+        self.fallback_allowed = self.source_refused or is_transient(cause)
         reason = f"{cause}; the host refused access" if self.status in (401, 403) else str(cause)
         super().__init__(f"download failed from {url}: {reason}")
+
+
+class DownloadSourcesExhausted(DownloadError):
+    """Every transport source definitively refused one pinned artifact."""
+
+    def __init__(self, failures: list[DownloadTransportError]):
+        self.failures = tuple(failures)
+        super().__init__("\n".join(str(error) for error in self.failures))
 
 
 @dataclass(frozen=True)
@@ -340,7 +347,10 @@ class Download:
                 if not exc.fallback_allowed or index == len(urls) - 1:
                     if len(failures) == 1:
                         raise
-                    raise DownloadError("\n".join(str(error) for error in failures)) from exc
+                    message = "\n".join(str(error) for error in failures)
+                    if all(error.source_refused for error in failures):
+                        raise DownloadSourcesExhausted(failures) from exc
+                    raise DownloadError(message) from exc
                 logging.getLogger(__name__).debug("%s; trying pinned mirror %s", exc, urls[index + 1])
 
     def _transfer(self, source: Source, tick) -> int:

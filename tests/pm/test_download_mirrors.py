@@ -3,7 +3,7 @@ import hashlib
 
 import pytest
 
-from pm.downloader import Download, DownloadError, HashError, Source
+from pm.downloader import Download, DownloadError, DownloadSourcesExhausted, HashError, Source
 from tests.pm._range_server import RangeHandler, dl_server, url  # noqa: F401
 
 
@@ -62,12 +62,39 @@ def test_exhausted_mirrors_name_each_attempted_url(tmp_path, dl_server, monkeypa
 
     monkeypatch.setattr(RangeHandler, "do_GET", respond)
     primary, mirror = (url(dl_server, path) for path in ("/missing", "/also-missing"))
-    with pytest.raises(DownloadError) as failure:
+    with pytest.raises(DownloadSourcesExhausted) as failure:
         Download([Source(primary, tmp_path / "absent", "0" * 64, fallbacks=(mirror,))],
                  partials_dir=tmp_path / "partials").run()
+    assert [error.url for error in failure.value.failures] == [primary, mirror]
+    assert [error.status for error in failure.value.failures] == [404, mirror_status]
     assert primary in str(failure.value) and mirror in str(failure.value)
     assert "404" in str(failure.value) and str(mirror_status) in str(failure.value)
     assert not (tmp_path / "absent").exists()
+
+
+def test_transient_mirror_exhaustion_is_not_a_retired_source(tmp_path, dl_server, monkeypatch):
+    original = RangeHandler.do_GET
+
+    def respond(handler):
+        if handler.path == "/transient-mirror":
+            handler.send_error(503)
+        else:
+            original(handler)
+
+    monkeypatch.setattr(RangeHandler, "do_GET", respond)
+    primary = url(dl_server, "/missing")
+    mirror = url(dl_server, "/transient-mirror")
+    download = Download(
+        [Source(primary, tmp_path / "absent", "0" * 64, fallbacks=(mirror,))],
+        partials_dir=tmp_path / "partials",
+    )
+    monkeypatch.setattr(download, "_wait_retry", lambda _: None)
+
+    with pytest.raises(DownloadError) as failure:
+        download.run()
+
+    assert type(failure.value) is DownloadError
+    assert primary in str(failure.value) and mirror in str(failure.value)
 
 
 @pytest.mark.parametrize("failure", ["503", "tls", "disk", "pause"])
