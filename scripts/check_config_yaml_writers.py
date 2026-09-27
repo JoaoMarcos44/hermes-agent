@@ -2,7 +2,8 @@
 """Fail when a ``config.yaml`` is written by anything but the comment-preserving writer.
 
 Every writer of ``~/.hermes/config.yaml`` (and ``profiles/*/config.yaml``) must go through
-``hermes_cli.config.atomic_config_write`` → ``utils.atomic_roundtrip_yaml_save`` (ruamel
+``hermes_cli.config.atomic_config_write`` (safe) or ``atomic_config_replace`` (explicit full-state)
+→ ``utils.atomic_roundtrip_yaml_save`` (ruamel
 round-trip). A PyYAML dump (``yaml.dump`` / ``yaml.safe_dump`` / ``utils.atomic_yaml_write``)
 of a config path re-serialises the parsed dict and destroys every user comment — the #92554
 class, which regressed several times because each new writer picked the plain dumper again.
