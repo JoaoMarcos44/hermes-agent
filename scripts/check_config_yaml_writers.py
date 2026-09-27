@@ -73,7 +73,9 @@ def scan_file(path: Path) -> list[str]:
         line = lines[node.lineno - 1]
         if SUPPRESS in line:
             return
-        problems.append(f"{rel}:{node.lineno}: {why} — route it through hermes_cli.config.atomic_config_write")
+        problems.append(
+            f"{rel}:{node.lineno}: {why} — route it through "
+            "hermes_cli.config.atomic_config_write/atomic_config_replace")
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):

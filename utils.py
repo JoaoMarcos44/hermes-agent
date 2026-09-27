@@ -504,12 +504,13 @@ def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict, *,
                                extra_content_on_create: "str | None" = None) -> None:
     """Persist a full config-state dict while preserving comments and ordering.
 
-    THE writer for ``config.yaml`` (every production caller reaches it through
-    ``hermes_cli.config.atomic_config_write``): the on-disk document is loaded through ruamel
-    round-trip mode and *new_state* is merged onto it, so comments, key order, quotes, blank
-    lines and readable Unicode survive. Only nodes whose value actually changed are reassigned;
-    an untouched scalar or list keeps its inline comments and formatting. Keys absent from
-    *new_state* are deleted ("explicit absence": ``cfg.pop(k)`` + save removes ``k`` from disk).
+    Low-level primitive for the two public ``config.yaml`` writer contracts in
+    ``hermes_cli.config``: ``atomic_config_write`` refuses deletion by omission, while
+    ``atomic_config_replace`` is the explicit full-state path. The on-disk document is loaded
+    through ruamel round-trip mode and *new_state* is merged onto it, so comments, key order,
+    quotes, blank lines and readable Unicode survive. Only nodes whose value actually changed
+    are reassigned; an untouched scalar or list keeps its inline comments and formatting. This
+    primitive itself treats keys absent from *new_state* as explicit deletion.
     ``extra_content_on_create`` (commented example blocks) is appended only when the file is
     being created — re-appending it on every rewrite is how the stock boilerplate replaced
     users' own comments (#92554).

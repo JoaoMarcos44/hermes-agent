@@ -105,7 +105,7 @@ class TestEveryWriterPreservesComments:
         assert data["_config_version"] == latest
 
     def test_atomic_config_write_direct(self, home):
-        """Direct callers (auth provider reset, gateway slash commands, telegram, doctor)."""
+        """Additive direct callers stay on the omission-safe writer."""
         from hermes_cli.config import atomic_config_write, read_user_config_raw
 
         raw = read_user_config_raw(home / "config.yaml")
@@ -113,6 +113,16 @@ class TestEveryWriterPreservesComments:
         atomic_config_write(home / "config.yaml", raw)
         data = _assert_preserved(home / "config.yaml")
         assert data["model"]["provider"] == "auto"
+
+    def test_atomic_config_replace_direct(self, home):
+        """Explicit deletion still preserves comments and order around the removed leaf."""
+        from hermes_cli.config import atomic_config_replace, read_user_config_raw
+
+        raw = read_user_config_raw(home / "config.yaml")
+        raw["model"].pop("default")
+        atomic_config_replace(home / "config.yaml", raw)
+        data = _assert_preserved(home / "config.yaml")
+        assert "default" not in data["model"]
 
     def test_boilerplate_only_on_create(self, home):
         from hermes_cli.config import save_config
