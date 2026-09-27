@@ -123,6 +123,64 @@ def test_update_network_git_calls_never_prompt_for_credentials():
     assert "GIT_CONFIG_COUNT" not in kw["env"] or kw["env"]["GIT_CONFIG_COUNT"] == os.environ.get("GIT_CONFIG_COUNT")
 
 
+def test_ssl_cert_file_becomes_git_ca_for_explicit_and_lazy_fetches(monkeypatch, tmp_path):
+    """The updater's CA fallback is process-scoped so partial-clone lazy fetches inherit it."""
+    import os
+    import subprocess
+
+    corporate_ca = str(tmp_path / "corporate-ca.pem")
+    monkeypatch.setenv("SSL_CERT_FILE", corporate_ca)
+    monkeypatch.delenv("GIT_SSL_CAINFO", raising=False)
+    monkeypatch.delenv("GIT_SSL_CAPATH", raising=False)
+    calls = []
+
+    def run(cmd, **kwargs):
+        if cmd[-4:] == ["config", "--name-only", "--get-regexp", r"^http\..*sslca(info|path)$"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        calls.append((cmd, os.environ.get("GIT_SSL_CAINFO"), kwargs))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", run)
+
+    kw = update_cmd._no_prompt_git_kwargs(["git"], tmp_path)
+    assert kw["env"]["GIT_SSL_CAINFO"] == corporate_ca
+
+    # A local-looking checkout may make an implicit promisor fetch in a treeless clone.
+    update_cmd._git_run(["git"], ["checkout", "main"], cwd=tmp_path)
+    assert calls[-1][1] == corporate_ca
+
+
+def test_ssl_cert_file_does_not_override_git_ca_env(monkeypatch, tmp_path):
+    """An explicit Git CA environment setting has higher precedence than the fallback."""
+    git_ca = str(tmp_path / "git-ca.pem")
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "python-ca.pem"))
+    monkeypatch.setenv("GIT_SSL_CAINFO", git_ca)
+
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("explicit GIT_SSL_CAINFO must skip the Git config probe")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", unexpected_run)
+
+    assert update_cmd._no_prompt_git_kwargs(["git"], tmp_path)["env"]["GIT_SSL_CAINFO"] == git_ca
+
+
+def test_ssl_cert_file_does_not_override_git_ca_config(monkeypatch, tmp_path):
+    """A persisted Git CA setting remains authoritative."""
+    import subprocess
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "python-ca.pem"))
+    monkeypatch.delenv("GIT_SSL_CAINFO", raising=False)
+    monkeypatch.delenv("GIT_SSL_CAPATH", raising=False)
+
+    def run(cmd, **_kwargs):
+        assert cmd[-4:] == ["config", "--name-only", "--get-regexp", r"^http\..*sslca(info|path)$"]
+        return subprocess.CompletedProcess(cmd, 0, "http.sslcainfo\n", "")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", run)
+
+    assert "GIT_SSL_CAINFO" not in update_cmd._no_prompt_git_kwargs(["git"], tmp_path)["env"]
+
+
 def test_update_and_upstream_network_calls_disable_terminal_prompts(monkeypatch, tmp_path):
     """Exercise origin fetch and fork fetch/pull/push, not their source spelling."""
     import subprocess

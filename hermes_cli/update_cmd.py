@@ -166,7 +166,32 @@ def _updates_config() -> dict:
     return section if isinstance(section, dict) else {}
 
 
-def _no_prompt_git_kwargs() -> dict:
+def _bridge_ssl_cert_file_to_git(git_cmd=None, cwd=None) -> None:
+    """Let updater Git children inherit ``SSL_CERT_FILE`` when Git has no CA override.
+
+    Installer checkouts are treeless partial clones, so checkout/merge can trigger a lazy
+    promisor fetch. A process-scoped fallback reaches both explicit fetches and those children.
+    """
+    ssl_cert_file = os.environ.get("SSL_CERT_FILE")
+    if not ssl_cert_file or "GIT_SSL_CAINFO" in os.environ or "GIT_SSL_CAPATH" in os.environ:
+        return
+
+    cmd = list(git_cmd) if git_cmd else _base_git_cmd()
+    root = _m().PROJECT_ROOT if cwd is None else cwd
+    try:
+        configured = subprocess.run(
+            cmd + ["config", "--name-only", "--get-regexp", r"^http\..*sslca(info|path)$"],
+            cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+
+    # Exit 1 means no matching key. Other failures leave the user's Git trust policy untouched.
+    if configured.returncode == 1:
+        os.environ["GIT_SSL_CAINFO"] = ssl_cert_file
+
+
+def _no_prompt_git_kwargs(git_cmd=None, cwd=None) -> dict:
     """``subprocess.run`` kwargs for the updater's network git calls.
 
     GitHub answers anonymous fetches with HTTP 401 during outages (and for
@@ -176,6 +201,7 @@ def _no_prompt_git_kwargs() -> dict:
     *prompt* is disabled — a configured credential helper / askpass still
     runs, so a private-fork origin keeps authenticating non-interactively.
     """
+    _bridge_ssl_cert_file_to_git(git_cmd, cwd)
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "Never"
@@ -596,6 +622,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
         sys.exit(1)
 
     git_cmd = _base_git_cmd()
+    _bridge_ssl_cert_file_to_git(git_cmd, root)
     _check.clear_git_debris(root)
 
     selected_channel = _source_update_channel(channel=channel, branch_explicit=branch_explicit)
@@ -1110,6 +1137,8 @@ def _prepare_git_command() -> tuple[bool, list, bool]:
     # swap in a real binary up front so git survives instead of degrading to ZIP.
     # See #87876.
     git_cmd = _ensure_non_trampoline_git(git_cmd)
+    if not use_zip_update:
+        _bridge_ssl_cert_file_to_git(git_cmd, _m().PROJECT_ROOT)
 
     # Before stash/branch logic: npm rewrites package-lock.json non-deterministically and
     # line-ending churn is machine-made dirt; both would otherwise force an autostash every update.
