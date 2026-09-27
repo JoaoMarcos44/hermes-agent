@@ -214,6 +214,14 @@ def _remove_downloads(store: Store, artifacts: list[dict]) -> None:
         _remove_entry(store, f"fetch-{artifact['sha256']}")
 
 
+def _verify_staged(package: Package, staged: Path, target: str) -> str:
+    """Verify a candidate and give install-only recovery one bounded chance."""
+    reason = package.verify(staged, target)
+    if reason:
+        reason = package.repair_staged_verification(staged, target, reason)
+    return reason
+
+
 def _entry_verified(package: Package, fact: dict, store: Store, target: str) -> bool:
     """Explicit installs re-check realized bytes; startup keeps its cheap facts check."""
     entry = store.entry(fact["entry"])
@@ -371,7 +379,7 @@ def _install(
                     raise DownloadPaused("install paused")
                 if progress is not None:
                     progress("verify", 0, 0, "")
-                reason = package.verify(staged, target)
+                reason = _verify_staged(package, staged, target)
                 if reason:
                     raise InstallError(package.name, f"staged entry failed verification: {reason}")
                 if facts is None:

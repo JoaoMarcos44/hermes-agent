@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -444,6 +445,87 @@ class Venv(StatePackage):
         return {"environment": candidate, "resolved_lock": resolved_lock}
 
 
+_NODE_LIBATOMIC_INSTALL = {
+    "apt-get": ("apt-get", "install", "-y", "libatomic1"),
+    "dnf": ("dnf", "install", "-y", "libatomic"),
+    "yum": ("yum", "install", "-y", "libatomic"),
+    "zypper": ("zypper", "--non-interactive", "install", "libatomic1"),
+    "pacman": ("pacman", "-S", "--needed", "--noconfirm", "gcc-libs"),
+    "apk": ("apk", "add", "libatomic"),
+}
+
+_NODE_LIBATOMIC_FAMILIES = (
+    ({"debian", "ubuntu", "linuxmint", "pop", "raspbian", "kali", "elementary"}, ("apt-get",)),
+    ({"fedora", "rhel", "centos", "rocky", "almalinux", "ol", "oracle", "amzn", "nobara",
+      "photon", "scientific"}, ("dnf", "yum")),
+    ({"arch", "manjaro", "endeavouros", "garuda", "artix"}, ("pacman",)),
+    ({"alpine"}, ("apk",)),
+)
+
+
+def _node_libatomic_manager() -> Optional[str]:
+    """Choose the distro package manager; never cross a known family."""
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        release = {}
+    tokens = set(
+        f"{release.get('ID', '')} {release.get('ID_LIKE', '')}"
+        .lower().replace(",", " ").split()
+    )
+    if any("suse" in token or token.startswith("sles") for token in tokens):
+        family_managers = ("zypper",)
+    else:
+        family_managers = next(
+            (managers for family, managers in _NODE_LIBATOMIC_FAMILIES if tokens & family),
+            (),
+        )
+    if family_managers:
+        return next((name for name in family_managers if shutil.which(name)), family_managers[0])
+    return next((name for name in _NODE_LIBATOMIC_INSTALL if shutil.which(name)), None)
+
+
+def _node_libatomic_remedy(manager: Optional[str]) -> str:
+    if manager is None:
+        return (
+            "official Node needs libatomic.so.1; install the distro package that provides it "
+            "and rerun `hermes update`"
+        )
+    argv = list(_NODE_LIBATOMIC_INSTALL[manager])
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        argv.insert(0, "sudo")
+    return f"install the missing Node runtime dependency with `{' '.join(argv)}` and rerun `hermes update`"
+
+
+def _try_install_node_libatomic() -> tuple[bool, str]:
+    """Best-effort host repair; never prompt for a sudo password."""
+    manager = _node_libatomic_manager()
+    remedy = _node_libatomic_remedy(manager)
+    if manager is None or shutil.which(manager) is None:
+        return False, remedy
+    argv = list(_NODE_LIBATOMIC_INSTALL[manager])
+    root = hasattr(os, "geteuid") and os.geteuid() == 0
+    if not root:
+        if shutil.which("sudo") is None:
+            return False, remedy
+        argv = ["sudo", "-n", *argv]
+    env = os.environ.copy()
+    env.setdefault("DEBIAN_FRONTEND", "noninteractive")
+    try:
+        proc = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, remedy
+    return proc.returncode == 0, remedy
+
+
 @register
 class Nodejs(_BionicDebArm, BinaryPackage, DebPackage):
     """nodejs.org tarballs for glibc/mac/win; the Termux main-repo nodejs
@@ -469,6 +551,22 @@ class Nodejs(_BionicDebArm, BinaryPackage, DebPackage):
 
     def latest_versions(self, target: str, locked=None) -> list[str]:
         return node_latest_versions()
+
+    def repair_staged_verification(self, entry: Path, target: str, reason: str) -> str:
+        """Repair libatomic only while installing the native glibc Node artifact."""
+        if (
+            "libatomic.so.1" not in reason
+            or target != current_target()
+            or target not in {"linux-x64", "linux-arm64"}
+        ):
+            return reason
+        installed, remedy = _try_install_node_libatomic()
+        if installed:
+            retried = _BionicDebArm.verify(self, entry, target)
+            if "libatomic.so.1" not in retried:
+                return retried
+            reason = retried
+        return reason if remedy in reason else f"{reason} — {remedy}"
 
 
 @register

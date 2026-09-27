@@ -158,6 +158,15 @@ class Package:
             return f"{binary.name} is not a {target} binary"
         return ""
 
+    def repair_staged_verification(self, entry: Path, target: str, reason: str) -> str:
+        """Install-only recovery hook for a failed staged verification.
+
+        ``verify()`` is also used by doctor/read/build validation paths and must stay
+        side-effect free. Installers may override this hook to repair a host
+        prerequisite, retry their probe once, and return the remaining reason.
+        """
+        return reason
+
     def env(self, entry: Path, target: str) -> dict:
         diff: dict = {}
         if self.on_path:
