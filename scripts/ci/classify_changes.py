@@ -20,8 +20,8 @@ Lanes:
 * ``site``        — Docusaurus + generated skill docs.
 * ``scan``        — supply-chain scan (Python files, .pth, setup hooks).
 * ``deps``        — pyproject.toml dependency bounds check.
-* ``uv_lock``     — ``PM lock check``. Re-resolves the whole graph against
-  PyPI, so a diff that touches neither ``pyproject.toml`` nor ``uv.lock``
+* ``uv_lock``     — PM lock checks for both the root project and ``pm/``.
+  Re-resolves against PyPI, so diffs that touch neither pyproject/lock pair
   must not run it.
 * ``npm_lock``    — semantic package-lock.json diff PR comment.
 * ``bootstrap``   — the bootstrap installer lane: install.sh sandbox install,
@@ -245,7 +245,10 @@ def classify(files: list[str]) -> dict[str, bool]:
         "site": any(f.startswith(_SITE) for f in files),
         "scan": any(_is_scan(f) for f in files),
         "deps": deps,
-        "uv_lock": any(f in ("pyproject.toml", "uv.lock") for f in files),
+        "uv_lock": any(
+            f in ("pyproject.toml", "uv.lock", "pm/pyproject.toml", "pm/uv.lock")
+            for f in files
+        ),
         "npm_lock": npm_lock,
         "bootstrap": any(
             f.startswith(_BOOTSTRAP_PATHS) or f in _BOOTSTRAP_FILES for f in files

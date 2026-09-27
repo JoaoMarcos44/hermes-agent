@@ -37,7 +37,11 @@ def stage_runtime(uv: Path, python: Path, destination: Path, *,
             shutil.copyfile(project / name, snapshot / name)
         environment.create()
         if wheelhouse is None:
-            environment.sync(snapshot, locked=True, no_default_groups=True,
+            # Runtime provisioning consumes the committed lock verbatim.  Lock
+            # freshness is a repository invariant checked in CI; asking uv to
+            # prove it again on the user's machine makes ambient pip/uv mirrors
+            # turn a valid PyPI-authored lock into a false stale-lock failure.
+            environment.sync(snapshot, no_default_groups=True,
                              no_install_project=True, timeout=600)
         else:
             environment.install_wheelhouse(snapshot, wheelhouse, timeout=600)

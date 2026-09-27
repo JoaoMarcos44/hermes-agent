@@ -86,6 +86,14 @@ CASES = {
     # also re-arms the desktop_updater integration tests (fail-open).
     "dep manifest → python": (["pyproject.toml"], _lanes(python=True, scan=True, deps=True, uv_lock=True, desktop_updater=True)),
     "uv.lock → python": (["uv.lock"], _lanes(python=True, uv_lock=True)),
+    "PM dependency manifest → uv_lock": (
+        ["pm/pyproject.toml"],
+        _lanes(python=True, uv_lock=True),
+    ),
+    "PM runtime lock → uv_lock": (
+        ["pm/uv.lock"],
+        _lanes(python=True, uv_lock=True),
+    ),
     "ts package → frontend": (["apps/desktop/src/app.tsx"], _lanes(frontend=True)),
     "ui-tui → frontend": (["ui-tui/src/entry.ts"], _lanes(frontend=True)),
     # Lockfile bump shifts every TS package's tree, but not the Python suite.

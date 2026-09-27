@@ -101,6 +101,35 @@ def test_cold_worker_bootstrap_reuses_the_requests_cache(tmp_path, monkeypatch):
     assert dict(os.environ) == before
 
 
+
+
+def test_stage_runtime_consumes_pm_lock_frozen(tmp_path, monkeypatch):
+    """Runtime staging trusts the committed PM lock; CI owns freshness checks."""
+    from pm import runtime_stage
+
+    recorded: dict = {}
+
+    def fake_sync(self, source, **kwargs):
+        recorded.update(kwargs)
+
+    monkeypatch.setattr("pm.environment.PythonEnvironment.create", lambda self: None)
+    monkeypatch.setattr("pm.environment.PythonEnvironment.sync", fake_sync)
+    monkeypatch.setattr("pm.runtime.runtime_environment", lambda: {})
+    monkeypatch.setattr(
+        runtime_stage.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+    )
+
+    runtime_stage.stage_runtime(
+        tmp_path / "uv", Path(sys.executable), tmp_path / "runtime",
+        cache=tmp_path / "cache",
+    )
+
+    assert "locked" not in recorded
+    assert recorded["no_default_groups"] is True
+    assert recorded["no_install_project"] is True
+
 @pytest.mark.platforms("macos", "windows")
 def test_sealed_worker_command_uses_only_its_recorded_site(tmp_path, monkeypatch):
     from pm import paths
