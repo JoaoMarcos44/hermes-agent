@@ -593,8 +593,8 @@ def custom_provider_pool_key_candidates_for_owner(
     """Return custom-pool candidates owned by this runtime, not merely its URL.
 
     Named provider identity is authoritative. A bare ``custom`` runtime may instead
-    prove ownership with its resolved key. URL-only matching is retained only for
-    legacy callers that have neither ownership hint.
+    prove ownership with its resolved key only when a configured entry declares that
+    same credential. URL-only matching is retained only for legacy callers with no owner hint.
     """
     normalized_url = _norm_url(base_url)
     if not normalized_url:
@@ -614,23 +614,19 @@ def custom_provider_pool_key_candidates_for_owner(
 
     owner_key = api_key.strip() if isinstance(api_key, str) else ""
     if owner_key and not (owner_key.startswith("${") and owner_key.endswith("}")):
-        unclaimed: Optional[List[str]] = None
         for norm_name, entry in _iter_custom_providers():
             if _norm_url(entry.get("base_url")) != normalized_url:
                 continue
-            if _custom_provider_declares_other_credential(entry, owner_key):
-                continue
-            keys = _pool_keys_for_custom_entry(norm_name, entry)
             declares_credential = bool(
                 str(entry.get("api_key") or "").strip()
                 or str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
                 or str(entry.get("key_cmd") or "").strip()
             )
-            if declares_credential:
-                return keys
-            if unclaimed is None:
-                unclaimed = keys
-        return unclaimed or []
+            if not declares_credential:
+                continue
+            if not _custom_provider_declares_other_credential(entry, owner_key):
+                return _pool_keys_for_custom_entry(norm_name, entry)
+        return []
 
     return custom_provider_pool_key_candidates(base_url)
 

@@ -2025,10 +2025,6 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
             _resolve_delegation_credentials({"provider": "copilot", "model": "gpt-5"}, parent)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def test_bare_custom_child_does_not_attach_same_url_sibling_pool():
     endpoint = "https://shared.example/v1"
     parent = _make_mock_parent()
@@ -2057,3 +2053,8 @@ def test_bare_custom_child_does_not_attach_same_url_sibling_pool():
 
     assert result is None
     loaded.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
+

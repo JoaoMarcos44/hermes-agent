@@ -61,6 +61,27 @@ def test_exact_key_can_select_its_same_url_named_pool():
         )
 
 
+
+def test_credentialless_same_url_entry_cannot_claim_known_owner_key():
+    configured = [(
+        "unclaimed",
+        {
+            "name": "Unclaimed", "provider_key": "unclaimed",
+            "base_url": ENDPOINT,
+        },
+    )]
+    with patch.object(cp, "_iter_custom_providers", return_value=configured):
+        assert cp.custom_provider_pool_key_candidates_for_owner(
+            ENDPOINT, provider_name="custom", api_key=MAIN_KEY
+        ) == []
+
+
+def test_named_custom_identity_is_authoritative_even_with_explicit_override_key():
+    with patch.object(cp, "_iter_custom_providers", return_value=_same_url_provider()):
+        assert cp.custom_provider_pool_key_candidates_for_owner(
+            ENDPOINT, provider_name="second", api_key=MAIN_KEY
+        ) == ["second", "custom:second"]
+
 def test_direct_alias_explicit_key_beats_same_url_sibling_pool(monkeypatch):
     sibling = _sibling_pool()
     monkeypatch.setattr(cp, "_iter_custom_providers", lambda: iter(_same_url_provider()))
