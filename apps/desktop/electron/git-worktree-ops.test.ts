@@ -470,3 +470,63 @@ test('switchBranch: repo dir still validates the branch name and switches', asyn
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+const posixTest = process.platform === 'win32' ? test.skip : test
+
+posixTest('addWorktree neutralizes repo fsmonitor, checkout hooks, and smudge filters', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-git-config-'))
+  const marker = path.join(dir, 'MARKER')
+  const hookDir = path.join(dir, 'evil-hooks')
+  const fsmonitor = path.join(dir, 'fsmonitor.sh')
+  const smudge = path.join(dir, 'smudge.sh')
+
+  try {
+    execFileSync('git', ['init', '-b', 'main'], { cwd: dir })
+    fs.writeFileSync(path.join(dir, '.gitattributes'), '* filter=evil\n')
+    fs.writeFileSync(path.join(dir, 'tracked.txt'), 'tracked\n')
+    execFileSync('git', ['add', '.gitattributes', 'tracked.txt'], { cwd: dir })
+    execFileSync('git', [
+      '-c',
+      'user.email=hermes@localhost',
+      '-c',
+      'user.name=Hermes',
+      'commit',
+      '-m',
+      'root'
+    ], { cwd: dir })
+
+    fs.mkdirSync(hookDir)
+    fs.writeFileSync(fsmonitor, `#!/bin/sh\ntouch "${marker}.fsmonitor"\n`, { mode: 0o755 })
+    fs.writeFileSync(smudge, `#!/bin/sh\ntouch "${marker}.smudge"\ncat\n`, { mode: 0o755 })
+    fs.writeFileSync(
+      path.join(hookDir, 'post-checkout'),
+      `#!/bin/sh\ntouch "${marker}.hook"\n`,
+      { mode: 0o755 }
+    )
+
+    execFileSync('git', ['config', 'core.fsmonitor', fsmonitor], { cwd: dir })
+    execFileSync('git', ['config', 'core.hooksPath', hookDir], { cwd: dir })
+    execFileSync('git', ['config', 'filter.evil.clean', 'cat'], { cwd: dir })
+    execFileSync('git', ['config', 'filter.evil.smudge', smudge], { cwd: dir })
+    execFileSync('git', ['config', 'filter.evil.required', 'true'], { cwd: dir })
+
+    // Prove both sink classes are armed before exercising the Desktop runner.
+    execFileSync('git', ['status', '--porcelain'], { cwd: dir })
+    assert.equal(fs.existsSync(`${marker}.fsmonitor`), true)
+    fs.rmSync(`${marker}.fsmonitor`, { force: true })
+
+    fs.rmSync(path.join(dir, 'tracked.txt'))
+    execFileSync('git', ['checkout', '--', 'tracked.txt'], { cwd: dir })
+    assert.equal(fs.existsSync(`${marker}.smudge`), true)
+    fs.rmSync(`${marker}.smudge`, { force: true })
+
+    const result = await addWorktree(dir, { branch: 'safe-worktree', name: 'safe-worktree' }, 'git')
+
+    assert.ok(fs.existsSync(result.path))
+    assert.equal(fs.existsSync(`${marker}.fsmonitor`), false)
+    assert.equal(fs.existsSync(`${marker}.hook`), false)
+    assert.equal(fs.existsSync(`${marker}.smudge`), false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

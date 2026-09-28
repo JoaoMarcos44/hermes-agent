@@ -8,17 +8,67 @@ import path from 'node:path'
 import { resolveRequestedPathForIpc } from './hardening'
 import { execGit } from './no-console-git'
 
-function runGit(gitBin, args, cwd): Promise<string> {
-  return execGit(gitBin, args, { cwd, timeoutMs: 30_000 }).then(result => {
-    if (result.code !== 0) {
-      const error = new Error(result.stderr || `git exited ${result.code}`) as Error & { stderr?: string }
+function gitResultOrThrow(result): string {
+  if (result.code !== 0) {
+    const error = new Error(result.stderr || `git exited ${result.code}`) as Error & { stderr?: string }
 
-      error.stderr = result.stderr
-      throw error
+    error.stderr = result.stderr
+    throw error
+  }
+
+  return result.stdout
+}
+
+function rawGit(gitBin, args, cwd) {
+  return execGit(gitBin, args, { cwd, timeoutMs: 30_000, noninteractive: true })
+}
+
+// worktree add / switch materialize files and therefore run attribute-scoped clean/smudge/process
+// filters. The filter name comes from .gitattributes, so static config pins cannot name it in
+// advance. Discover only repo-local filter drivers, then neutralize those drivers for checkout.
+async function checkoutFilterPins(gitBin, cwd): Promise<string[]> {
+  const result = await rawGit(
+    gitBin,
+    ['config', '--local', '--includes', '--name-only', '-z', '--get-regexp', '^filter\\..*\\.(clean|smudge|process|required)$'],
+    cwd
+  )
+
+  // git config exits 1 when no key matches. Any other failure is unsafe to ignore because the
+  // caller is about to materialize repository-controlled content.
+  if (result.code === 1) {
+    return []
+  }
+
+  const out = gitResultOrThrow(result)
+  const drivers = new Set<string>()
+
+  for (const key of out.split('\0')) {
+    const match = /^filter\.(.+)\.(?:clean|smudge|process|required)$/.exec(key)
+
+    if (match?.[1]) {
+      drivers.add(match[1])
     }
+  }
 
-    return result.stdout
-  })
+  return Array.from(drivers).flatMap(driver => [
+    '-c',
+    `filter.${driver}.clean=`,
+    '-c',
+    `filter.${driver}.smudge=`,
+    '-c',
+    `filter.${driver}.process=`,
+    '-c',
+    `filter.${driver}.required=false`
+  ])
+}
+
+function materializesCheckout(args): boolean {
+  return args[0] === 'switch' || (args[0] === 'worktree' && args[1] === 'add')
+}
+
+async function runGit(gitBin, args, cwd): Promise<string> {
+  const hardenedArgs = materializesCheckout(args) ? [...(await checkoutFilterPins(gitBin, cwd)), ...args] : args
+  return gitResultOrThrow(await rawGit(gitBin, hardenedArgs, cwd))
 }
 
 // Parse `git worktree list --porcelain`. The first record is the main worktree.

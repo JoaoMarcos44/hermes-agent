@@ -165,13 +165,65 @@ export function noConsoleGitEnv(base: NodeJS.ProcessEnv | undefined, gitBin: str
   return env
 }
 
+const INTERNAL_GIT_CONFIG_OVERRIDES = [
+  ['credential.helper', ''],
+  ['core.askPass', ''],
+  ['core.fsmonitor', 'false'],
+  ['core.untrackedCache', 'false'],
+  ['core.pager', 'cat'],
+  ['core.editor', 'true'],
+  ['sequence.editor', 'true'],
+  ['diff.external', ''],
+  ['core.sshCommand', 'ssh -o BatchMode=yes']
+] as const
+
+export function noninteractiveGitEnv(
+  base: NodeJS.ProcessEnv | undefined,
+  gitBin: string,
+  isWindows = process.platform === 'win32'
+): NodeJS.ProcessEnv {
+  const env = noConsoleGitEnv(base, gitBin)
+
+  // A parent process may already carry command-scope git config injection. Replace it rather than
+  // appending so it cannot re-enable a repo execution sink after our pins.
+  for (const key of Object.keys(env)) {
+    if (
+      key === 'GIT_CONFIG_PARAMETERS' ||
+      key === 'GIT_CONFIG_COUNT' ||
+      /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)
+    ) {
+      delete env[key]
+    }
+  }
+
+  env.GCM_INTERACTIVE = 'Never'
+  env.GIT_PAGER = 'cat'
+  env.PAGER = 'cat'
+  env.GIT_EDITOR = 'true'
+
+  const overrides = [
+    ...INTERNAL_GIT_CONFIG_OVERRIDES,
+    ['core.hooksPath', isWindows ? 'NUL' : '/dev/null'] as const
+  ]
+
+  env.GIT_CONFIG_COUNT = String(overrides.length)
+
+  overrides.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = key
+    env[`GIT_CONFIG_VALUE_${index}`] = value
+  })
+
+  return env
+}
+
 export function planNoConsoleGitSpawn({
   gitBin,
   args,
   isWindows = false,
   pythonBin = null,
   scriptPath = null,
-  env
+  env,
+  noninteractive = false
 }: {
   gitBin: string
   args: string[]
@@ -179,12 +231,13 @@ export function planNoConsoleGitSpawn({
   pythonBin?: string | null
   scriptPath?: string | null
   env?: NodeJS.ProcessEnv
+  noninteractive?: boolean
 }): NoConsoleGitPlan {
   if (isWindows && pythonBin && scriptPath) {
     return {
       command: pythonBin,
       args: [scriptPath, ...args],
-      env: noConsoleGitEnv(env, gitBin),
+      env: noninteractive ? noninteractiveGitEnv(env, gitBin, true) : noConsoleGitEnv(env, gitBin),
       windowsHide: true,
       stdio: [...PIPED_STDIO],
       creationFlags: CREATE_NO_WINDOW
@@ -194,7 +247,7 @@ export function planNoConsoleGitSpawn({
   return {
     command: gitBin || 'git',
     args,
-    env: { ...(env || {}) },
+    env: noninteractive ? noninteractiveGitEnv(env, gitBin, isWindows) : { ...(env || {}) },
     windowsHide: Boolean(isWindows),
     stdio: [...PIPED_STDIO],
     creationFlags: 0
@@ -215,7 +268,7 @@ export function simpleGitBinary(
 export function hiddenGitSpawnSpec(
   gitBin: string,
   args: string[],
-  options: SpawnOptions & { isWindows?: boolean } = {}
+  options: SpawnOptions & { isWindows?: boolean; noninteractive?: boolean } = {}
 ) {
   const isWindows = options.isWindows ?? process.platform === 'win32'
   const host = isWindows ? windowsGitHost(true) : null
@@ -226,10 +279,11 @@ export function hiddenGitSpawnSpec(
     isWindows,
     pythonBin: host?.pythonBin ?? null,
     scriptPath: host?.scriptPath ?? null,
-    env: (options.env as NodeJS.ProcessEnv | undefined) || process.env
+    env: (options.env as NodeJS.ProcessEnv | undefined) || process.env,
+    noninteractive: options.noninteractive
   })
 
-  const { isWindows: _ignored, ...rest } = options
+  const { isWindows: _ignored, noninteractive: _noninteractive, ...rest } = options
 
   return {
     command: plan.command,
@@ -247,12 +301,13 @@ export function hiddenGitSpawnSpec(
 export function execGit(
   gitBin: string,
   args: string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; noninteractive?: boolean } = {}
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const spec = hiddenGitSpawnSpec(gitBin, args, {
     cwd: options.cwd,
     env: options.env,
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe'],
+    noninteractive: options.noninteractive
   })
 
   return new Promise((resolve, reject) => {

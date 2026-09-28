@@ -9,6 +9,7 @@ import { test } from 'vitest'
 import {
   CREATE_NO_WINDOW,
   NO_CONSOLE_GIT_SCRIPT,
+  noninteractiveGitEnv,
   planNoConsoleGitSpawn,
   resolveNoConsolePython,
   simpleGitBinary
@@ -49,6 +50,48 @@ test('non-windows git spawn keeps the git binary and argv', () => {
   assert.equal(plan.command, '/usr/bin/git')
   assert.deepEqual(plan.args, ['status', '--porcelain'])
   assert.equal(plan.creationFlags, 0)
+})
+
+test('noninteractive git env replaces ambient config injection and pins repo execution sinks', () => {
+  const env = noninteractiveGitEnv(
+    {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.fsmonitor',
+      GIT_CONFIG_VALUE_0: 'touch inherited-marker',
+      GIT_CONFIG_PARAMETERS: "'core.hooksPath=/tmp/inherited-hooks'",
+      PATH: '/usr/bin'
+    },
+    '/usr/bin/git',
+    false
+  )
+
+  assert.equal(env.GIT_TERMINAL_PROMPT, '0')
+  assert.equal(env.GCM_INTERACTIVE, 'Never')
+  assert.equal(env.GIT_CONFIG_PARAMETERS, undefined)
+  assert.equal(env.HERMES_GIT_ARGV0, JSON.stringify('/usr/bin/git'))
+  assert.equal(env.PATH, '/usr/bin')
+
+  const pinned = Object.fromEntries(
+    Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, index) => [
+      String(env[`GIT_CONFIG_KEY_${index}`]),
+      env[`GIT_CONFIG_VALUE_${index}`]
+    ] as const)
+  )
+
+  assert.equal(pinned['core.fsmonitor'], 'false')
+  assert.equal(pinned['core.hooksPath'], '/dev/null')
+  assert.equal(pinned['credential.helper'], '')
+  assert.equal(pinned['core.sshCommand'], 'ssh -o BatchMode=yes')
+
+  const windowsEnv = noninteractiveGitEnv({}, 'git.exe', true)
+  const windowsPinned = Object.fromEntries(
+    Array.from({ length: Number(windowsEnv.GIT_CONFIG_COUNT) }, (_, index) => [
+      String(windowsEnv[`GIT_CONFIG_KEY_${index}`]),
+      windowsEnv[`GIT_CONFIG_VALUE_${index}`]
+    ] as const)
+  )
+
+  assert.equal(windowsPinned['core.hooksPath'], 'NUL')
 })
 
 test('missing python does not rewrite git argv', () => {
