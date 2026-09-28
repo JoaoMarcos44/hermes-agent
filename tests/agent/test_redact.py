@@ -749,6 +749,11 @@ class TestStrictUrlCredentialRedaction:
                 "NET_SECRET",
                 "//user:***@x.test/path",
             ),
+            (
+                "https://x.test/object?X-Amz-Signature=AWS_SECRET&view=public",
+                "AWS_SECRET",
+                "https://x.test/object?X-Amz-Signature=***&view=public",
+            ),
         ],
     )
     def test_masks_all_url_reference_forms_only_when_opted_in(

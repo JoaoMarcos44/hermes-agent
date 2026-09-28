@@ -178,7 +178,10 @@ def _config_overrides(config: dict) -> dict[str, str]:
         overrides["toolsets"] = str(user_toolsets)
     fallbacks = config.get("fallback_providers", [])
     if fallbacks:
-        overrides["fallback_providers"] = str(fallbacks)
+        from agent.redact import redact_sensitive_text
+        overrides["fallback_providers"] = redact_sensitive_text(
+            str(fallbacks), force=True, redact_url_credentials=True
+        )
     return overrides
 
 

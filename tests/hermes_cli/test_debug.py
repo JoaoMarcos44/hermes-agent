@@ -416,6 +416,57 @@ class TestRunDebugShareRedaction:
                 "raw token leaked into upload-bound content"
             )
 
+
+    def test_fallback_dump_masks_inline_and_url_credentials(self):
+        """The dump is safe before upload-time redaction is applied."""
+        from hermes_cli.dump import _config_overrides
+
+        api_key = "opaqueFallbackKeyABC123456789"
+        user_password = "urlPasswordABC123456789"
+        signature = "signedQueryABC123456789"
+        fragment_token = "fragmentTokenABC123456789"
+        rendered = _config_overrides({
+            "fallback_providers": [{
+                "provider": "custom",
+                "model": "backup-model",
+                "api_key": api_key,
+                "base_url": (
+                    f"https://user:{user_password}@backup.example/v1"
+                    f"?X-Amz-Signature={signature}"
+                    f"#access_token={fragment_token}&view=public"
+                ),
+            }],
+        })["fallback_providers"]
+
+        for secret in (api_key, user_password, signature, fragment_token):
+            assert secret not in rendered
+        assert "backup-model" in rendered
+        assert "backup.example" in rendered
+        assert "view=public" in rendered
+
+    def test_capture_dump_is_independent_strict_redaction_boundary(self):
+        """A future dump formatting mistake cannot leak through debug upload paths."""
+        from hermes_cli.debug import _capture_dump
+
+        raw_key = "opaqueBoundaryKeyABC123456789"
+        raw_password = "boundaryPasswordABC123456789"
+        raw_signature = "boundarySignatureABC123456789"
+
+        def leaky_dump(_args):
+            print(
+                "{'api_key': '" + raw_key + "', "
+                "'base_url': 'https://user:" + raw_password
+                + "@example.test/v1?X-Amz-Signature=" + raw_signature + "'}"
+            )
+
+        with patch("hermes_cli.dump.run_dump", side_effect=leaky_dump):
+            safe = _capture_dump()
+            raw = _capture_dump(redact=False)
+
+        for secret in (raw_key, raw_password, raw_signature):
+            assert secret not in safe
+            assert secret in raw
+
     def test_default_share_includes_redaction_banner(
         self, hermes_home_with_secret, capsys
     ):
