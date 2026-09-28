@@ -26,6 +26,7 @@ from hermes_cli._subprocess_compat import (
     NO_DRIVER_DIFF_FLAGS,
     harden_git_argv,
     noninteractive_git_env,
+    noninteractive_repo_git_env,
 )
 
 _HAS_GIT = shutil.which("git") is not None
@@ -187,6 +188,56 @@ def test_subagent_worktree_add_is_safe(malicious_repo, tmp_path):
     repo, marker = malicious_repo
     sw._run_git(["worktree", "add", str(tmp_path / "wt1"), "-b", "safe1"], str(repo))
     assert _fired(marker) == []
+
+
+def test_repo_env_neutralizes_named_filters(monkeypatch):
+    import hermes_cli._subprocess_compat as compat
+
+    class Result:
+        returncode = 0
+        stdout = "filter.evil.clean\0filter.evil.process\0filter.evil.clean\0"
+        stderr = ""
+
+    monkeypatch.setattr(compat.subprocess, "run", lambda *args, **kwargs: Result())
+    env = noninteractive_repo_git_env("/repo", {})
+    values = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+
+    assert values["filter.evil.clean"] == ""
+    assert values["filter.evil.process"] == ""
+    assert values["filter.evil.required"] == "false"
+
+
+def test_repo_env_filter_discovery_is_fail_closed(monkeypatch):
+    import hermes_cli._subprocess_compat as compat
+
+    def fail(*args, **kwargs):
+        raise subprocess.TimeoutExpired("git", 2)
+
+    monkeypatch.setattr(compat.subprocess, "run", fail)
+    assert noninteractive_repo_git_env("/repo", {}) is None
+
+
+def test_repo_env_allows_no_filter_match(monkeypatch):
+    import hermes_cli._subprocess_compat as compat
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(compat.subprocess, "run", lambda *args, **kwargs: Result())
+    env = noninteractive_repo_git_env("/repo", {})
+
+    assert env is not None
+    values = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert values["core.fsmonitor"] == "false"
+    assert values["core.hooksPath"] == os.devnull
 
 
 def test_noninteractive_env_pins_fsmonitor_and_hooks():

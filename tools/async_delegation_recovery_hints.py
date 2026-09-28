@@ -15,6 +15,11 @@ import os
 import subprocess
 from typing import Dict, Optional
 
+from hermes_cli._subprocess_compat import (
+    harden_git_argv,
+    noninteractive_repo_git_env,
+)
+
 TAIL_LINES = 20
 TAIL_CHARS = 2_000
 _GIT_TIMEOUT_S = 5
@@ -47,9 +52,14 @@ def git_state_hint(cwd: Optional[str]) -> Optional[str]:
 
     def run(*args: str) -> Optional[str]:
         try:
-            out = subprocess.run(["git", "-C", cwd, *args], capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 stdin=subprocess.DEVNULL, timeout=_GIT_TIMEOUT_S)
+            env = noninteractive_repo_git_env(cwd)
+            if env is None:
+                return None
+            out = subprocess.run(
+                ["git", "-C", cwd, *harden_git_argv(args)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                stdin=subprocess.DEVNULL, timeout=_GIT_TIMEOUT_S, env=env,
+            )
         except (OSError, subprocess.SubprocessError):
             return None
         return out.stdout if out.returncode == 0 else None

@@ -18,6 +18,10 @@ from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
 
+from hermes_cli._subprocess_compat import (
+    harden_git_argv,
+    noninteractive_repo_git_env,
+)
 from hermes_cli.worktree_ops import release_lsp_clients
 
 if TYPE_CHECKING:
@@ -51,12 +55,20 @@ _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM ta
 
 def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
     """``git -C repo_root args``; never raises on a non-zero exit."""
+    argv = ["git", "-C", str(repo_root), *harden_git_argv(args)]
+    env = noninteractive_repo_git_env(repo_root)
+    if env is None:
+        return subprocess.CompletedProcess(
+            args=argv, returncode=1, stdout="", stderr="git config hardening failed"
+        )
     return subprocess.run(
-        ["git", "-C", str(repo_root), *args],
+        argv,
         capture_output=True,
         text=True, encoding='utf-8', errors='replace',
         timeout=timeout,
         check=False,
+        stdin=subprocess.DEVNULL,
+        env=env,
     )
 
 

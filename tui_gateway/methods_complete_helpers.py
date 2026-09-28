@@ -24,15 +24,32 @@ _fuzzy_cache: dict[str, tuple[float, list[str]]] = {}
 def _git_repo_files(root: str):
     """Yield ``git ls-files`` paths (tracked + untracked) relative to ``root``; empty outside a
     repo or on git failure/timeout. Entries above ``root`` are skipped (Cmd-P workspace scope)."""
-    from hermes_cli._subprocess_compat import windows_hide_flags
-    run_kw = dict(capture_output=True, timeout=2.0, check=False, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+    from hermes_cli._subprocess_compat import (
+        harden_git_argv,
+        noninteractive_repo_git_env,
+        windows_hide_flags,
+    )
+    run_kw = dict(
+        capture_output=True, timeout=2.0, check=False, stdin=subprocess.DEVNULL,
+        creationflags=windows_hide_flags(),
+    )
     try:
-        top_result = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"], **run_kw)
+        env = noninteractive_repo_git_env(root)
+        if env is None:
+            return
+        run_kw["env"] = env
+        top_result = subprocess.run(
+            ["git", "-C", root, *harden_git_argv(["rev-parse", "--show-toplevel"])], **run_kw)
         if top_result.returncode != 0:
             return
         top = top_result.stdout.decode("utf-8", "replace").strip()
+        env = noninteractive_repo_git_env(top)
+        if env is None:
+            return
+        run_kw["env"] = env
         list_result = subprocess.run(
-            ["git", "-C", top, "ls-files", "-z", "--cached", "--others", "--exclude-standard"], **run_kw)
+            ["git", "-C", top, *harden_git_argv(
+                ["ls-files", "-z", "--cached", "--others", "--exclude-standard"])], **run_kw)
         if list_result.returncode != 0:
             return
     except (OSError, subprocess.TimeoutExpired):

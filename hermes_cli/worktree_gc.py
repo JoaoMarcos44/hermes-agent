@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from hermes_cli._subprocess_compat import (
+    harden_git_argv,
+    noninteractive_repo_git_env,
+)
+
 logger = logging.getLogger(__name__)
 
 # Branches never considered for deletion, in any mode.
@@ -71,8 +76,18 @@ def _git(args: list, cwd: str, timeout: int = 15) -> subprocess.CompletedProcess
     """Run git, translating timeouts into returncode 124. Every verdict fails safe toward "keep"
     on nonzero, so a slow ``git cherry`` on a huge repo degrades to keep instead of aborting the
     audit mid-list."""
+    argv = ["git", *harden_git_argv(args)]
     try:
-        return _run(["git", *args], timeout, cwd)
+        env = noninteractive_repo_git_env(cwd)
+        if env is None:
+            return subprocess.CompletedProcess(
+                args=argv, returncode=1, stdout="", stderr="git config hardening failed"
+            )
+        return subprocess.run(
+            argv,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, cwd=cwd, stdin=subprocess.DEVNULL, env=env,
+        )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args=["git", *args], returncode=124, stdout="",
                                            stderr=f"timeout after {timeout}s")
