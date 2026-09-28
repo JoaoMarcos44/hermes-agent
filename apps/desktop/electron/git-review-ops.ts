@@ -11,7 +11,7 @@ import path from 'node:path'
 import simpleGit from 'simple-git'
 
 import { resolveRequestedPathForIpc } from './hardening'
-import { execGit, noConsoleGitEnv, simpleGitBinary, windowsGitHost } from './no-console-git'
+import { execGit, hardenGitArgs, noConsoleGitEnv, simpleGitBinary, windowsGitHost } from './no-console-git'
 
 const COMMIT_CONTEXT_DIFF_MAX_CHARS = 120_000
 const COMMIT_CONTEXT_UNTRACKED_MAX = 80
@@ -69,11 +69,11 @@ function gitFor(cwd, gitBin) {
     ...(unsafe ? { unsafe: { allowUnsafeCustomBinary: true } } : {})
   })
 
-  if (Array.isArray(binary)) {
-    return git.env(noConsoleGitEnv(process.env, gitBin || 'git'))
-  }
+  return git.env(noConsoleGitEnv(process.env, gitBin || 'git'))
+}
 
-  return git
+function safeDiffArgs(args: string[]): string[] {
+  return hardenGitArgs(['diff', ...args]).slice(1)
 }
 
 // simple-git reports renames as `old => new` (and `dir/{old => new}/f`); resolve
@@ -268,7 +268,7 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
       }
 
       const range = scope === 'branch' ? `${base}...HEAD` : base
-      const summary = await git.diffSummary([range])
+      const summary = await git.diffSummary(safeDiffArgs([range]))
 
       const files = summary.files.slice(0, REVIEW_FILE_CAP).map(file => ({
         path: resolveRenamePath(file.file),
@@ -311,8 +311,8 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
       // every descendant. The result is also capped before per-file stat/read
       // work and before crossing the Electron IPC boundary.
       git.status(['--untracked-files=normal']),
-      git.diffSummary(['--cached']),
-      git.diffSummary([])
+      git.diffSummary(safeDiffArgs(['--cached'])),
+      git.diffSummary(safeDiffArgs([]))
     ])
 
     const stagedCounts = countsByPath(staged)
@@ -351,7 +351,7 @@ async function reviewDiff(repoPath, filePath, scope, baseRef, staged, gitBin) {
   }
 
   const git = gitFor(cwd, gitBin)
-  const safe = args => git.diff(args).catch(() => '')
+  const safe = args => git.diff(safeDiffArgs(args)).catch(() => '')
 
   if (scope === 'branch') {
     const base = await branchBase(git)
@@ -399,7 +399,7 @@ async function fileDiffVsHead(repoPath, filePath, gitBin) {
   }
 
   const git = gitFor(cwd, gitBin)
-  const head = await git.diff(['HEAD', '--', filePath]).catch(() => '')
+  const head = await git.diff(safeDiffArgs(['HEAD', '--', filePath])).catch(() => '')
 
   if (head.trim()) {
     return head
@@ -514,7 +514,7 @@ async function reviewCommitContext(repoPath, gitBin) {
   }
 
   const git = gitFor(cwd, gitBin)
-  const safe = args => git.diff(args).catch(() => '')
+  const safe = args => git.diff(safeDiffArgs(args)).catch(() => '')
 
   let status
 
@@ -799,7 +799,7 @@ async function repoStatus(repoPath, gitBin) {
 
   // +/- vs HEAD (staged + unstaged tracked changes). No HEAD yet → leave 0.
   try {
-    const summary = await git.diffSummary(['HEAD'])
+    const summary = await git.diffSummary(safeDiffArgs(['HEAD']))
     result.added = summary.insertions
     result.removed = summary.deletions
   } catch {

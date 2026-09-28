@@ -8,7 +8,9 @@ import { test } from 'vitest'
 
 import {
   CREATE_NO_WINDOW,
+  hardenGitArgs,
   NO_CONSOLE_GIT_SCRIPT,
+  noConsoleGitEnv,
   planNoConsoleGitSpawn,
   resolveNoConsolePython,
   simpleGitBinary
@@ -49,6 +51,64 @@ test('non-windows git spawn keeps the git binary and argv', () => {
   assert.equal(plan.command, '/usr/bin/git')
   assert.deepEqual(plan.args, ['status', '--porcelain'])
   assert.equal(plan.creationFlags, 0)
+})
+
+test('git env pins repo execution sinks after inherited command config', () => {
+  const env = noConsoleGitEnv(
+    {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'commit.gpgsign',
+      GIT_CONFIG_VALUE_0: 'false',
+      GIT_CONFIG_PARAMETERS: "'core.fsmonitor=true'"
+    },
+    'git'
+  )
+
+  assert.equal(env.GIT_CONFIG_COUNT, '8')
+  assert.equal(env.GIT_CONFIG_KEY_0, 'commit.gpgsign')
+  assert.equal(env.GIT_CONFIG_VALUE_0, 'false')
+  assert.equal(env.GIT_CONFIG_PARAMETERS, undefined)
+
+  const values = new Map<string, string>()
+  for (let i = 0; i < Number(env.GIT_CONFIG_COUNT); i++) {
+    values.set(String(env[`GIT_CONFIG_KEY_${i}`]), String(env[`GIT_CONFIG_VALUE_${i}`]))
+  }
+
+  assert.equal(values.get('core.fsmonitor'), 'false')
+  assert.equal(values.get('core.untrackedCache'), 'false')
+  assert.equal(values.get('core.hooksPath'), os.devNull)
+  assert.equal(values.get('diff.external'), '')
+  assert.equal(env.GIT_TERMINAL_PROMPT, '0')
+  assert.equal(env.GIT_PAGER, 'cat')
+  assert.equal(env.GIT_EDITOR, 'true')
+})
+
+test('diff argv hardening is subcommand-aware and idempotent', () => {
+  const hardened = hardenGitArgs(['-c', 'core.quotePath=false', 'diff', 'HEAD'])
+
+  assert.deepEqual(hardened, [
+    '-c',
+    'core.quotePath=false',
+    'diff',
+    '--no-ext-diff',
+    '--no-textconv',
+    'HEAD'
+  ])
+  assert.deepEqual(hardenGitArgs(hardened), hardened)
+  assert.deepEqual(hardenGitArgs(['status', '--porcelain']), ['status', '--porcelain'])
+})
+
+test('non-windows plan uses the hardened env and diff argv', () => {
+  const plan = planNoConsoleGitSpawn({
+    gitBin: '/usr/bin/git',
+    args: ['diff', 'HEAD'],
+    isWindows: false,
+    env: { PATH: '/usr/bin' }
+  })
+
+  assert.deepEqual(plan.args, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD'])
+  assert.equal(plan.env.GIT_TERMINAL_PROMPT, '0')
+  assert.equal(plan.env.GIT_CONFIG_COUNT, '7')
 })
 
 test('missing python does not rewrite git argv', () => {

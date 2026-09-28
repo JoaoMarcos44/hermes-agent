@@ -15,6 +15,47 @@ import path from 'node:path'
 
 export const CREATE_NO_WINDOW = 0x08000000
 
+const REPO_GIT_CONFIG_OVERRIDES = [
+  ['core.fsmonitor', 'false'],
+  ['core.untrackedCache', 'false'],
+  ['core.hooksPath', os.devNull],
+  ['core.pager', 'cat'],
+  ['core.editor', 'true'],
+  ['sequence.editor', 'true'],
+  ['diff.external', '']
+] as const
+
+const NO_DRIVER_DIFF_FLAGS = ['--no-ext-diff', '--no-textconv'] as const
+const DIFF_RENDERING_SUBCOMMANDS = new Set(['diff', 'show', 'log', 'blame'])
+const GIT_VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'])
+
+export function hardenGitArgs(args: string[]): string[] {
+  const out = [...args]
+  let i = 0
+
+  while (i < out.length) {
+    const token = out[i]
+
+    if (GIT_VALUE_OPTIONS.has(token)) {
+      i += 2
+      continue
+    }
+    if (token.startsWith('-')) {
+      i++
+      continue
+    }
+    if (!DIFF_RENDERING_SUBCOMMANDS.has(token)) {
+      return out
+    }
+
+    const existing = new Set(out.slice(i + 1))
+    const missing = NO_DRIVER_DIFF_FLAGS.filter(flag => !existing.has(flag))
+    return [...out.slice(0, i + 1), ...missing, ...out.slice(i + 1)]
+  }
+
+  return out
+}
+
 export const NO_CONSOLE_GIT_SCRIPT = `import json, os, subprocess, sys
 git = json.loads(os.environ["HERMES_GIT_ARGV0"])
 argv = [git, *sys.argv[1:]]
@@ -157,10 +198,21 @@ export function noConsoleGitEnv(base: NodeJS.ProcessEnv | undefined, gitBin: str
   }
 
   env.HERMES_GIT_ARGV0 = JSON.stringify(gitBin || 'git')
+  env.GIT_TERMINAL_PROMPT = '0'
+  env.GIT_PAGER = 'cat'
+  env.PAGER = 'cat'
+  env.GIT_EDITOR = 'true'
 
-  if (!env.GIT_TERMINAL_PROMPT) {
-    env.GIT_TERMINAL_PROMPT = '0'
-  }
+  delete env.GIT_CONFIG_PARAMETERS
+  const parsedCount = Number.parseInt(env.GIT_CONFIG_COUNT || '0', 10)
+  const baseCount = Number.isFinite(parsedCount) && parsedCount >= 0 ? parsedCount : 0
+
+  REPO_GIT_CONFIG_OVERRIDES.forEach(([key, value], offset) => {
+    const index = baseCount + offset
+    env[`GIT_CONFIG_KEY_${index}`] = key
+    env[`GIT_CONFIG_VALUE_${index}`] = value
+  })
+  env.GIT_CONFIG_COUNT = String(baseCount + REPO_GIT_CONFIG_OVERRIDES.length)
 
   return env
 }
@@ -180,11 +232,14 @@ export function planNoConsoleGitSpawn({
   scriptPath?: string | null
   env?: NodeJS.ProcessEnv
 }): NoConsoleGitPlan {
+  const safeArgs = hardenGitArgs(args)
+  const safeEnv = noConsoleGitEnv(env, gitBin)
+
   if (isWindows && pythonBin && scriptPath) {
     return {
       command: pythonBin,
-      args: [scriptPath, ...args],
-      env: noConsoleGitEnv(env, gitBin),
+      args: [scriptPath, ...safeArgs],
+      env: safeEnv,
       windowsHide: true,
       stdio: [...PIPED_STDIO],
       creationFlags: CREATE_NO_WINDOW
@@ -193,8 +248,8 @@ export function planNoConsoleGitSpawn({
 
   return {
     command: gitBin || 'git',
-    args,
-    env: { ...(env || {}) },
+    args: safeArgs,
+    env: safeEnv,
     windowsHide: Boolean(isWindows),
     stdio: [...PIPED_STDIO],
     creationFlags: 0
