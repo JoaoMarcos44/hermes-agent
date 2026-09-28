@@ -79,6 +79,22 @@ _PRUNE_FILTER_NAMES = frozenset(name for name, _, _ in _PRUNE_FILTERS) | {"archi
 _CONTINUATION_EDGE_SQL = "p.end_reason = 'compression'\n" + _non_continuation_child_sql("c.", "p.id")
 
 
+def _pinned_lineage_ids_sql() -> str:
+    """Pinned rows and their real compression continuations."""
+    return ("WITH RECURSIVE pinned_lineage(id) AS ("
+            " SELECT id FROM sessions WHERE COALESCE(pinned, 0) != 0"
+            " UNION"
+            " SELECT c.id FROM pinned_lineage k JOIN sessions p ON p.id = k.id"
+            " JOIN sessions c ON c.parent_session_id = p.id"
+            f" WHERE {_CONTINUATION_EDGE_SQL}"
+            ") SELECT id FROM pinned_lineage")
+
+
+def _unpinned_lineage_clause(alias: str) -> str:
+    """Rows not protected by a pin on this or an earlier compression segment."""
+    return f"{alias}.id NOT IN ({_pinned_lineage_ids_sql()})"
+
+
 def _continued_ancestors_sql(candidates_where: str) -> str:
     """Compression ancestors of every row *candidates_where* (alias ``s``) does not select."""
     return ("WITH RECURSIVE kept(id) AS ("
@@ -170,7 +186,7 @@ class SessionMaintenanceMixin:
         if not (hb_grace is not None and hb_grace >= 0):
             hb_grace = hb_staleness
         cutoff = (now := time.time()) - max_idle_seconds
-        pin_scope = " AND COALESCE(pinned, 0) = 0" if exclude_pinned else ""
+        pin_scope = f" AND {_unpinned_lineage_clause('sessions')}" if exclude_pinned else ""
         orphan_predicate = f"started_at < ? AND {_sql_session_last_active('sessions')} < ?"
         heartbeat_params: Tuple[float, ...] = ()
         if respect_gateway_heartbeats:
@@ -197,7 +213,8 @@ class SessionMaintenanceMixin:
 
     @staticmethod
     def _prune_filter_where(*, archived: Optional[bool] = None, include_pinned: bool = False,
-                            lineage_tips_only: bool = False, **filters) -> Tuple[str, list]:
+                            lineage_tips_only: bool = False, protect_pinned_lineages: bool = False,
+                            **filters) -> Tuple[str, list]:
         """Shared WHERE clause for bulk prune/archive selection (alias ``s``): ``_PRUNE_FILTERS``
         AND together, only ended sessions are ever candidates, ``archived`` is tri-state
         (None = both), ``*_like`` are case-insensitive substrings, the rest exact.
@@ -220,15 +237,21 @@ class SessionMaintenanceMixin:
                 params.extend(new_params)
         if isinstance(archived, bool):
             clauses.append(f"s.archived = {int(archived)}")
-        # Pinned is a durable "keep" flag: bulk prune/delete/archive exclude pinned rows unless opted in.
+        # Pinned is a durable "keep" flag. Destructive maintenance treats the compression
+        # lineage as the unit, including stores whose newer segment predates pin inheritance.
         if not include_pinned:
-            clauses.append("COALESCE(s.pinned, 0) = 0")
+            clauses.append(
+                _unpinned_lineage_clause("s")
+                if protect_pinned_lineages else "COALESCE(s.pinned, 0) = 0"
+            )
         return " AND ".join(clauses), params
 
-    def _prune_where(self, older_than_days, source, filters, *, whole_lineages: bool = False) -> Tuple[str, list]:
+    def _prune_where(self, older_than_days, source, filters, *, whole_lineages: bool = False,
+                     protect_pinned_lineages: Optional[bool] = None) -> Tuple[str, list]:
         """Translate the legacy age window into the shared activity filter, then build WHERE.
         ``whole_lineages`` (prune) keeps a compression ancestor while any continuation after it
-        is unmatched."""
+        is unmatched. Destructive prune/archive selectors protect pinned compression lineages;
+        raw selectors keep their historical per-row pin semantics."""
         if (older_than_days is not None and filters.get("last_active_before") is None
                 and filters.get("started_before") is None):
             if older_than_days < 0:
@@ -236,7 +259,10 @@ class SessionMaintenanceMixin:
                     f"older_than_days must be >= 0, got {older_than_days!r}: a negative "
                     "retention builds a future cutoff that matches every ended session.")
             filters["last_active_before"] = time.time() - (older_than_days * 86400)
-        where, params = self._prune_filter_where(source=source, **filters)
+        if protect_pinned_lineages is None:
+            protect_pinned_lineages = whole_lineages or bool(filters.get("lineage_tips_only"))
+        where, params = self._prune_filter_where(
+            source=source, protect_pinned_lineages=protect_pinned_lineages, **filters)
         if not whole_lineages:
             return where, params
         # A compressed-away segment ages with its conversation, not on its own: while any later
@@ -257,8 +283,9 @@ class SessionMaintenanceMixin:
 
     def count_prune_matches(self, older_than_days: Optional[float] = None, source: str = None,
                             **filters) -> int:
-        """Count-only :meth:`list_prune_candidates` (CLI reports spared pinned sessions)."""
-        where, params = self._prune_where(older_than_days, source, filters)
+        """Count row-level matches for the CLI's spared-pinned-row report."""
+        where, params = self._prune_where(
+            older_than_days, source, filters, protect_pinned_lineages=False)
         return int(self._read_one(f"SELECT COUNT(*) FROM sessions s WHERE {where}", params)[0])
 
     def count_open_prune_matches(self, older_than_days: Optional[float] = None, source: str = None,
@@ -282,7 +309,7 @@ class SessionMaintenanceMixin:
         if idle_days is None or idle_days < 0:
             return 0
         cutoff = time.time() - float(idle_days) * 86400.0
-        pin_clause = "AND s.pinned = 0" if exclude_pinned else ""
+        pin_clause = f"AND {_unpinned_lineage_clause('s')}" if exclude_pinned else ""
         rows = self._read_all(
             f"""
             SELECT s.id FROM sessions s
