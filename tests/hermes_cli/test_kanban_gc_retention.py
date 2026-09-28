@@ -165,25 +165,32 @@ def test_cmd_gc_keeps_workspace_used_by_live_task_same_board(board):
     assert not shared.exists()
 
 
-def test_cmd_gc_keeps_workspace_used_by_live_task_other_board(board):
+def test_cmd_gc_keeps_workspace_used_by_live_task_other_board(board, monkeypatch):
     kb.create_board("other")
-    shared = kb.workspaces_root(board=kb.DEFAULT_BOARD) / "shared-cross-board"
+    default_db = kb.kanban_db_path(board=kb.DEFAULT_BOARD)
+    default_ws = kb.workspaces_root(board=kb.DEFAULT_BOARD)
+    shared = default_ws / "shared-cross-board"
     shared.mkdir(parents=True)
     (shared / "note.txt").write_text("keep", encoding="utf-8")
     with kbc.connect_closing(board=kb.DEFAULT_BOARD) as conn:
         _shared_scratch_task(conn, "archived default", shared, "archived")
-    with kbc.connect_closing(board="other") as conn:
-        live = _shared_scratch_task(conn, "live other", shared, "ready")
 
-    with kb.scoped_current_board(kb.DEFAULT_BOARD):
-        assert kanban_ops._cmd_gc(_args()) == 0
-    assert (shared / "note.txt").exists()
+    # Workers pin their own board DB/root in the environment. The cleanup guard
+    # must still inspect physical sibling-board DBs rather than resolving every
+    # board through these process-wide pins.
+    with kbc.connect_closing(board="other") as other_conn:
+        live = _shared_scratch_task(other_conn, "live other", shared, "ready")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(default_db))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(default_ws))
 
-    with kbc.connect_closing(board="other") as conn:
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (live,))
-    with kb.scoped_current_board(kb.DEFAULT_BOARD):
-        assert kanban_ops._cmd_gc(_args()) == 0
+        with kb.scoped_current_board(kb.DEFAULT_BOARD):
+            assert kanban_ops._cmd_gc(_args()) == 0
+        assert (shared / "note.txt").exists()
+
+        with kb.write_txn(other_conn):
+            other_conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (live,))
+        with kb.scoped_current_board(kb.DEFAULT_BOARD):
+            assert kanban_ops._cmd_gc(_args()) == 0
     assert not shared.exists()
 
 
