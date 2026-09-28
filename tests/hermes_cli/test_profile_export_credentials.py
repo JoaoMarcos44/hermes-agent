@@ -13,7 +13,7 @@ import tarfile
 
 import pytest
 
-from hermes_cli.profiles import export_profile
+from hermes_cli.profiles import PROFILE_PRIVATE_PATHS, export_profile
 
 # Long enough to match agent.redact prefix patterns (sk- + 10+ chars).
 _LEAKED_KEY = "sk-or-v1-reallyLongSecretKeyValue12345678"
@@ -54,6 +54,89 @@ class TestCredentialExclusion:
         assert any("SOUL.md" in n for n in names), "SOUL.md should be in export"
         assert not any("auth.json" in n for n in names), "auth.json must NOT be in export"
         assert not any(".env" in n for n in names), ".env must NOT be in export"
+
+    def test_named_profile_export_excludes_every_private_store(self, tmp_path, monkeypatch):
+        """Credential stores are excluded by root-relative identity, including legacy/directory OAuth paths."""
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "testprofile"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: gpt-4\n")
+        (profile_dir / "platforms").mkdir()
+        (profile_dir / "platforms" / "keep.json").write_text("{}")
+
+        directory_stores = {
+            "google_chat_user_tokens", "google_chat_user_oauth_pending",
+            "mcp-tokens", "vault", "browser-profile", "browser_auth", "bot-desktop",
+            "pairing", "platforms/pairing", "whatsapp/session", "platforms/whatsapp/session",
+            "matrix/store", "platforms/matrix/store", "backups", "state-snapshots",
+        }
+        for rel in PROFILE_PRIVATE_PATHS:
+            target = profile_dir / rel
+            if rel in directory_stores:
+                target.mkdir(parents=True, exist_ok=True)
+                (target / "credential").write_text("private")
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("private")
+
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+        result = export_profile("testprofile", str(tmp_path / "export.tar.gz"))
+
+        with tarfile.open(result, "r:gz") as tf:
+            names = set(tf.getnames())
+
+        assert "testprofile/platforms/keep.json" in names
+        leaked = sorted(
+            rel for rel in PROFILE_PRIVATE_PATHS
+            if any(
+                name == f"testprofile/{rel}" or name.startswith(f"testprofile/{rel}/")
+                for name in names
+            )
+        )
+        assert not leaked, leaked
+        # These two are current runtime paths omitted by the competing #126116 inventory.
+        assert "testprofile/google_chat_user_token.json" not in names
+        assert not any(name.startswith("testprofile/google_chat_user_oauth_pending/") for name in names)
+
+        upper_file = profile_dir / "AUTH.JSON"
+        upper_dir = profile_dir / "GOOGLE_CHAT_USER_TOKENS"
+        upper_file.write_text("private")
+        upper_dir.mkdir()
+        (upper_dir / "entry").write_text("private")
+        result = export_profile("testprofile", str(tmp_path / "export-uppercase.tar.gz"))
+        with tarfile.open(result, "r:gz") as tf:
+            upper_names = set(tf.getnames())
+        assert "testprofile/AUTH.JSON" not in upper_names
+        assert not any(name.startswith("testprofile/GOOGLE_CHAT_USER_TOKENS/") for name in upper_names)
+
+    def test_named_export_drops_managed_recovery_siblings_but_keeps_user_lookalike(
+        self, tmp_path, monkeypatch
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "testprofile"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: gpt-4\n")
+        managed = (
+            "auth.json.corrupt",
+            ".env.bak-20260928T084018Z",
+            ".env.bak-20260928T084018Z.1",
+            "config.yaml.bak-20260928T084018Z",
+            "config.yaml.bak.1778718391",
+            "config.yaml.corrupt.20260729-093706.bak",
+            "config.yaml.bak-pre-migrate-xai-20260515-120000",
+        )
+        for name in managed:
+            (profile_dir / name).write_text("private")
+        (profile_dir / "config.yaml.bak-my-note").write_text("user note")
+
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+        result = export_profile("testprofile", str(tmp_path / "export.tar.gz"))
+
+        with tarfile.open(result, "r:gz") as tf:
+            names = set(tf.getnames())
+
+        assert not any(f"testprofile/{name}" in names for name in managed)
+        assert "testprofile/config.yaml.bak-my-note" in names
 
 
 class TestExportSecretScrub:

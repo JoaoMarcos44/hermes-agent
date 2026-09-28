@@ -710,13 +710,55 @@ class TestSecurity:
         # Author leaks credentials into the staging tree (shouldn't happen, but...)
         (staged / "auth.json").write_text('{"leaked": true}')
         (staged / ".env").write_text("LEAKED=1")
+        (staged / "auth.json.corrupt").write_text('{"leaked": true}')
 
         plan = install_distribution(str(staged), name="clean")
         assert not (plan.target_dir / "auth.json").exists(), "auth.json leaked"
+        assert not (plan.target_dir / "auth.json.corrupt").exists(), "quarantined auth copy leaked"
         # Fresh profile may have its own .env via the bootstrap; what we care
         # about is that the leaked content didn't land in the target.
         if (plan.target_dir / ".env").exists():
             assert "LEAKED" not in (plan.target_dir / ".env").read_text()
+
+    def test_explicit_private_distribution_path_is_never_owned(self, profile_env):
+        """An explicit distribution_owned entry cannot opt a credential subtree back in."""
+        mf = DistributionManifest(
+            name="private_path", version="0.1.0",
+            distribution_owned=["platforms/pairing", "auth.json.corrupt"],
+        )
+        staged = _make_staging_dir(profile_env, "src", manifest=mf)
+        secret = staged / "platforms" / "pairing" / "telegram.json"
+        secret.parent.mkdir(parents=True)
+        secret.write_text('{"token":"leak"}')
+        (staged / "auth.json.corrupt").write_text('{"token":"leak"}')
+
+        plan = install_distribution(str(staged), name="private_path")
+
+        assert not (plan.target_dir / "platforms" / "pairing").exists()
+        assert not (plan.target_dir / "auth.json.corrupt").exists()
+
+    def test_owned_parent_filters_private_descendant_without_dropping_siblings(self, profile_env):
+        """Path-aware filtering keeps an owned parent useful while excluding its live session child."""
+        mf = DistributionManifest(
+            name="owned_parent", version="0.1.0",
+            distribution_owned=["platforms/whatsapp"],
+        )
+        staged = _make_staging_dir(profile_env, "src", manifest=mf)
+        parent = staged / "platforms" / "whatsapp"
+        (parent / "session").mkdir(parents=True)
+        (parent / "session" / "creds.json").write_text('{"token":"leak"}')
+        (parent / "adapter.json").write_text('{"enabled":true}')
+
+        target = profile_env / ".hermes" / "profiles" / "owned_parent"
+        local_session = target / "platforms" / "whatsapp" / "session"
+        local_session.mkdir(parents=True)
+        local_state = local_session / "local.json"
+        local_state.write_text('{"owner":"local"}')
+
+        plan = install_distribution(str(staged), name="owned_parent", force=True)
+
+        assert (plan.target_dir / "platforms" / "whatsapp" / "adapter.json").exists()
+        assert local_state.read_text() == '{"owner":"local"}'
 
     def test_install_rejects_symlinked_distribution_files(self, profile_env, tmp_path):
         """Distribution install must not follow symlinks to local files."""

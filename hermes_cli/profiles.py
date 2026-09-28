@@ -148,6 +148,81 @@ def _clone_all_copytree_ignore(source_dir: Path):
     return _ignore
 
 
+# Profile-home paths that contain credentials or live authentication state.  These are
+# root-relative on purpose: some stores live below otherwise shareable roots (for example
+# platforms/whatsapp/session), so callers must match the whole path rather than blacklist a
+# basename such as "session".
+PROFILE_PRIVATE_PATHS = frozenset({
+    "auth.json", ".env", "auth/google_oauth.json",
+    ".op.env", "npmrc", ".anthropic_oauth.json",
+    "google_token.json", "google_oauth_pending.json", "google_client_secret.json",
+    "google_chat_user_token.json", "google_chat_user_tokens",
+    "google_chat_user_client_secret.json",
+    "google_chat_user_oauth_pending.json", "google_chat_user_oauth_pending",
+    "slack_tokens.json", "webhook_subscriptions.json", "feishu_comment_pairing.json",
+    "mcp-tokens", "vault", "browser-profile", "browser_auth", "bot-desktop",
+    "pairing", "platforms/pairing",
+    "whatsapp/session", "platforms/whatsapp/session",
+    "matrix/store", "platforms/matrix/store",
+    "cache/bws_cache.json", "cache/bws_cache.enc.json",
+    "backups", "state-snapshots",
+})
+_PROFILE_PRIVATE_PREFIXES = tuple(\n    tuple(part.casefold() for part in path.split("/")) for path in PROFILE_PRIVATE_PATHS\n)
+
+
+def _managed_recovery_root_name(name: str) -> bool:
+    """Return whether name matches a recovery sibling written by Hermes itself.
+
+    Match writer formats rather than a broad prefix: config.yaml.bak-my-note is
+    documented user-owned and must remain shareable.
+    """
+    name = name.casefold()\n    if name == "auth.json.corrupt":
+        return True
+    for original in (".env", "config.yaml"):
+        prefix = f"{original}.bak-"
+        if not name.startswith(prefix):
+            continue
+        tail = name[len(prefix):]
+        stamp, dot, collision = tail.partition(".")
+        if (
+            len(stamp) == 16
+            and stamp[8:9] == "T"
+            and stamp[-1:] == "Z"
+            and stamp[:8].isdigit()
+            and stamp[9:15].isdigit()
+            and (not dot or collision.isdigit())
+        ):
+            return True
+    if name.startswith("config.yaml.bak.") and name[len("config.yaml.bak."):].isdigit():
+        return True
+    if (
+        name.startswith("config.yaml.corrupt.")
+        and name.endswith(".bak")
+        and len(name) > len("config.yaml.corrupt..bak")
+    ):
+        return True
+    if name.startswith("config.yaml.bak-pre-migrate-"):
+        return True
+    return False
+
+
+def profile_path_is_private(parts: Tuple[str, ...]) -> bool:
+    """True when *parts* names a private store/recovery copy or anything below one."""
+    candidate = tuple(str(part).casefold() for part in parts)
+    if len(candidate) == 1 and _managed_recovery_root_name(candidate[0]):
+        return True
+    return any(candidate[:len(prefix)] == prefix for prefix in _PROFILE_PRIVATE_PREFIXES)
+
+
+def profile_path_contains_private_store(parts: Tuple[str, ...]) -> bool:
+    """True when *parts* is a non-private ancestor of a private store."""
+    candidate = tuple(str(part).casefold() for part in parts)
+    return any(
+        len(prefix) > len(candidate) and prefix[:len(candidate)] == candidate
+        for prefix in _PROFILE_PRIVATE_PREFIXES
+    )
+
+
 # Directories/files to exclude when exporting the default (~/.hermes) profile.
 # The default profile contains infrastructure (repo checkout, worktrees, DBs,
 # caches, binaries) that named profiles don't have.  We exclude those so the
@@ -181,7 +256,9 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "browser_screenshots", "checkpoints",
     "sandboxes",
     "logs",                 # gateway logs
-}) | PM_RUNTIME_ROOT_DIRS
+}) | PM_RUNTIME_ROOT_DIRS | frozenset(
+    path for path in PROFILE_PRIVATE_PATHS if "/" not in path
+)
 
 # Allow-list for ``export_profile("default")``: when HERMES_HOME equals the
 # cwd (Docker/custom deployments), the default profile home is the working
@@ -2174,6 +2251,11 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     def _ignore_credentials(directory: str, contents: list) -> set:
         ignored = _non_exportable_entries(directory, contents)
         ignored.update(_EXPORT_CREDENTIAL_FILES & set(contents))
+        rel_parts = Path(directory).relative_to(profile_dir).parts
+        ignored.update(
+            entry for entry in contents
+            if profile_path_is_private((*rel_parts, entry))
+        )
         if Path(directory) == profile_dir:
             ignored |= PM_RUNTIME_ROOT_DIRS & set(contents)
         return ignored
