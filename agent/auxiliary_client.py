@@ -5062,6 +5062,17 @@ def _resolve_minimax_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
         return None, None
 
     final_model = _normalize_resolved_model(req.model, req.provider)
+    if _aux_probe_active():
+        try:
+            from hermes_cli.auth import get_provider_auth_state
+            state = get_provider_auth_state("minimax-oauth") or {}
+        except Exception:
+            state = {}
+        base_url = str(state.get("inference_base_url") or "").strip().rstrip("/")
+        if not state.get("access_token") or not base_url:
+            return None, None
+        return _AuxProbeClientStub(api_key="", base_url=base_url), final_model
+
     try:
         from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
         creds = resolve_minimax_oauth_runtime_credentials(as_token_provider=True)

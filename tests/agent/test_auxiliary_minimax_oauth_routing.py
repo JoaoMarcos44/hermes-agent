@@ -125,3 +125,35 @@ def test_unexpected_minimax_client_build_error_is_not_masked(monkeypatch):
 
     with pytest.raises(RuntimeError, match="builder bug"):
         aux.resolve_provider_client("minimax-oauth", "MiniMax-M3")
+
+
+def test_minimax_oauth_probe_is_local_and_does_not_refresh_or_build_client(monkeypatch):
+    from agent import auxiliary_client as aux
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        lambda provider: {
+            "provider": provider,
+            "access_token": "stored-token",
+            "inference_base_url": "https://api.minimax.io/anthropic",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_minimax_oauth_runtime_credentials",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("probe must not refresh OAuth")),
+    )
+
+    built = []
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.build_anthropic_client",
+        lambda *_args, **_kwargs: built.append(True),
+    )
+
+    with aux.aux_probe_mode():
+        client, model = aux.resolve_provider_client("minimax-oauth", "MiniMax-M3")
+
+    assert isinstance(client, aux._AuxProbeClientStub)
+    assert model == "MiniMax-M3"
+    assert client.base_url == "https://api.minimax.io/anthropic"
+    assert built == []
+
