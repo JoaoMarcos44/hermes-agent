@@ -365,6 +365,122 @@ def test_server_strips_client_auth_header():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("headers, allowed", [
+    ({}, True),
+    ({"Host": "localhost:{port}"}, True),
+    ({"Origin": "http://{authority}"}, True),
+    ({"Host": "localhost:80", "Origin": "http://localhost"}, True),
+    ({"Host": "rebound.example:{port}"}, False),
+    ({"Host": "localhost:not-a-port"}, False),
+    ({"Host": "user@localhost:{port}"}, False),
+    ({"Origin": "https://site.example"}, False),
+    ({"Origin": "http://{authority}/path"}, False),
+    ({"Origin": "null"}, False),
+])
+def test_proxy_enforces_host_and_browser_origin_boundary(headers, allowed):
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter, bound_host="127.0.0.1"))
+        authority = proxy_base.removeprefix("http://")
+        port = authority.rsplit(":", 1)[1]
+        sent = {key: value.format(authority=authority, port=port) for key, value in headers.items()}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers=sent,
+                ) as resp:
+                    await resp.read()
+                    status = resp.status
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+        if allowed:
+            assert status == 200
+            assert len(captured["requests"]) == 1
+        else:
+            assert 400 <= status < 500
+            assert captured["requests"] == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("bound_host", ["0.0.0.0", "::", "0:0:0:0:0:0:0:0"])
+def test_proxy_wildcard_bind_rejects_same_origin_dns_rebinding(bound_host):
+    """Wildcard is a LAN opt-in for API clients, not an Origin bypass for browser DNS rebinding."""
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter, bound_host=bound_host))
+        port = proxy_base.rsplit(":", 1)[1]
+        rebound_host = f"rebound.example:{port}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={"Host": rebound_host, "Origin": f"http://{rebound_host}"},
+                ) as resp:
+                    await resp.read()
+                    assert resp.status == 403
+                assert captured["requests"] == []
+
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={"Host": rebound_host},
+                ) as resp:
+                    await resp.read()
+                    assert resp.status == 200
+                assert len(captured["requests"]) == 1
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_proxy_specific_ip_bind_accepts_only_its_address():
+    async def run():
+        captured: Dict[str, Any] = {"requests": []}
+        upstream_runner, upstream_base = await _start_runner(_build_fake_upstream(captured))
+        adapter = FakeAdapter(f"{upstream_base}/v1", bearer="ours")
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter, bound_host="192.0.2.10"))
+        port = proxy_base.rsplit(":", 1)[1]
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={
+                        "Host": f"192.0.2.10:{port}",
+                        "Origin": f"http://192.0.2.10:{port}",
+                    },
+                ) as resp:
+                    await resp.read()
+                    assert resp.status == 200
+
+                async with session.post(
+                    f"{proxy_base}/v1/chat/completions",
+                    json={},
+                    headers={"Host": f"192.0.2.11:{port}"},
+                ) as resp:
+                    await resp.read()
+                    assert resp.status == 403
+
+                assert len(captured["requests"]) == 1
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
 def _build_sse_upstream(
     frames: list[bytes],
     *,

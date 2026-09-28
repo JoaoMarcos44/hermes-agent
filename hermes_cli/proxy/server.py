@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from ipaddress import ip_address
 from typing import Optional
+from urllib.parse import urlsplit
 
 try:
     import aiohttp
@@ -51,6 +53,95 @@ def _json_error(status: int, message: str, code: str = "proxy_error") -> "web.Re
     """OpenAI-style error JSON response."""
     body = {"error": {"message": message, "type": code, "code": code}}
     return web.json_response(body, status=status)
+
+
+def _canonical_hostname(hostname: str) -> str:
+    """Normalize a Host/Origin hostname for exact security-boundary comparison."""
+    value = hostname.rstrip(".").lower()
+    try:
+        return ip_address(value).compressed
+    except ValueError:
+        return value
+
+
+def _parse_authority(authority: str) -> Optional[tuple[str, Optional[int]]]:
+    """Return canonical (hostname, port) for an HTTP authority, or None if malformed."""
+    if not authority or any(char in authority for char in "@/\\?# \t\r\n"):
+        return None
+    try:
+        parsed = urlsplit("//" + authority)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.username is not None or parsed.password is not None or not parsed.hostname:
+        return None
+    return _canonical_hostname(parsed.hostname), port
+
+
+def _normalized_bind_host(bound_host: str) -> str:
+    value = bound_host.strip().lower()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return _canonical_hostname(value)
+
+
+def _is_wildcard_bind(bound_host: str) -> bool:
+    normalized = _normalized_bind_host(bound_host)
+    if not normalized:
+        return True
+    try:
+        return ip_address(normalized).is_unspecified
+    except ValueError:
+        return False
+
+
+def _origin_matches_authority(origin: str, authority: str) -> bool:
+    """Whether a browser Origin is the same plain-HTTP origin as the request Host authority."""
+    target = _parse_authority(authority)
+    if target is None or not origin or any(char in origin for char in " \t\r\n"):
+        return False
+    try:
+        parsed = urlsplit(origin)
+        origin_port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.lower() != "http"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    return (
+        _canonical_hostname(parsed.hostname) == target[0]
+        and (origin_port or 80) == (target[1] or 80)
+    )
+
+
+_LOOPBACK_REQUEST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _request_boundary_error(host_header: str, origin: Optional[str], bound_host: str) -> Optional[str]:
+    """Return a refusal code for requests that must not reach the credential-attaching proxy."""
+    authority = _parse_authority(host_header)
+    if authority is None:
+        return "host_not_allowed"
+
+    hostname, _ = authority
+    wildcard = _is_wildcard_bind(bound_host)
+    if not wildcard:
+        allowed_hosts = _LOOPBACK_REQUEST_HOSTS | {_normalized_bind_host(bound_host)}
+        if hostname not in allowed_hosts:
+            return "host_not_allowed"
+
+    if origin is not None:
+        if wildcard or not _origin_matches_authority(origin.strip(), host_header):
+            return "origin_not_allowed"
+
+    return None
 
 
 def _filter_headers(headers, drop: frozenset = _HOP_BY_HOP_HEADERS) -> dict:
@@ -123,7 +214,7 @@ async def _stream_back(request: "web.Request", session, upstream_resp) -> "web.S
     return resp
 
 
-def create_app(adapter: UpstreamAdapter) -> "web.Application":
+def create_app(adapter: UpstreamAdapter, bound_host: str = DEFAULT_HOST) -> "web.Application":
     """Build the aiohttp application bound to a specific upstream adapter.
 
     Every adapter method is synchronous and blocking (the Nous adapter takes the 15s cross-process
@@ -132,7 +223,26 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
     the single loop and every other in-flight streaming completion.
     """
     _require_aiohttp()
-    app = web.Application(client_max_size=MAX_REQUEST_BYTES)
+
+    @web.middleware
+    async def enforce_local_request_boundary(request: "web.Request", handler):
+        refusal = _request_boundary_error(
+            request.headers.get("Host", ""),
+            request.headers.get("Origin"),
+            bound_host,
+        )
+        if refusal:
+            return _json_error(
+                403,
+                "Request refused by the local proxy Host/Origin boundary.",
+                code=refusal,
+            )
+        return await handler(request)
+
+    app = web.Application(
+        client_max_size=MAX_REQUEST_BYTES,
+        middlewares=[enforce_local_request_boundary],
+    )
     # AppKey: forward-compat with aiohttp versions that strip bare-string keys.
     app[web.AppKey("adapter", UpstreamAdapter)] = adapter
 
@@ -189,7 +299,7 @@ async def run_server(
 ) -> None:
     """Run the proxy in the current event loop until shutdown_event is set."""
     _require_aiohttp()
-    app = create_app(adapter)
+    app = create_app(adapter, bound_host=host)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
