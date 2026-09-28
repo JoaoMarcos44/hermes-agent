@@ -1,4 +1,4 @@
-"""Regression coverage for pinned compression lineages during maintenance."""
+"""Regression coverage for pinned compression lineages."""
 
 import time
 from contextlib import closing
@@ -36,8 +36,8 @@ def _split_pinned_lineage(
     if not tip_open:
         db.end_session(tip, "done")
 
-    # Persist the pre-fix shape explicitly so this regression remains meaningful
-    # even after compression-child flag inheritance lands independently.
+    # Persist the legacy shape explicitly: existing databases can contain it even
+    # though newly published compression children now inherit the pin.
     db._conn.execute(
         "UPDATE sessions SET pinned = CASE WHEN id = ? THEN 1 ELSE 0 END "
         "WHERE id IN (?, ?, ?)",
@@ -72,6 +72,25 @@ def _old_branch(db: SessionDB, root: str, old: float) -> str:
     )
     db._conn.commit()
     return branch
+
+
+def test_publish_compression_child_inherits_parent_pin(tmp_path):
+    with closing(SessionDB(tmp_path / "state.db")) as db:
+        for pinned in (False, True):
+            root, child = f"root-{pinned}", f"child-{pinned}"
+            db.create_session(root, source="cli")
+            if pinned:
+                db.set_session_pinned(root, True)
+
+            db.publish_compression_child(
+                parent_session_id=root,
+                child_session_id=child,
+                source="cli",
+                messages=[{"role": "user", "content": "summary"}],
+                require_compression_lease=False,
+            )
+
+            assert db.get_session(child)["pinned"] == int(pinned)
 
 
 def test_prune_keeps_split_pinned_continuations_but_not_a_branch(tmp_path):
