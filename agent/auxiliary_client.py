@@ -5052,6 +5052,42 @@ def _resolve_xai_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
                           "OAuth token found (run: hermes model -> xAI Grok OAuth — SuperGrok / Premium+)")
 
 
+def _resolve_minimax_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
+    """MiniMax OAuth auxiliary route over its Anthropic-Messages endpoint."""
+    if not req.model:
+        logger.warning(
+            "resolve_provider_client: minimax-oauth requested without a model; "
+            "configure auxiliary.<task>.model or a provider default"
+        )
+        return None, None
+
+    final_model = _normalize_resolved_model(req.model, req.provider)
+    try:
+        from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+        creds = resolve_minimax_oauth_runtime_credentials(as_token_provider=True)
+    except ImportError:
+        return None, None
+    except Exception as exc:
+        logger.warning("resolve_provider_client: minimax-oauth unavailable: %s", exc)
+        return None, None
+
+    token_provider = creds.get("api_key")
+    base_url = str(creds.get("base_url") or "").strip().rstrip("/")
+    if not callable(token_provider) or not base_url:
+        logger.warning("resolve_provider_client: minimax-oauth credentials are incomplete")
+        return None, None
+    try:
+        from agent.anthropic_adapter import build_anthropic_client
+        real_client = build_anthropic_client(token_provider, base_url)
+    except ImportError:
+        return None, None
+
+    client = AnthropicAuxiliaryClient(
+        real_client, final_model, token_provider, base_url, is_oauth=False,
+    )
+    return _route_client(req, client, final_model)
+
+
 def _resolve_custom_branch(req: _ResolveRequest) -> _ResolveResult:
     """Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY)."""
     provider, model, main_runtime = req.provider, req.model, req.main_runtime
@@ -5402,6 +5438,7 @@ _EXPLICIT_PROVIDER_BRANCHES: Dict[str, Callable[[_ResolveRequest], _ResolveResul
     "nous": _resolve_nous_branch,
     "openai-codex": _resolve_openai_codex_branch,
     "xai-oauth": _resolve_xai_oauth_branch,
+    "minimax-oauth": _resolve_minimax_oauth_branch,
     "custom": _resolve_custom_branch,
 }
 
