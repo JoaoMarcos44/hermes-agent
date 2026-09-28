@@ -219,6 +219,65 @@ class TestSweepOrphanedSessions:
         ) == []
         assert db.get_session("pinned")["ended_at"] is None
 
+    def test_automatic_source_scope_spares_unpinned_tip_of_pinned_lineage(self, db):
+        stale = time.time() - 8 * 3600
+        _make_session(
+            db, "pinned-root", source="cli", started_at=stale, message_at=stale
+        )
+        assert db.set_session_pinned("pinned-root", True)
+        db.publish_compression_child(
+            parent_session_id="pinned-root",
+            child_session_id="legacy-unpinned-tip",
+            source="cli",
+            messages=[{"role": "user", "content": "continued", "timestamp": stale}],
+            require_compression_lease=False,
+        )
+        _backdate_session(db, "legacy-unpinned-tip", stale)
+        _set_last_activity(db, "legacy-unpinned-tip", stale)
+        # Recreate a store written before compression children inherited the pin.
+        db._conn.execute(
+            "UPDATE sessions SET pinned = 0 WHERE id = 'legacy-unpinned-tip'"
+        )
+        db._conn.commit()
+
+        assert db.get_session("pinned-root")["pinned"] == 1
+        assert db.get_session("legacy-unpinned-tip")["pinned"] == 0
+        assert db.sweep_orphaned_sessions(
+            max_idle_seconds=IDLE_S,
+            sources=("cli",),
+            exclude_pinned=True,
+        ) == []
+        assert db.get_session("legacy-unpinned-tip")["ended_at"] is None
+
+        assert db.sweep_orphaned_sessions(
+            max_idle_seconds=IDLE_S,
+            sources=("cli",),
+            exclude_pinned=False,
+        ) == ["legacy-unpinned-tip"]
+
+    def test_pinned_compression_parent_does_not_spare_branch_child(self, db):
+        stale = time.time() - 8 * 3600
+        _make_session(
+            db, "pinned-branch-root", source="cli", started_at=stale, message_at=stale
+        )
+        assert db.set_session_pinned("pinned-branch-root", True)
+        db.end_session("pinned-branch-root", "compression")
+        db.create_session(
+            "independent-branch",
+            source="cli",
+            parent_session_id="pinned-branch-root",
+            model_config={"_branched_from": "pinned-branch-root"},
+        )
+        db.append_message("independent-branch", role="user", content="branch")
+        _set_message_timestamps(db, "independent-branch", stale)
+        _backdate_session(db, "independent-branch", stale)
+
+        assert db.sweep_orphaned_sessions(
+            max_idle_seconds=IDLE_S,
+            sources=("cli",),
+            exclude_pinned=True,
+        ) == ["independent-branch"]
+
     def test_live_turn_lease_on_compression_lineage_spares_session(self, db):
         stale = time.time() - 8 * 3600
         _make_session(db, "root", source="cli", started_at=stale, message_at=stale)

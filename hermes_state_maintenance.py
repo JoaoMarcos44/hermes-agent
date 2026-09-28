@@ -170,7 +170,19 @@ class SessionMaintenanceMixin:
         if not (hb_grace is not None and hb_grace >= 0):
             hb_grace = hb_staleness
         cutoff = (now := time.time()) - max_idle_seconds
-        pin_scope = " AND COALESCE(pinned, 0) = 0" if exclude_pinned else ""
+        if exclude_pinned:
+            pinned_lineage_sql = (
+                "WITH RECURSIVE pinned_lineage(id) AS ("
+                " SELECT id FROM sessions WHERE COALESCE(pinned, 0) = 1"
+                " UNION"
+                " SELECT c.id FROM pinned_lineage l JOIN sessions p ON p.id = l.id"
+                " JOIN sessions c ON c.parent_session_id = p.id"
+                f" WHERE {_CONTINUATION_EDGE_SQL}"
+                ") SELECT id FROM pinned_lineage"
+            )
+            pin_scope = f" AND id NOT IN ({pinned_lineage_sql})"
+        else:
+            pin_scope = ""
         orphan_predicate = f"started_at < ? AND {_sql_session_last_active('sessions')} < ?"
         heartbeat_params: Tuple[float, ...] = ()
         if respect_gateway_heartbeats:
