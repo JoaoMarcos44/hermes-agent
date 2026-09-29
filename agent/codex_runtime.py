@@ -508,7 +508,29 @@ def _stored_codex_thread_id(agent) -> str | None:
     if db is None or not session_id:
         return None
     thread_id = db.get_session_model_config_value(session_id, _CODEX_THREAD_ID_KEY)
-    return thread_id if isinstance(thread_id, str) and thread_id else None
+    if not isinstance(thread_id, str) or not thread_id:
+        return None
+
+    # Gateway sessions record the last runtime alongside the thread binding. A
+    # thread only contains turns sent to Codex; resuming it after another
+    # provider handled turns would hide those rows from the model. Legacy
+    # sessions without a runtime marker retain the existing resume behavior.
+    runtime = db.get_session_model_config_value(session_id, "gateway_runtime")
+    if isinstance(runtime, dict):
+        changed_fields = [
+            key
+            for key in ("provider", "base_url", "api_mode")
+            if runtime.get(key) not in (None, "") and runtime[key] != getattr(agent, key, None)
+        ]
+        if changed_fields:
+            logger.info(
+                "Ignoring stale Codex thread binding for session %s after runtime change (%s)",
+                session_id,
+                ", ".join(changed_fields),
+            )
+            _store_codex_thread_id(agent, None)
+            return None
+    return thread_id
 
 
 def _store_codex_thread_id(agent, thread_id: str | None) -> None:
