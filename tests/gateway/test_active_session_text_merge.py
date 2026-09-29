@@ -221,6 +221,31 @@ async def test_debounce_resets_timer_on_new_arrival():
 
 
 @pytest.mark.asyncio
+async def test_pending_synthetic_and_human_text_keep_prompt_identity_separate():
+    """A human text must wait behind, not merge into, a pin-preserving synthetic turn."""
+    adapter = _make_adapter()
+    synthetic = _make_event("synthetic")
+    synthetic.message_id = None
+    synthetic.preserve_prompt_pins = True
+    session_key = build_session_key(synthetic.source)
+    adapter._pending_messages[session_key] = synthetic
+
+    human = _make_event("human")
+    await adapter._queue_text_debounce(session_key, human)
+
+    assert await adapter._flush_text_debounce_now(session_key) is False
+    assert adapter._pending_messages[session_key] is synthetic
+    buffered = _debounced_event(adapter, session_key)
+    assert buffered is human
+    assert buffered.preserve_prompt_pins is False
+    assert buffered.message_id == human.message_id
+
+    adapter._pending_messages.pop(session_key)
+    assert await adapter._flush_text_debounce_now(session_key) is True
+    assert adapter._pending_messages[session_key] is human
+
+
+@pytest.mark.asyncio
 async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter = _make_adapter()
     started: list[str] = []

@@ -3772,7 +3772,7 @@ class BasePlatformAdapter(ABC):
         return result
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
+        """Return True when text debounce events share sender and prompt identity."""
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -3785,6 +3785,15 @@ class BasePlatformAdapter(ABC):
             if getattr(source, "chat_type", None) in {"dm", "private"} and getattr(source, "chat_id", None):
                 return (platform, "dm", str(source.chat_id))
             return None
+
+        def _preserves_prompt_pins(candidate: MessageEvent) -> bool:
+            return bool(
+                getattr(candidate, "internal", False)
+                or getattr(candidate, "preserve_prompt_pins", False)
+            )
+
+        if _preserves_prompt_pins(existing) != _preserves_prompt_pins(event):
+            return False
         existing_sender = _identity(existing)
         return existing_sender is not None and existing_sender == _identity(event)
 

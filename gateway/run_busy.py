@@ -113,6 +113,19 @@ class GatewayBusySessionMixin:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
 
+    def _requeue_before_pending_slot(
+        self, session_key: str, queued_event: "MessageEvent", adapter: Any
+    ) -> None:
+        """Put an already-dequeued older event back ahead of the current FIFO slot."""
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if pending_slot is None:
+            return
+        existing = pending_slot.get(session_key)
+        pending_slot[session_key] = queued_event
+        queued_event._gateway_accepted = True
+        if existing is not None and existing is not queued_event:
+            self._session_state(session_key).conversation.queued_events.insert(0, existing)
+
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
     ) -> Optional["MessageEvent"]:
@@ -386,6 +399,8 @@ class GatewayBusySessionMixin:
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
         same_security_context = existing is not None and (
             getattr(existing, "internal", False) == getattr(event, "internal", False)
+            and getattr(existing, "preserve_prompt_pins", False)
+            == getattr(event, "preserve_prompt_pins", False)
             and getattr(existing, "allow_gateway_control", True)
             == getattr(event, "allow_gateway_control", True)
             and all(

@@ -3790,7 +3790,16 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                existing = getattr(adapter, "_pending_messages", {}).get(session_key)
+                if (
+                    existing is not None
+                    and self._event_preserves_prompt_pins(existing)
+                    != self._event_preserves_prompt_pins(pending_event)
+                ):
+                    # pending_event was dequeued before the current slot event; keep FIFO order.
+                    self._requeue_before_pending_slot(session_key, pending_event, adapter)
+                else:
+                    merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
