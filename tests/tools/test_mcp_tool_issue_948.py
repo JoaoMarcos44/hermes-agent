@@ -87,6 +87,53 @@ def test_resolve_stdio_command_empty_path_is_a_miss(monkeypatch, tmp_path):
     assert command == "other-mcp-server"  # cwd-only lookup: no ambient fallback
 
 
+@pytest.mark.platforms("windows")
+def test_resolve_stdio_command_uses_case_insensitive_config_path_and_pathext(tmp_path, monkeypatch):
+    command_dir = tmp_path / "mixed-case-bin"
+    command_dir.mkdir()
+    script = command_dir / "audit-mcp.cmd"
+    script.write_text("@echo off\\r\\n", encoding="utf-8")
+    inherited_path = str(tmp_path / "inherited-bin")
+    monkeypatch.setenv("PATH", inherited_path)
+    monkeypatch.setenv("PATHEXT", ".EXE")
+
+    command, child_env = _resolve_stdio_command(
+        "audit-mcp",
+        {"PATH": inherited_path, "Path": str(command_dir), "Pathext": ".CMD"},
+    )
+
+    assert os.path.normcase(command) == os.path.normcase(str(script))
+    assert child_env["PATH"] == inherited_path
+    assert child_env["Path"].split(os.pathsep)[0] == str(command_dir)
+    assert os.environ["PATHEXT"] == ".EXE"
+
+
+@pytest.mark.platforms("windows")
+def test_managed_launcher_updates_mixed_case_path_entry(tmp_path, monkeypatch):
+    import tools.mcp_tool_config as _config
+
+    managed_dir = tmp_path / "managed-bin"
+    user_dir = tmp_path / "user-bin"
+    managed_dir.mkdir()
+    user_dir.mkdir()
+    launcher = managed_dir / "npx.cmd"
+    launcher.write_text("@echo off\\r\\n", encoding="utf-8")
+    inherited_path = str(tmp_path / "inherited-bin")
+    monkeypatch.setattr(
+        _config,
+        "_managed_launcher",
+        lambda _command: (str(launcher), [str(managed_dir)]),
+    )
+
+    command, child_env = _resolve_stdio_command(
+        "npx", {"PATH": inherited_path, "Path": str(user_dir)}
+    )
+
+    assert command == str(launcher)
+    assert child_env["PATH"] == inherited_path
+    assert child_env["Path"].split(os.pathsep) == [str(managed_dir), str(user_dir)]
+
+
 def test_config_pathext_lookup_never_touches_parent_environ(tmp_path, monkeypatch):
     """Resolving under a configured PATHEXT must not mutate the parent's ``os.environ``:
     a multiplexed gateway resolves servers for several profiles from one process, and

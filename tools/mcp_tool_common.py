@@ -94,14 +94,38 @@ def _exc_str(exc: BaseException) -> str:
     return text or repr(exc)
 
 
+def _env_key(env: dict, key: str) -> str | None:
+    """Find an environment key using the host's name semantics.
+
+    Windows environment names are case-insensitive, while POSIX names are
+    case-sensitive. For a plain dict containing duplicate Windows spellings,
+    the last entry wins so a server's configured value takes precedence over
+    the inherited environment.
+    """
+    if os.name == "nt":
+        folded = key.casefold()
+        return next(
+            (candidate for candidate in reversed(env) if str(candidate).casefold() == folded),
+            None,
+        )
+    return key if key in env else None
+
+
+def _env_get(env: dict, key: str):
+    """Read an environment variable using the host's case-sensitivity rules."""
+    real_key = _env_key(env, key)
+    return env[real_key] if real_key is not None else None
+
+
 def _prepend_path(env: dict, directory: str) -> dict:
     """Prepend *directory* to env PATH if it is not already present."""
     updated = dict(env or {})
     if directory:
-        parts = [part for part in updated.get("PATH", "").split(os.pathsep) if part]
+        path_key = _env_key(updated, "PATH") or "PATH"
+        parts = [part for part in updated.get(path_key, "").split(os.pathsep) if part]
         if directory not in parts:
             parts = [directory, *parts]
-        updated["PATH"] = os.pathsep.join(parts) if parts else directory
+        updated[path_key] = os.pathsep.join(parts) if parts else directory
     return updated
 
 

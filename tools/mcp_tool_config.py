@@ -12,7 +12,7 @@ import sys
 import threading
 from typing import Any, Dict, List, Optional, Set, Tuple
 from hermes_cli.stderr_timestamp import stamp_line, timestamp
-from tools.mcp_tool_common import _env_ref_name, _prepend_path
+from tools.mcp_tool_common import _env_get, _env_key, _env_ref_name, _prepend_path
 
 logger = logging.getLogger("tools.mcp_tool")
 
@@ -184,8 +184,8 @@ def _which_with_config_pathext(command: str, path_arg, env: dict):
     extensions in order) but reads nothing from and writes nothing to ``os.environ``: swapping
     the parent's PATHEXT around a ``which`` call would publish this server's per-profile value
     to every other thread for the duration, and a ``finally``-restore cannot undo that window."""
-    cfg_pathext = next((v for k, v in env.items() if k.upper() == "PATHEXT" and isinstance(v, str) and v.strip()), None)
-    if not cfg_pathext or cfg_pathext == os.environ.get("PATHEXT"):
+    cfg_pathext = _env_get(env, "PATHEXT")
+    if not isinstance(cfg_pathext, str) or not cfg_pathext.strip() or cfg_pathext == os.environ.get("PATHEXT"):
         return None
     # PATHEXT is Windows-defined: ";"-separated even when resolved off-Windows
     exts = [ext for ext in cfg_pathext.split(";") if ext]
@@ -252,11 +252,12 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
         resolved_command, dirs = managed
         # Moved to the front even when already on PATH behind a user's copy.
         keys = {os.path.normcase(d) for d in dirs}
-        rest = [p for p in resolved_env.get("PATH", "").split(os.pathsep) if p and os.path.normcase(p) not in keys]
-        resolved_env["PATH"] = os.pathsep.join([*dirs, *rest])
+        path_key = _env_key(resolved_env, "PATH") or "PATH"
+        rest = [p for p in resolved_env.get(path_key, "").split(os.pathsep) if p and os.path.normcase(p) not in keys]
+        resolved_env[path_key] = os.pathsep.join([*dirs, *rest])
         return resolved_command, resolved_env
     if os.sep not in resolved_command:
-        path_arg = resolved_env.get("PATH")
+        path_arg = _env_get(resolved_env, "PATH")
         which_hit = shutil.which(resolved_command, path=path_arg) if path_arg is not None else None
         if which_hit is None and sys.platform == "win32" and resolved_env:
             which_hit = _which_with_config_pathext(resolved_command, path_arg, resolved_env)
