@@ -1270,15 +1270,25 @@ def _apply_display_config(agent, _agent_cfg, platform):
 
 
 def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
-    """Scoping kwargs for ``MemoryManager.initialize_all`` (status_callback is CLI-only:
-    gateway status travels a different path and the indicator no-ops without it)."""
+    """Scoping and capability kwargs for ``MemoryManager.initialize_all``.
+
+    ``agent_context`` remains the legacy runtime identity. The additive ``auto_sync``
+    and ``tools_available`` booleans let providers suppress automatic persistence without
+    treating that policy as a decision to hide explicitly enabled provider tools.
+    ``status_callback`` remains CLI-only; gateway status travels through a separate path.
+    """
+    agent_context = platform if platform in ("cron", "subagent", "flush") else "primary"
     kwargs = {
         "session_id": agent.session_id,
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
-        # platform="cron" (scheduler) / "subagent" (delegate_task) → providers skip writes (MemoryProvider.initialize).
-        "agent_context": platform if platform in ("cron", "subagent") else "primary",
+        "agent_context": agent_context,
+        "auto_sync": agent_context == "primary",
     }
+    # Use the same session toolset gate as inject_memory_provider_tools(); it is
+    # independent of whether automatic provider writes are allowed in this context.
+    from agent.memory_manager import memory_provider_tools_exposed
+    kwargs["tools_available"] = memory_provider_tools_exposed(agent)
     if kwargs["platform"] == "cli":
         kwargs["warning_callback"] = agent._emit_warning
         kwargs["status_callback"] = agent._emit_status

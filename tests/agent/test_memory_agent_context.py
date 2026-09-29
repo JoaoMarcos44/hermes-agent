@@ -20,10 +20,13 @@ def _fake_agent():
 
 @pytest.mark.parametrize(
     ("platform", "expected"),
-    [("cron", "cron"), ("subagent", "subagent"), ("telegram", "primary"), (None, "primary")],
+    [("cron", "cron"), ("subagent", "subagent"), ("flush", "flush"), ("telegram", "primary"), (None, "primary")],
 )
 def test_agent_context_follows_the_platform(platform, expected):
-    assert _memory_provider_init_kwargs(_fake_agent(), platform)["agent_context"] == expected
+    kwargs = _memory_provider_init_kwargs(_fake_agent(), platform)
+    assert kwargs["agent_context"] == expected
+    assert kwargs["auto_sync"] is (expected == "primary")
+    assert kwargs["tools_available"] is True
 
 
 def test_cron_session_disables_supermemory_writes(tmp_path, monkeypatch):

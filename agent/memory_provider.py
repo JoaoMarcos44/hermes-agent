@@ -105,8 +105,15 @@ class MemoryProvider(ABC):
 
         kwargs always include ``hermes_home`` (profile-scoped storage; never hardcode
         ``~/.hermes``) and ``platform``; may include ``agent_context`` ("primary" |
-        "subagent" | "cron" | "flush" — skip writes for non-primary contexts),
-        ``agent_identity``, ``agent_workspace``, ``parent_session_id``, ``user_id``, ``user_id_alt``.
+        "subagent" | "cron" | "flush"), ``auto_sync`` (whether the host permits
+        automatic turn persistence in this context), and ``tools_available`` (whether
+        this session exposes the provider's explicit tools). ``auto_sync`` and
+        ``tools_available`` are independent: a cron session can disable automatic
+        writes while keeping configured tools available. ``agent_context`` remains
+        present for compatibility; legacy providers may keep using non-primary values to skip writes.
+        Newer providers should use ``auto_sync`` for that decision; all providers may ignore the
+        additive signals. Other optional fields include ``agent_identity``, ``agent_workspace``,
+        ``parent_session_id``, ``user_id``, ``user_id_alt``.
         """
 
     def unavailable_reason(self) -> str:

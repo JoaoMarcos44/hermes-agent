@@ -128,7 +128,9 @@ fields; callers may initialize a provider without an agent or a session database
 | `gateway_session_key` | Stable messaging-chat identity for per-chat session isolation. |
 | `user_id`, `user_id_alt`, `user_name`, `chat_id` | Gateway identity fields, included when present. |
 | `agent_identity` | Active profile name, when available. |
-| `agent_workspace`, `agent_context` | Runtime agent scope. `agent_workspace` is `hermes`; `agent_context` is `cron` for scheduler runs, `subagent` for `delegate_task` children, else `primary` — skip automatic writes for the non-primary values. |
+| `agent_workspace`, `agent_context` | Runtime agent scope. `agent_workspace` is `hermes`; `agent_context` is `cron` for scheduler runs, `subagent` for `delegate_task` children, else `primary`. The legacy field remains available to existing providers. |
+| `auto_sync` | Whether the host permits automatic turn persistence in this context. False for non-primary contexts; providers may further restrict it using their own configuration. This does not disable explicit provider tools. |
+| `tools_available` | Whether this session's toolset configuration exposes provider tools. Independent of `auto_sync`; a cron session may suppress automatic writes while keeping an enabled recall tool available. |
 
 Do not assume `os.getcwd()` identifies the conversation's workspace: one Desktop
 or gateway backend can serve several sessions. If `cwd` is absent and directory
