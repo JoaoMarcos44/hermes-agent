@@ -394,6 +394,44 @@ class TestSaveAndLoadRoundtrip:
         assert config_path.read_text(encoding="utf-8") == original
         assert list((tmp_path / "backups" / "config").glob("config.yaml.corrupt.*"))
 
+    def test_atomic_config_write_merges_partial_payload_into_hermes_home(self, _isolate_hermes_home):
+        """Partial config writes preserve omitted keys in the real hermes home."""
+        from hermes_cli.config import atomic_config_write, get_config_path
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        original = {f"k{i}": i for i in range(99)}
+        original["k0"] = {"keep": "existing", "nested": {"kept": True}}
+        config_path.write_text(yaml.safe_dump(original), encoding="utf-8")
+
+        atomic_config_write(
+            config_path,
+            {"skills": {"disabled": ["a"]}, "k0": {"nested": {"added": True}}},
+        )
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert len(saved) == 100, f"expected 100 keys after adding skills, got {len(saved)} keys"
+        expected = {**original, "skills": {"disabled": ["a"]}}
+        expected["k0"] = {"keep": "existing", "nested": {"kept": True, "added": True}}
+        assert saved == expected
+
+    def test_atomic_config_replace_intentionally_removes_keys(self, _isolate_hermes_home):
+        """Full-state replacement remains available when omission means deletion."""
+        from hermes_cli.config import atomic_config_replace, get_config_path
+
+        config_path = get_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            yaml.safe_dump({"model": {"default": "test-model"}, "plugins": {"enabled": ["a"]}}),
+            encoding="utf-8",
+        )
+
+        replacement = {"model": {"default": "test-model"}}
+        atomic_config_replace(config_path, replacement)
+
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == replacement
+
+
 class TestLoadEnvInlineComments:
     def test_unquoted_hash_is_a_comment_quoted_hash_is_data(self, tmp_path):
         """load_env is the one dotenv reader (agent.secret_scope.load_env_file): an unquoted ` #...` tail

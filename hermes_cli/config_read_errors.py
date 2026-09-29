@@ -114,9 +114,9 @@ def get_active_config_parse_failure() -> Optional[str]:
 class FailedConfigRead(dict):
     """The fail-open fallback a config reader serves when an existing config.yaml could not be read
     or parsed (``{}``, defaults or last-known-good). Readers use it like any dict; ``save_config`` /
-    ``atomic_config_write`` refuse to persist it. The writer merges by deletion, so saving a fallback
-    after one transient EMFILE/EIO replaced the whole file with the fallback plus the caller's edit.
-    A dict subclass so the refusal survives the load→mutate→save round trip at every call site."""
+    the config writer APIs refuse to persist it. A fallback is not authoritative state: saving it
+    after one transient EMFILE/EIO could overwrite or remove recoverable user values. A dict subclass
+    so the refusal survives the load→mutate→save round trip at every call site."""
 
     def __init__(self, data: Any = (), *, error: Exception):
         super().__init__(data)

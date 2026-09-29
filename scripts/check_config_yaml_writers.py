@@ -2,8 +2,10 @@
 """Fail when a ``config.yaml`` is written by anything but the comment-preserving writer.
 
 Every writer of ``~/.hermes/config.yaml`` (and ``profiles/*/config.yaml``) must go through
-``hermes_cli.config.atomic_config_write`` → ``utils.atomic_roundtrip_yaml_save`` (ruamel
-round-trip). A PyYAML dump (``yaml.dump`` / ``yaml.safe_dump`` / ``utils.atomic_yaml_write``)
+``hermes_cli.config.atomic_config_write`` (recursive partial merge) or
+``hermes_cli.config.atomic_config_replace`` (intentional full-state replacement) →
+``utils.atomic_roundtrip_yaml_save`` (ruamel round-trip). A PyYAML dump
+(``yaml.dump`` / ``yaml.safe_dump`` / ``utils.atomic_yaml_write``)
 of a config path re-serialises the parsed dict and destroys every user comment — the #92554
 class, which regressed several times because each new writer picked the plain dumper again.
 
@@ -14,7 +16,7 @@ Flags, in the scanned trees:
   ``get_config_path()``, ``_active_config_path()``, ``live_path``);
 * ``<config path>.write_text(... dump(...) ...)``;
 * any ``yaml.dump`` / ``yaml.safe_dump`` / ``atomic_yaml_write`` call inside ``hermes_cli/config.py``
-  or ``hermes_cli/config_*.py`` (the config system has exactly one writer).
+  or ``hermes_cli/config_*.py`` (the config system has one comment-preserving writer seam).
 
 Suppress a true false positive with ``# config-writer: ok — <why>`` on the call's line.
 
@@ -72,7 +74,7 @@ def scan_file(path: Path) -> list[str]:
         line = lines[node.lineno - 1]
         if SUPPRESS in line:
             return
-        problems.append(f"{rel}:{node.lineno}: {why} — route it through hermes_cli.config.atomic_config_write")
+        problems.append(f"{rel}:{node.lineno}: {why} — route it through the hermes_cli.config writer seam")
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):

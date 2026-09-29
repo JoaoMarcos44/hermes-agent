@@ -501,18 +501,19 @@ def _rt_value(value: Any) -> Any:
 
 
 def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict, *,
-                               extra_content_on_create: "str | None" = None) -> None:
-    """Persist a full config-state dict while preserving comments and ordering.
+                               extra_content_on_create: "str | None" = None,
+                               delete_missing: bool = True) -> None:
+    """Persist config state while preserving comments and ordering.
 
-    THE writer for ``config.yaml`` (every production caller reaches it through
-    ``hermes_cli.config.atomic_config_write``): the on-disk document is loaded through ruamel
-    round-trip mode and *new_state* is merged onto it, so comments, key order, quotes, blank
-    lines and readable Unicode survive. Only nodes whose value actually changed are reassigned;
-    an untouched scalar or list keeps its inline comments and formatting. Keys absent from
-    *new_state* are deleted ("explicit absence": ``cfg.pop(k)`` + save removes ``k`` from disk).
-    ``extra_content_on_create`` (commented example blocks) is appended only when the file is
-    being created — re-appending it on every rewrite is how the stock boilerplate replaced
-    users' own comments (#92554).
+    THE on-disk writer for ``config.yaml`` (production callers reach it through
+    ``hermes_cli.config.atomic_config_write`` or ``atomic_config_replace``): the document is loaded
+    through ruamel round-trip mode and *new_state* is merged onto it, so comments, key order, quotes,
+    blank lines and readable Unicode survive. Only nodes whose value actually changed are reassigned;
+    an untouched scalar or list keeps its inline comments and formatting. When ``delete_missing`` is
+    true, keys absent from *new_state* are deleted (``cfg.pop(k)`` + save removes ``k`` from disk);
+    the merge writer disables this to preserve omitted keys recursively. ``extra_content_on_create``
+    (commented example blocks) is appended only when the file is being created — re-appending it on
+    every rewrite is how the stock boilerplate replaced users' own comments (#92554).
     """
     from ruamel.yaml.comments import CommentedMap, CommentedSeq
     from hermes_cli.config import require_readable_config_before_write
@@ -554,8 +555,9 @@ def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict, *,
                 _merge_item(dst, key, value)
             else:
                 dst[key] = _rt_value(value)
-        for key in [k for k in dst if k not in src]:
-            del dst[key]
+        if delete_missing:
+            for key in [k for k in dst if k not in src]:
+                del dst[key]
 
     _merge(existing, new_state)
     _roundtrip_dump(path, yaml_rt, existing, extra_content=extra_content_on_create if creating else None)
