@@ -1208,9 +1208,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # restored — what next?", so a resumed turn should complete the interrupted work rather than acknowledge
     # (#57056).
     interactive_resume: bool = False
-    # Opt-in cap (chars) on tool outputs / tool-call arguments in the stored /v1/responses
-    # transcript; 0 = store verbatim (gateway.api_server.history_tool_output_max_chars, #82513).
-    _history_tool_output_max_chars: int = 0
+    # Explicit cap on tool outputs / arguments in persisted /v1/responses history; unset mirrors
+    # the response.completed trim, while an explicit 0 stores them verbatim (#82513).
+    _history_tool_output_max_chars: Optional[int] = None
 
     # Admission-gated OpenAI-compatible entry points (bodies live in the mixin).
     _handle_chat_completions = _admit_api_agent_request(OpenAICompatRoutesMixin._handle_chat_completions)
@@ -1259,8 +1259,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._last_resolved_model: Dict[str, str] = {}
         self._session_db_lock: Optional[asyncio.Lock] = None  # single-flight for lazy init
         self._max_concurrent_runs: int = self._resolve_max_concurrent_runs()  # 0 disables
-        self._history_tool_output_max_chars = self._resolve_api_server_int(
-            "history_tool_output_max_chars", default=0)
+        self._history_tool_output_max_chars = self._resolve_history_tool_output_max_chars()
         # In-flight _run_agent() turns (/v1/runs tracks its own via _active_run_tasks).
         # Concurrency cap shared across all agent-serving endpoints (/v1/chat/completions, /v1/responses,
         # /v1/runs, /api/sessions/{id}/chat[/stream]). Read from config.yaml
@@ -1397,6 +1396,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception:
             return default
         return max(0, value)
+
+    @staticmethod
+    def _resolve_history_tool_output_max_chars() -> Optional[int]:
+        """Explicit history override; None keeps the response.completed wire trim policy."""
+        try:
+            from hermes_cli.config import cfg_get
+            from hermes_cli.config_effective import load_user_config_effective
+            value = cfg_get(
+                load_user_config_effective(), "gateway", "api_server", "history_tool_output_max_chars")
+            return max(0, int(value)) if value is not None else None
+        except Exception:
+            return None
 
     @staticmethod
     def _metrics_day_key(timestamp: Optional[float] = None) -> str:

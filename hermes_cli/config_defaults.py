@@ -2230,12 +2230,10 @@ DEFAULT_CONFIG = {
             # /v1/runs beyond this get HTTP 429 + Retry-After, bounding CPU/memory/LLM-quota
             # exhaustion from a request flood. 0 = no cap.
             "max_concurrent_runs": 10,
-            # Cap (chars) on each tool output and tool-call argument string in the stored
-            # /v1/responses conversation history used for previous_response_id chaining. The
-            # stored history is cumulative, so a few large tool outputs can make one
-            # response_store.db write several hundred KB. 0 = store tool outputs verbatim
-            # (default: the capped text is what the model is replayed on the next turn).
-            "history_tool_output_max_chars": 0,
+            # Optional override for tool output/argument chars in stored /v1/responses history.
+            # When unset, snapshots use the response.completed trim policy; explicit 0 stores
+            # tool outputs verbatim, while positive values apply this custom cap.
+            "history_tool_output_max_chars": None,
         },
     },
     # Real-time token streaming to messaging platforms (gateway; restart after enabling). Off by

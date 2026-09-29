@@ -112,13 +112,15 @@ def _cap_text(text: str, keep: int) -> str:
     return text[:keep] + "...[" + str(len(text) - keep) + " more chars]"
 
 
-def _cap_history_tool_outputs(history: List[Dict[str, Any]], max_chars: int) -> List[Dict[str, Any]]:
-    """Copy of ``history`` with tool outputs and string tool-call arguments longer than
-    ``max_chars`` cut down. Only tool rows and ``tool_calls`` blobs change; user/assistant text
-    is left alone, and the agent's own transcript rows are never mutated (rows are copied).
-    Opt-in via gateway.api_server.history_tool_output_max_chars: a single stored snapshot
-    embeds the full cumulative history, so a few large tool outputs pushed one
-    response_store.db write to ~677 KB (#82513)."""
+def _cap_history_tool_outputs(
+        history: List[Dict[str, Any]], max_chars: Optional[int]) -> List[Dict[str, Any]]:
+    """Apply the configured history override, or mirror the wire trim when unset.
+
+    An explicit ``0`` preserves the full history; a positive value caps it using the existing
+    ``gateway.api_server.history_tool_output_max_chars`` behavior.
+    """
+    if max_chars is None:
+        return _trim_history_tool_outputs(history)
     if max_chars <= 0:
         return history
     out: List[Dict[str, Any]] = []
@@ -207,6 +209,48 @@ def _trim_tool_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         first["text"] = _cap_text(text, 500)
                         item["output"] = [first]
     return items
+
+
+def _trim_history_tool_outputs(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Apply the existing response.completed trim policy to persisted role messages."""
+    trimmed = list(history)
+    for index, message in enumerate(history):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            content = message.get("content")
+            if isinstance(content, str):
+                item = {
+                    "type": "function_call_output",
+                    "output": [{"type": "input_text", "text": content}],
+                }
+                _trim_tool_items([item])
+                trimmed_content = item["output"][0]["text"]
+                if trimmed_content != content:
+                    trimmed[index] = {**message, "content": trimmed_content}
+        elif message.get("role") == "assistant":
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            trimmed_calls = []
+            changed = False
+            for call in tool_calls:
+                function = call.get("function") if isinstance(call, dict) else None
+                if not isinstance(function, dict):
+                    trimmed_calls.append(call)
+                    continue
+                arguments = function.get("arguments")
+                projected_arguments = dict(arguments) if isinstance(arguments, dict) else arguments
+                item = {"type": "function_call", "arguments": projected_arguments}
+                _trim_tool_items([item])
+                trimmed_arguments = item.get("arguments")
+                if trimmed_arguments != arguments:
+                    call = {**call, "function": {**function, "arguments": trimmed_arguments}}
+                    changed = True
+                trimmed_calls.append(call)
+            if changed:
+                trimmed[index] = {**message, "tool_calls": trimmed_calls}
+    return trimmed
 
 
 class _ResponsesStream:
@@ -1239,15 +1283,15 @@ class OpenAICompatRoutesMixin:
     @staticmethod
     def _build_response_conversation_history(
         conversation_history: List[Dict[str, Any]], user_message: Any, result: Dict[str, Any],
-        final_response: Any, *, tool_output_max_chars: int = 0) -> List[Dict[str, Any]]:
+        final_response: Any, *, tool_output_max_chars: Optional[int] = None) -> List[Dict[str, Any]]:
         """Build the stored Responses transcript without duplicating history.
 
         A compressed transcript (``result["_compressed"]``) shares no input-history prefix, so
         turn-start detection fails; prepending the uncompressed history would bloat the stored
         context and re-trigger compression every request — it is stored as-is instead.
 
-        ``tool_output_max_chars`` > 0 caps tool outputs / tool-call argument blobs in the
-        stored copy (gateway.api_server.history_tool_output_max_chars; 0 = store verbatim).
+        When unset, tool outputs and arguments use the same trim policy as ``response.completed``.
+        An explicit ``tool_output_max_chars`` overrides that policy; ``0`` stores them verbatim.
         """
         from gateway.platforms.api_server import APIServerAdapter
         prior = list(conversation_history)
