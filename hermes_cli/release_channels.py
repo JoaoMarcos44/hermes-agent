@@ -287,7 +287,7 @@ class ChannelReader:
 
         # Channel reads are idempotent and precede the PM download path, so an explicit update
         # uses the same bounded transient-failure policy instead of a second retry classifier.
-        from pm.network import is_cloudflare_waf_block, retry_network
+        from pm.network import is_cloudflare_html_403, retry_network
 
         def read() -> bytes:
             with self.opener(Request(url, headers={"Cache-Control": "no-cache"}), timeout=30) as response:
@@ -301,9 +301,10 @@ class ChannelReader:
             if exc.code == 404:
                 raise ChannelNotFound(f"Channel object not found: {key}") from exc
             if (urlsplit(url).hostname == "hermes-assets.nousresearch.com"
-                    and is_cloudflare_waf_block(exc)):
+                    and is_cloudflare_html_403(exc)):
                 raise ChannelError(
-                    "Channel read blocked by the asset CDN's bot protection from this network (HTTP 403)"
+                    "Cloudflare returned an HTML 403 for the Hermes asset CDN. "
+                    "Try another network; if it persists, report the 403 to Nous infrastructure."
                 ) from exc
             raise ChannelError(f"Channel read unavailable: HTTP {exc.code}") from exc
         except (OSError, URLError) as exc:

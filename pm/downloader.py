@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from pm.network import is_cloudflare_waf_block, is_transient, retry_network
+from pm.network import is_cloudflare_html_403, is_transient, retry_network
 
 # GitHub's release-asset CDN (release-assets.githubusercontent.com, which
 # TUR's pool 302s to) 403s unknown tool UAs from CI runner IP ranges --
@@ -123,8 +123,11 @@ class DownloadTransportError(DownloadError):
             self.status in (401, 403, 404, 410) or is_transient(cause)
         )
         if (self.status == 403 and urllib.parse.urlsplit(url).hostname == "hermes-assets.nousresearch.com"
-                and is_cloudflare_waf_block(cause)):
-            reason = f"{cause}; blocked by the asset CDN's bot protection from this network"
+                and is_cloudflare_html_403(cause)):
+            reason = (
+                f"{cause}; Cloudflare returned an HTML 403 for the Hermes asset CDN. "
+                "Try another network; if it persists, report the 403 to Nous infrastructure"
+            )
         elif self.status in (401, 403):
             reason = f"{cause}; the host refused access"
         else:

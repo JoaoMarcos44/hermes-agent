@@ -146,26 +146,30 @@ def test_asset_cdn_cloudflare_403_has_actionable_network_diagnosis():
     from urllib.error import HTTPError
     from hermes_cli.release_channels import ChannelError, ChannelReader
 
-    def blocked_reader(base_url, server):
+    def blocked_reader(base_url, server, content_type="text/html; charset=UTF-8"):
         def opener(request, timeout):
             headers = Message()
             headers["Server"] = server
-            headers["Content-Type"] = "text/html; charset=UTF-8"
+            headers["Content-Type"] = content_type
             raise HTTPError(request.full_url, 403, "Forbidden", headers, None)
         return ChannelReader(base_url, opener=opener)
 
-    with pytest.raises(ChannelError, match="asset CDN's bot protection from this network"):
+    with pytest.raises(
+        ChannelError,
+        match=r"Cloudflare returned an HTML 403 for the Hermes asset CDN.*Try another network.*Nous infrastructure",
+    ):
         blocked_reader("https://hermes-assets.nousresearch.com", "cloudflare").read_bytes(
             "releases/channels/main.json"
         )
-    # Host and edge identity are both required: a Zscaler-style 403 and an
+    # Host and response identity are both required: a Zscaler-style 403 and an
     # unrelated Cloudflare origin keep the generic fail-closed diagnosis.
-    for base_url, server in [
-        ("https://hermes-assets.nousresearch.com", "Zscaler"),
-        ("https://releases.example", "cloudflare"),
+    for base_url, server, content_type in [
+        ("https://hermes-assets.nousresearch.com", "Zscaler", "text/html"),
+        ("https://releases.example", "cloudflare", "text/html"),
+        ("https://hermes-assets.nousresearch.com", "cloudflare", "application/json"),
     ]:
         with pytest.raises(ChannelError, match=r"Channel read unavailable: HTTP 403$"):
-            blocked_reader(base_url, server).read_bytes("releases/channels/main.json")
+            blocked_reader(base_url, server, content_type).read_bytes("releases/channels/main.json")
 
 
 def test_reader_rejects_cycles_identity_substitution_and_cross_authority():

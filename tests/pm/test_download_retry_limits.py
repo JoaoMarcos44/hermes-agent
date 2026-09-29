@@ -119,7 +119,9 @@ def test_asset_cdn_cloudflare_403_names_network_block_without_changing_fallback_
     headers["Content-Type"] = "text/html; charset=UTF-8"
     blocked = DownloadTransportError(asset, HTTPError(asset, 403, "Forbidden", headers, None))
     assert blocked.status == 403 and blocked.fallback_allowed
-    assert "blocked by the asset CDN's bot protection from this network" in str(blocked)
+    assert "Cloudflare returned an HTML 403 for the Hermes asset CDN" in str(blocked)
+    assert "Try another network" in str(blocked)
+    assert "Nous infrastructure" in str(blocked)
 
     # A generic/proxy 403 keeps the existing wording and fallback behavior.
     proxy_headers = Message()
