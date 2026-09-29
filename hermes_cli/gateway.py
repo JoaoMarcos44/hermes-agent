@@ -1122,31 +1122,33 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
         except Exception:
             pass
 
-        # Platform-appropriate detach for the respawned gateway: POSIX start_new_session (setsid);
-        # Windows needs explicit creationflags. CREATE_BREAKAWAY_FROM_JOB is critical: the watcher may
-        # itself sit inside a job object (Electron/Tauri parent) and without breakaway the respawned
-        # gateway dies when that job tears down. See _subprocess_compat.windows_detach_flags().
+        # A breakaway flag can be accepted while a nested Job Object still owns this watcher.
+        # Delegate from any job to Task Scheduler, whose service outlives the updater's job.
         _popen_kwargs = {{"stdout": _stdio_target, "stderr": _stdio_target}}
-        # Anchor at the stable working dir and overlay the env (VIRTUAL_ENV / PYTHONPATH /
-        # HERMES_HOME) the windowless base interpreter needs to import hermes_cli. Empty on POSIX.
         if _respawn_cwd:
             _popen_kwargs["cwd"] = _respawn_cwd
         _base_env = {{**os.environ, **_respawn_env_overlay}}
         try:
             if sys.platform == "win32":
-                try:
-                    _popen_kwargs["creationflags"] = windows_detach_flags()
-                    # Stamp the breakaway state exactly like gateway_windows._spawn_detached so the
-                    # respawned gateway's exit-diag / lifecycle records show whether it escaped the
-                    # parent Job Object (a job-teardown kill is otherwise indistinguishable).
-                    _popen_kwargs["env"] = {{**_base_env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1"}}
-                    subprocess.Popen(cmd, **_popen_kwargs)
-                except OSError:
-                    # CREATE_BREAKAWAY_FROM_JOB is rejected with ERROR_ACCESS_DENIED when the parent's
-                    # job object refuses breakaway; retry without it (mirrors _spawn_detached).
-                    _popen_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
-                    _popen_kwargs["env"] = {{**_base_env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}}
-                    subprocess.Popen(cmd, **_popen_kwargs)
+                from hermes_cli._subprocess_compat import process_is_in_job
+                if process_is_in_job():
+                    from hermes_cli.gateway_windows import _spawn_gateway_via_transient_task
+                    try:
+                        _spawn_gateway_via_transient_task(cmd, _respawn_cwd, _respawn_env_overlay)
+                    except Exception as _error:
+                        if _stdio_fh is not None:
+                            _stdio_fh.write(("[watcher] Job Object handoff failed: " + str(_error) + "\\n").encode("utf-8", "replace"))
+                        raise
+                else:
+                    try:
+                        _popen_kwargs["creationflags"] = windows_detach_flags()
+                        _popen_kwargs["env"] = {{**_base_env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "1"}}
+                        subprocess.Popen(cmd, **_popen_kwargs)
+                    except OSError:
+                        # With no enclosing job, retrying without breakaway cannot be reaped by it.
+                        _popen_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
+                        _popen_kwargs["env"] = {{**_base_env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}}
+                        subprocess.Popen(cmd, **_popen_kwargs)
             else:
                 if _respawn_env_overlay:
                     _popen_kwargs["env"] = _base_env

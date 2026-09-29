@@ -9,10 +9,15 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import sysconfig
 import threading
 
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
+} | {
+    # Python may keep stdlib source under a stable ABI directory whose name omits the patch
+    # version, while sys.base_prefix points at the versioned runtime directory.
+    Path(sysconfig.get_path("stdlib")).resolve(),
 } | {
     # A PM-activated developer shell runs sys.prefix's python against a dependency generation
     # whose site-packages sits under the (real) Hermes home; third-party imports from it are the

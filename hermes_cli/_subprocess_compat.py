@@ -24,6 +24,7 @@ __all__ = [
     "suppress_platform_ver_console",
     "windows_detach_flags",
     "windows_detach_flags_without_breakaway",
+    "process_is_in_job",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
     "bounded_git_probe",
@@ -206,6 +207,26 @@ def windows_detach_flags_without_breakaway() -> int:
     if not IS_WINDOWS:
         return 0
     return _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW
+
+
+def process_is_in_job() -> bool:
+    """Whether this process belongs to a Windows Job Object; false on other platforms."""
+    if not IS_WINDOWS:
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.restype = wintypes.HANDLE
+    is_process_in_job = kernel32.IsProcessInJob
+    is_process_in_job.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    is_process_in_job.restype = wintypes.BOOL
+    in_job = wintypes.BOOL()
+    if not is_process_in_job(get_current_process(), None, ctypes.byref(in_job)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return bool(in_job.value)
 
 
 def windows_hide_flags() -> int:

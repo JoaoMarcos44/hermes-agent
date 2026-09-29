@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -178,6 +179,15 @@ def _quote_vbs_string(value: str) -> str:
     if "\r" in value or "\n" in value:
         raise ValueError(f"refusing to quote VBScript value containing newline: {value!r}")
     return '"' + value.replace('"', '""') + '"'
+
+
+def _quote_vbs_command_line(value: str) -> str:
+    """VBScript expression preserving command-line newlines as ``vbCrLf``/``vbLf`` values."""
+    parts = re.split(r"(\r\n|\r|\n)", value)
+    return " & ".join(
+        {"\r\n": "vbCrLf", "\r": "vbCr", "\n": "vbLf"}.get(part, _quote_vbs_string(part))
+        for part in parts
+    )
 
 
 # ── schtasks.exe wrapper
@@ -593,6 +603,115 @@ def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, st
     if delete_detail:
         last_err = f"{last_err.strip()} (delete detail: {delete_detail})"
     return (False, f"schtasks /Create failed (code {last_code}): {last_err.strip()}")
+
+
+def _build_update_handoff_vbs(
+    argv: list[str], working_dir: str, env_overlay: dict[str, str], started_path: Path,
+) -> str:
+    """Render a one-shot WScript launcher for an exact post-update gateway argv."""
+    quote = _quote_vbs_string
+    lines = [
+        "Option Explicit",
+        "Dim sh, env, fso, marker",
+        'Set sh = CreateObject("WScript.Shell")',
+        'Set env = sh.Environment("PROCESS")',
+        *[f"env.Item({quote(key)}) = {quote(value)}" for key, value in env_overlay.items()],
+        # Task Scheduler, not the gateway process, owns this handoff, so no Popen breakaway stamp applies.
+        f"env.Item({quote(_WINDOWS_GATEWAY_BREAKAWAY_ENV)}) = {quote('')}",
+    ]
+    if working_dir:
+        lines.append(f"sh.CurrentDirectory = {quote(working_dir)}")
+    lines.extend([
+        f"sh.Run {quote(subprocess.list2cmdline(argv))}, 0, False",
+        'Set fso = CreateObject("Scripting.FileSystemObject")',
+        f"Set marker = fso.CreateTextFile({quote(str(started_path))}, True)",
+        'marker.WriteLine "started"',
+        "marker.Close",
+    ])
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _build_update_handoff_task_xml(launcher_path: Path, user: str | None) -> str:
+    """An on-demand-only task: no logon trigger or persistent autostart side effect."""
+    user_id = f"<UserId>{escape(user)}</UserId>" if user else ""
+    arguments = escape(f'//B //Nologo "{launcher_path}"')
+    return f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Hermes gateway post-update handoff</Description></RegistrationInfo>
+  <Triggers />
+  <Principals><Principal id="Author">{user_id}
+    <LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>
+  </Principal></Principals>
+  <Settings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>wscript.exe</Command><Arguments>{arguments}</Arguments></Exec></Actions>
+</Task>
+'''
+
+
+def _spawn_gateway_via_transient_task(
+    argv: list[str], working_dir: str, env_overlay: dict[str, str], *, timeout_s: float = 30.0,
+) -> None:
+    """Hand a gateway start to Task Scheduler when this watcher belongs to a Job Object.
+
+    Task Scheduler starts the launcher outside the updater's Job Object. The temporary task has no
+    trigger, uses the exact respawn argv, and is removed after WScript confirms the command was
+    launched. Environment values are limited to the non-secret runtime overlay; credentials remain
+    profile-scoped in HERMES_HOME rather than being written into a task or launcher file.
+    """
+    _assert_windows()
+    if not argv:
+        raise ValueError("gateway handoff requires a command")
+
+    task_name = f"Hermes_Update_Handoff_{os.getpid()}_{uuid.uuid4().hex[:12]}"
+    task_dir = Path(tempfile.mkdtemp(prefix="hermes-gateway-handoff-"))
+    launcher_path = task_dir / "gateway.vbs"
+    xml_path = task_dir / "task.xml"
+    started_path = task_dir / "started.marker"
+    registered = False
+    try:
+        launcher_path.write_text(
+            _build_update_handoff_vbs(argv, working_dir, env_overlay, started_path),
+            encoding="utf-16",
+            newline="",
+        )
+        user = _resolve_task_user()
+        xml_path.write_text(
+            _build_update_handoff_task_xml(launcher_path, user), encoding="utf-16", newline=""
+        )
+        base = ["/Create", "/F", "/TN", task_name, "/XML", str(xml_path)]
+        variants = [[*base, "/RU", user, "/NP", "/IT"], base] if user else [base]
+        last_detail = ""
+        for args in variants:
+            code, out, err = _exec_schtasks(args)
+            if code == 0:
+                registered = True
+                break
+            last_detail = (err or out or f"exit code {code}").strip()
+        if not registered:
+            raise RuntimeError(f"could not register temporary gateway handoff task: {last_detail}")
+
+        code, out, err = _exec_schtasks(["/Run", "/TN", task_name])
+        if code != 0:
+            raise RuntimeError(f"could not run temporary gateway handoff task: {(err or out).strip()}")
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if started_path.is_file():
+                return
+            time.sleep(0.05)
+        raise RuntimeError(f"temporary gateway handoff task did not launch within {timeout_s}s")
+    finally:
+        if registered:
+            code, out, err = _exec_schtasks(["/Delete", "/F", "/TN", task_name])
+            if code != 0:
+                logger.warning(
+                    "Could not remove temporary gateway handoff task %s: %s",
+                    task_name,
+                    (err or out).strip(),
+                )
+        shutil.rmtree(task_dir, ignore_errors=True)
 
 
 def _install_startup_entry(script_path: Path) -> Path:
