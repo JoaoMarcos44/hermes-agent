@@ -359,8 +359,28 @@ class SlashCommandCompleter(Completer):
                 if not expanded or expanded == ".":
                     expanded = "./"
                 # `@folder:` = dirs only, `@file:` = files only (else `@folder:` lists dotfiles).
+                def text_for(fp: str) -> str:
+                    try:
+                        return f"{prefix}{os.path.relpath(fp)}"
+                    except ValueError:
+                        # A `\\?\\C:\\` path and plain `C:\\` cwd name the same drive, but
+                        # Windows treats them as different mounts. Normalize only drive paths;
+                        # UNC/device namespace paths must keep their safety-sensitive spelling.
+                        normal_path = fp[4:] if os.name == "nt" and fp.startswith("\\\\?\\") else ""
+                        if (
+                            len(normal_path) >= 3
+                            and normal_path[0] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                            and normal_path[1] == ":"
+                            and normal_path[2] in "\\/"
+                        ):
+                            try:
+                                return f"{prefix}{os.path.relpath(normal_path)}"
+                            except ValueError:
+                                return f"{prefix}{normal_path}"
+                        return f"{prefix}{fp}"
+
                 yield from _dir_completions(
-                    expanded, word, limit, lambda fp: f"{prefix}{os.path.relpath(fp)}",
+                    expanded, word, limit, text_for,
                     want_dir=(prefix == "@folder:"))
                 return
         yield from self._fuzzy_file_completions(word, word[1:], limit)

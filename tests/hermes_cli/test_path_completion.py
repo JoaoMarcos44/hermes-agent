@@ -109,8 +109,49 @@ class TestIntegration:
         assert list(completer.get_completions(doc, event)) == []
 
 
+class TestExplicitAtPathCompletion:
+    @pytest.mark.skipif(os.name != "nt", reason="requires a real Windows extended-length path")
+    def test_extended_drive_file_completion_is_workspace_relative_and_attachable(
+        self, tmp_path, monkeypatch, _isolate_hermes_home,
+    ):
+        from agent.context_references import preprocess_context_references
+
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "extended-file.txt"
+        target.write_text("extended file content", encoding="utf-8")
+        extended = chr(92) * 2 + "?" + chr(92) + str(target)
+        assert os.path.isfile(extended), extended
+
+        completions = list(SlashCommandCompleter()._context_completions("@file:" + extended))
+        suggestion = next(c.text for c in completions if c.text.endswith(target.name))
+        assert suggestion == "@file:" + target.name
+
+        result = preprocess_context_references(suggestion, cwd=tmp_path, context_length=8192)
+        assert result.expanded and "extended file content" in result.message, result
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires a real Windows extended-length path")
+    def test_extended_drive_folder_completion_is_workspace_relative_and_attachable(
+        self, tmp_path, monkeypatch, _isolate_hermes_home,
+    ):
+        from agent.context_references import preprocess_context_references
+
+        monkeypatch.chdir(tmp_path)
+        root = tmp_path / "extended-folder"
+        child = root / "child-folder"
+        child.mkdir(parents=True)
+        (child / "inside.txt").write_text("inside", encoding="utf-8")
+        extended = chr(92) * 2 + "?" + chr(92) + str(root) + os.sep
+        assert os.path.isdir(extended), extended
+
+        completions = list(SlashCommandCompleter()._context_completions("@folder:" + extended))
+        suggestion = next(c.text for c in completions if c.text.endswith("child-folder/"))
+        expected = "@folder:" + os.path.join("extended-folder", "child-folder") + "/"
+        assert suggestion == expected
+
+        result = preprocess_context_references(suggestion, cwd=tmp_path, context_length=8192)
+        assert result.expanded and "inside.txt" in result.message, result
+
+
 class TestFileSizeLabel:
-
-
     def test_nonexistent(self):
         assert _file_size_label("/nonexistent_xyz") == ""
