@@ -1207,8 +1207,12 @@ class GatewayBusySessionMixin:
         try:
             marker_path = _hermes_home / ".restart_last_processed.json"
             if not marker_path.exists():
+                # This fallback is specifically for Telegram's restart-on-redelivery loop
+                # (#18528). Native interaction transports must not consume the Telegram
+                # one-shot boot flag just because they also carry a delivery identity.
                 if (
-                    getattr(self, "_booted_from_restart", False)
+                    platform == "telegram"
+                    and getattr(self, "_booted_from_restart", False)
                     and time.time() - getattr(self, "_startup_time", 0.0) < 60
                 ):
                     self._booted_from_restart = False

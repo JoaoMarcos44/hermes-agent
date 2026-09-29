@@ -246,3 +246,33 @@ async def test_marker_missing_but_booted_from_restart_ignores_redelivery(tmp_pat
     assert runner._booted_from_restart is False
 
 
+def test_marker_missing_non_telegram_preserves_telegram_boot_guard(tmp_path, monkeypatch):
+    """A native restart must not consume Telegram's no-marker one-shot fallback."""
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, _adapter = make_restart_runner()
+    runner._booted_from_restart = True
+    runner._startup_time = time.time()
+
+    slack_event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="group",
+            user_id="U1",
+        ),
+        platform_delivery_id="slack-trigger-capability",
+    )
+
+    assert runner._is_stale_restart_redelivery(slack_event) is False
+    assert runner._booted_from_restart is True
+
+    assert runner._is_stale_restart_redelivery(_make_restart_event(update_id=100)) is True
+    assert runner._booted_from_restart is False
+
+
