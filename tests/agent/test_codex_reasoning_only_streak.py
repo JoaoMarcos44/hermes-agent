@@ -135,3 +135,22 @@ def test_cross_protocol_fallback_wire_drops_codex_nudge_and_replay_state(monkeyp
     assert not any(m.get("codex_reasoning_items") for m in wire)
     roles = [m["role"] for m in wire]
     assert roles and all(a != b for a, b in zip(roles, roles[1:]))
+
+
+def test_visible_progress_continues_through_ten_incomplete_responses(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    continuation_count = 10
+    agent.max_iterations = continuation_count + 1
+    agent.iteration_budget = run_agent.IterationBudget(agent.max_iterations)
+    responses = [
+        _codex_incomplete_message_response(f"Progress {attempt}")
+        for attempt in range(1, continuation_count + 1)
+    ]
+    responses.append(_codex_message_response("Completed after ten continuations."))
+    api_calls = _drive(agent, monkeypatch, responses)
+
+    result = agent.run_conversation("continue the task")
+
+    assert result["completed"] is True, result.get("final_response")
+    assert result["final_response"] == "Completed after ten continuations."
+    assert api_calls["n"] == agent.max_iterations

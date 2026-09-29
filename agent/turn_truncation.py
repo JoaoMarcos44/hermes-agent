@@ -536,6 +536,11 @@ _CODEX_REPLAY_KEYS = (
     "codex_reasoning_items", "codex_message_items",
 )
 
+# Separate the documented progress allowance from the no-progress fallback tripwire.
+# The outer turn iteration budget remains the hard bound on all API calls.
+_CODEX_PROGRESS_CONTINUATION_LIMIT = 10
+_CODEX_REASONING_ONLY_FALLBACK_STREAK = 3
+
 # Third return value of ``continue_codex_incomplete``: the reasoning-only stall was handed to a
 # fallback provider — the caller re-syncs the system prompt identity and continues the turn.
 CODEX_FALLBACK_ACTIVATED = "codex_fallback_activated"
@@ -545,7 +550,7 @@ def continue_codex_incomplete(
     agent: Any, assistant_message: Any, finish_reason: str, *, messages: List[Dict[str, Any]],
     conversation_history: Any, api_call_count: int, response: Any = None,
 ) -> Optional[Any]:
-    """Codex Responses ``status=incomplete`` continuation (max 3 per turn).
+    """Codex Responses ``status=incomplete`` continuation (up to 10 progress-bearing replies).
 
     Appends the interim assistant message (deduped on visible content only — opaque
     provider state drifts per continuation; ``codex_reasoning_items`` are merged, not
@@ -553,16 +558,19 @@ def continue_codex_incomplete(
     checkpoint) and, when a bare retry would be byte-identical, a user-role nudge — only
     after an assistant row, to preserve role alternation. Returns ``None`` to continue
     the turn loop, ``CODEX_FALLBACK_ACTIVATED`` when a reasoning-only stall was handed to
-    the next fallback provider, or the terminal ``partial`` result once retries are exhausted.
+    the next fallback provider, or the terminal ``partial`` result once the bounded
+    progress allowance is exhausted.
 
-    Reasoning-only stall ladder (#67321): a response with neither visible text nor a tool
-    call advances ``_codex_reasoning_only_streak`` (a visible partial resets it; the aggregate
-    ``_codex_incomplete_retries`` stays the cap for partials). Encrypted reasoning replays
-    byte-for-byte, so after replay (1) and nudge (2) the third consecutive reasoning-only
-    response goes to the configured fallback with the semantic ``incomplete_response`` reason
-    instead of ending on the sentinel; when that response consumed the last iteration the
-    fallback gets exactly one grace call (``_budget_grace_call`` is consumed by the next
-    iteration, and the streak restarts from 0, so a second grace call is unreachable).
+    Reasoning-only stall ladder (#67321): a response with neither visible progress nor a
+    tool call advances ``_codex_reasoning_only_streak`` (visible progress resets it). The
+    aggregate ``_codex_incomplete_retries`` allows the progress-bearing continuation path to
+    run through ``_CODEX_PROGRESS_CONTINUATION_LIMIT`` incomplete replies; a three-response
+    reasoning-only streak instead takes the separate fallback exit. The outer turn iteration
+    budget remains the hard bound. Encrypted reasoning replays byte-for-byte, so after replay
+    (1) and nudge (2) the third consecutive reasoning-only response goes to the configured
+    fallback with semantic ``incomplete_response`` instead of the sentinel. If the trigger
+    consumed the last iteration, fallback receives exactly one grace call; the streak resets,
+    so a second grace call is unreachable.
 
     When ``response`` hit ``max_output_tokens`` with no visible text (reasoning ate the
     whole budget), the next attempt goes out with reasoning off and a doubled output
@@ -616,7 +624,7 @@ def continue_codex_incomplete(
             append_message(messages, interim_msg)
             agent._emit_interim_assistant_message(interim_msg)
 
-    if reasoning_only and streak >= 3:
+    if reasoning_only and streak >= _CODEX_REASONING_ONLY_FALLBACK_STREAK:
         if agent._try_activate_fallback(reason=FailoverReason.incomplete_response):
             # The trigger may have consumed the turn budget; without a grace call the loop
             # exits before the fallback is ever asked.
@@ -633,9 +641,9 @@ def continue_codex_incomplete(
             agent._session_messages = messages
             return CODEX_FALLBACK_ACTIVATED
         # No fallback left: fall through to the terminal sentinel.
-    elif n < 3 or reasoning_only:
-        # A reasoning-only streak below 3 continues even once partials used up the aggregate
-        # cap, so the mixed partial-then-stall variant reaches the ladder above.
+    elif n <= _CODEX_PROGRESS_CONTINUATION_LIMIT or reasoning_only:
+        # A reasoning-only streak below its fallback threshold continues even once
+        # progress used up the aggregate allowance, so mixed turns can reach the ladder.
         # If the interim has nothing the Responses converter will replay, a bare retry is
         # byte-identical; a replayable interim holding only a ``compaction`` checkpoint
         # ALSO re-sends identically. One bare retry, then always nudge.
@@ -658,8 +666,18 @@ def continue_codex_incomplete(
             agent._ephemeral_max_output_tokens = boosted_output_cap(
                 agent, None, n, base=agent.max_tokens or int(observed or 0) or 4096
             )
+        _attempt_count = streak if reasoning_only else n
+        _attempt_limit = (
+            _CODEX_REASONING_ONLY_FALLBACK_STREAK
+            if reasoning_only
+            else _CODEX_PROGRESS_CONTINUATION_LIMIT
+        )
         if not agent.quiet_mode:
-            agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({n}/3)", diagnostic=True)
+            agent._vprint(
+                f"{agent.log_prefix}↻ Codex response incomplete; continuing turn "
+                f"({_attempt_count}/{_attempt_limit})",
+                diagnostic=True,
+            )
         # Spinner/heartbeat notice: these retries can take minutes and otherwise look
         # like infinite thinking.
         # #70773: same FD-recycle corruption vector as #67142. The shared OpenAI client's connection pool
@@ -670,9 +688,12 @@ def continue_codex_incomplete(
         # Surface the continuation on the live spinner/status line (CLI/TUI/Desktop) and gateway heartbeat:
         # each of these retries can spend minutes waiting on the provider, and without a distinct notice the
         # user only sees a generic thinking spinner ("infinite thinking", #64434).
-        agent._emit_diagnostic_wait(
-            f"↻ model returned reasoning with no final answer — asking it to continue ({n}/3)"
+        _wait_copy = (
+            "↻ model returned reasoning with no final answer — asking it to continue"
+            if reasoning_only
+            else "↻ model returned progress without a final answer — asking it to continue"
         )
+        agent._emit_diagnostic_wait(f"{_wait_copy} ({_attempt_count}/{_attempt_limit})")
         agent._session_messages = messages
         return None
 
@@ -680,7 +701,8 @@ def continue_codex_incomplete(
     agent._codex_reasoning_only_streak = 0
     agent._persist_session(messages, conversation_history)
     return partial_result(
-        messages, api_call_count, "Codex response remained incomplete after 3 continuation attempts"
+        messages, api_call_count,
+        f"Codex response remained incomplete after {n} continuation attempts",
     )
 
 
