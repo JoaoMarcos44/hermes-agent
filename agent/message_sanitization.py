@@ -299,6 +299,25 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     return True
 
 
+SCHEDULED_HEARTBEAT_METADATA_KEY = "scheduled_heartbeat"
+
+
+def is_operational_notification_user_turn(message: Any) -> bool:
+    """Whether a typed internal-notification user row is an operational event, not a
+    scheduled prompt. The gateway stamps ``display_kind`` from MessageEvent provenance;
+    heartbeat prompts use the same display kind but carry an explicit marker because the
+    model must still receive their prompt. Never infer provenance from message text."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    if message.get("display_kind") != "internal_notification":
+        return False
+    metadata = message.get("display_metadata")
+    return not (
+        isinstance(metadata, dict)
+        and metadata.get(SCHEDULED_HEARTBEAT_METADATA_KEY) is True
+    )
+
+
 # finish_reason wire normalization. Some OpenAI-compatible gateways fronting
 # Gemini backends emit the native uppercase reasons (STOP, MAX_TOKENS); every
 # downstream comparison uses the lowercase OpenAI literals, so an uppercase
@@ -447,6 +466,7 @@ def _looks_like_corrupt_image_rejection(error_body: str) -> bool:
 
 __all__ = [
     "_SURROGATE_RE", "close_interrupted_tool_sequence",
+    "SCHEDULED_HEARTBEAT_METADATA_KEY", "is_operational_notification_user_turn",
     "_sanitize_surrogates", "_sanitize_structure_surrogates", "_sanitize_messages_surrogates",
     "coerce_tool_name",
     "_escape_invalid_chars_in_json_strings", "_repair_tool_call_arguments",

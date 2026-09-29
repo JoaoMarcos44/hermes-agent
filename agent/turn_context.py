@@ -1219,8 +1219,22 @@ def build_api_messages(
     split = current_turn_user_idx if has_current else 0
     canonical_messages = canonicalize_replay_history(messages[:split], now=turn_now) + messages[split:]
 
+    # Suppress only the operational event that triggered this turn. Historical rows
+    # already belong to the provider's cached prefix and must replay byte-for-byte.
+    from agent.message_sanitization import is_operational_notification_user_turn
+
+    wire_messages = []
+    for msg in canonical_messages:
+        if msg is current_turn_message and is_operational_notification_user_turn(msg):
+            operational_context = compose_multimodal_context_part(
+                ext_prefetch_cache, plugin_user_context
+            )
+            if operational_context:
+                wire_messages.append({"role": "user", "content": operational_context})
+            continue
+        wire_messages.append(msg)
     api_messages = []
-    for idx, msg in enumerate(canonical_messages):
+    for idx, msg in enumerate(wire_messages):
         # Structural clone, NOT msg.copy(): in-place transforms below must not reach
         # persisted history via nested containers; see _clone_message_for_send.
         api_msg = _clone_message_for_send(msg)
@@ -1266,7 +1280,7 @@ def build_api_messages(
         # Fill empty non-final user/assistant wire copies so the pre-call sanitizer
         # stops re-healing and flooding errors.log; durable history is untouched.
         # After the reasoning copy so thinking-only turns keep payload.
-        fill_empty_non_final_wire_payload(api_msg, is_final=(idx == len(canonical_messages) - 1))
+        fill_empty_non_final_wire_payload(api_msg, is_final=(idx == len(wire_messages) - 1))
         # _thinking_prefill survives intentionally: the drop pass below needs it.
         # Strip length-continuation marks; some transports keep underscore keys.
         api_msg.pop("_length_continuation_fragment", None)
