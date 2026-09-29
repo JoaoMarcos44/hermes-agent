@@ -85,3 +85,46 @@ def test_developer_checkout_skips_managed_runtime_warning(tmp_path, monkeypatch)
     (checkout / ".git").mkdir(parents=True)
     monkeypatch.setattr(pm, "activate", lambda: pytest.fail("dev checkout activated managed runtime"))
     assert venv_sync.check_runtime(checkout) is None
+
+
+
+def test_detached_source_completion_keeps_marker_ownership_across_reexec(tmp_path, monkeypatch):
+    root = tmp_path / "checkout"
+    completion = root / "hermes_cli" / "source_completion.py"
+    completion.parent.mkdir(parents=True)
+    completion.write_text("# test checkout\n", encoding="utf-8")
+
+    forwarded = []
+    monkeypatch.setattr(
+        source_completion,
+        "_bootstrap_command",
+        lambda _root, argv: forwarded.extend(argv) or ["python", "completion-child"],
+    )
+    monkeypatch.setattr("pm.environments.activation_environment", lambda _root: {})
+    monkeypatch.setattr(source_completion.subprocess, "call", lambda *_args, **_kwargs: 0)
+
+    assert source_completion.main([
+        "--source", str(root),
+        "--finish-update",
+        "--desktop",
+        "--clear-pending-on-success",
+    ]) == 0
+    assert set(forwarded) == {"--finish-update", "--desktop", "--clear-pending-on-success"}
+
+    cleared = []
+    monkeypatch.setattr(venv_sync, "clear_completion", lambda target: cleared.append(target))
+    for complete, expected_code in ((False, 1), (True, 0)):
+        monkeypatch.setattr(
+            source_completion,
+            "complete_source_checkout",
+            lambda *_args, _complete=complete, **_kwargs: _complete,
+        )
+        cleared.clear()
+        assert source_completion.main([
+            "--source", str(root),
+            "--finish-update",
+            "--desktop",
+            "--clear-pending-on-success",
+            source_completion._PREPARED,
+        ]) == expected_code
+        assert cleared == ([root.resolve()] if complete else [])

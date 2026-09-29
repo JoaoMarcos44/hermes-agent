@@ -25,6 +25,7 @@
 #     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
 #     [-NoUi]               headless (tests); default shows a progress window
 #     [-NoMarkerCleanup]    leave .hermes-update-in-progress in place (tests)
+#     [-FinishSourceCompletion] finish an already-pending source tail, then relaunch
 #
 # SAFETY POSTURE: both preflight gates FAIL CLOSED. A Desktop that never
 # exits, or a venv shim that never unlocks, aborts the hand-off without
@@ -51,6 +52,8 @@ param(
     [switch]$NoUi,
     [switch]$NoMarkerCleanup,
     [switch]$NoGateway,
+    [switch]$FinishSourceCompletion,
+    [string]$SourceCompletionFallbackPath = "",
     [switch]$SelfTestUi,
     [switch]$SelfTestPipeDrain,
     [switch]$SelfTestMarker,
@@ -143,6 +146,23 @@ function Write-HandoffLog([string]$Message) {
     try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
     if ($script:ConsoleInput -and [HermesHandoff.ConsoleInput]::Selecting()) { return }
     Write-Host $line
+}
+
+function Write-SourceCompletionFallback {
+    if (-not $FinishSourceCompletion -or -not $SourceCompletionFallbackPath) { return }
+    try {
+        $parent = Split-Path -Parent $SourceCompletionFallbackPath
+        if ($parent) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText(
+            $SourceCompletionFallbackPath,
+            ("detached source completion failed at {0}`n" -f [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()),
+            $utf8
+        )
+        Write-HandoffLog "latched in-process source-completion fallback"
+    } catch {
+        Write-HandoffLog "WARNING: could not latch source-completion fallback: $($_.Exception.Message)"
+    }
 }
 
 # ── The shim: repo-owned HTML in a chromeless default-browser app window ───
@@ -1572,8 +1592,16 @@ try {
 
     . (Join-Path $PSScriptRoot 'runtime.ps1')
     $legacyInstall = -not (Test-Path -LiteralPath (Join-Path $InstallRoot 'pm') -PathType Container)
+    $runtimeCommand = @()
+    $completionCommand = @()
     try {
-        $runtimeCommand = @(Get-HermesRuntimeCommand -InstallRoot $InstallRoot)
+        if ($FinishSourceCompletion) {
+            # Resolve the exact installation runtime BEFORE asking Desktop to
+            # exit. A broken launcher must leave the current app alive.
+            $completionCommand = @(Get-HermesRuntimeCommand -InstallRoot $InstallRoot -Module 'hermes_cli.source_completion')
+        } else {
+            $runtimeCommand = @(Get-HermesRuntimeCommand -InstallRoot $InstallRoot)
+        }
     } catch {
         $finalCode = 3
         $finalMsg = $_.Exception.Message
@@ -1599,6 +1627,34 @@ try {
             exit $finalCode
         }
         Write-HandoffLog "desktop exited"
+    }
+
+    # Launch-time source recovery already has the updated checkout and selected
+    # dependency generation. The only obligation left is the shared completion
+    # tail. Run it after Desktop exits so electron-builder can replace the live
+    # app; source_completion clears the pending marker only after every step wins.
+    if ($FinishSourceCompletion) {
+        $completionArgs = @($completionCommand | Select-Object -Skip 1) + @(
+            '--source', $InstallRoot,
+            '--finish-update',
+            '--desktop',
+            '--clear-pending-on-success'
+        )
+        Write-HandoffLog ("running detached source completion: " + ($completionArgs -join " "))
+        Publish-UiProgress "Finishing interrupted update"
+        $res = Invoke-HermesStep $completionCommand[0] $completionArgs "source completion"
+        Write-HandoffLog "source completion exit code: $($res.Code)"
+        if ($res.Code -eq 0) {
+            if ($SourceCompletionFallbackPath) {
+                Remove-Item -LiteralPath $SourceCompletionFallbackPath -Force -ErrorAction SilentlyContinue
+            }
+            $finalCode = 0
+            $finalMsg = "Interrupted source update completed."
+        } else {
+            $finalCode = $res.Code
+            $finalMsg = "Interrupted source update recovery failed (exit $($res.Code)). Hermes will reopen using the safe in-app fallback."
+        }
+        exit $finalCode
     }
 
     # PM creates a new dependency generation. Live old Python readers do not
@@ -1740,13 +1796,25 @@ try {
         Show-ErrorFinale $finalMsg
         Close-ProgressWindow
     } else {
+        if ($FinishSourceCompletion -and $finalCode -ne 0) { Write-SourceCompletionFallback }
         if ($finalCode -eq 0 -and $manualAction) { $finalMsg = $manualMsg }
         Write-Result ($finalCode -eq 0) $finalCode $finalMsg ($finalCode -eq 0 -and $manualAction)
         Remove-MarkerIfOwned
         if ($finalCode -ne 0) {
-            Show-ErrorFinale $finalMsg
+            if (-not $FinishSourceCompletion) { Show-ErrorFinale $finalMsg }
             Close-ProgressWindow
-            [void](Start-DesktopRelaunch)
+
+            # If completion failed during Electron's settle window, the original
+            # Desktop is still alive and continues booting into the safe fallback.
+            $desktopStillAlive = $false
+            if ($FinishSourceCompletion -and $DesktopPid -gt 0) {
+                $desktopStillAlive = $null -ne (Get-Process -Id $DesktopPid -ErrorAction SilentlyContinue)
+            }
+            if ($desktopStillAlive) {
+                Write-HandoffLog "desktop stayed alive after failed source-completion hand-off; no relaunch needed"
+            } else {
+                [void](Start-DesktopRelaunch)
+            }
         } else {
             Publish-UiProgress "Opening Hermes"
             $cameBack = Start-DesktopRelaunch

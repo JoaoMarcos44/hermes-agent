@@ -543,9 +543,12 @@ import {
   observeUpdaterHandoff,
   resolveInstallationLauncher,
   resolveStagedUpdaterBinary,
+  resolveUpdateScriptHandoff,
   resolveVenvDir,
   spawnUpdaterProcess,
-  stagedUpdaterSupportsPrewrittenMarker
+  stagedUpdaterSupportsPrewrittenMarker,
+  windowsUpdatePrerequisiteError,
+  wrapHandoffForDetachedConsole
 } from './updater-process'
 import { AppInstallerStrategy } from './updater/app-installer'
 import { createChannelAppInstallerStrategy } from './updater/app-installer'
@@ -554,7 +557,7 @@ import { inspectRunningChannelApp } from './updater/channel-native'
 import { ChannelStrategy } from './updater/channel-strategy'
 import { verifyPreparedChannelInstaller } from './updater/channel-windows-host'
 import { createCheckoutStrategy } from './updater/checkout'
-import { readSourceUpdate, type SourceUpdate } from './updater/checkout-source'
+import { readSourceUpdate, sourceUpdateEnvironment, type SourceUpdate } from './updater/checkout-source'
 import { ExternalStrategy } from './updater/external'
 import { readUpdatesFeedBaseFromConfig, resolveFeedBaseUrl } from './updater/feed-config'
 import { createChannelMacStrategy, createMacStrategy } from './updater/mac-client'
@@ -4457,6 +4460,151 @@ async function applyUpdates(): Promise<UpdaterApplyResultWire> {
       }
     }
   })
+}
+
+async function handOffPendingWindowsSourceCompletion(): Promise<boolean> {
+  // #123510 remains the fail-safe: if this pre-boot hand-off cannot be
+  // established, start normally and let the backend finish the tail while
+  // skipping only the Windows packaged build that its Desktop ancestor locks.
+  if (!IS_WINDOWS || !IS_PACKAGED || !isPrimaryInstance || installShape() === 'bundled') {
+    return false
+  }
+
+  let updateRoot: string
+
+  try {
+    updateRoot = resolveUpdateRoot()
+  } catch (error) {
+    rememberLog(
+      `[source-completion] could not resolve checkout for detached recovery: ${error instanceof Error ? error.message : String(error)}`
+    )
+
+    return false
+  }
+
+  const installState = path.join(HERMES_HOME, 'installs', installIdForRoot(updateRoot, canonicalizeInstallPath))
+  const pending = path.join(installState, 'source-completion-pending')
+  const fallback = path.join(installState, 'source-completion-desktop-fallback')
+
+  if (!fs.existsSync(pending)) {
+    // A successful in-process fallback or a later explicit update settled the
+    // obligation. Do not let its failure latch affect a future, newly-armed tail.
+    try {
+      fs.rmSync(fallback, { force: true })
+    } catch (error) {
+      rememberLog(
+        `[source-completion] could not clear stale hand-off fallback: ${error instanceof Error ? error.message : String(error)}`
+      )
+    }
+
+    return false
+  }
+
+  if (fs.existsSync(fallback)) {
+    try {
+      // The latch belongs only to the pending obligation it followed. A later
+      // re-arm has a newer mtime and gets a fresh detached attempt.
+      if (fs.statSync(fallback).mtimeMs >= fs.statSync(pending).mtimeMs) {
+        rememberLog('[source-completion] previous detached recovery failed; using the safe in-process fallback')
+
+        return false
+      }
+
+      fs.rmSync(fallback, { force: true })
+    } catch (error) {
+      // Unknown latch state must bias toward keeping the app alive, not another
+      // quit/relaunch cycle.
+      rememberLog(
+        `[source-completion] could not validate hand-off fallback; using in-process recovery: ${error instanceof Error ? error.message : String(error)}`
+      )
+
+      return false
+    }
+  }
+
+  const prerequisiteError = windowsUpdatePrerequisiteError(updateRoot, HERMES_HOME)
+
+  if (prerequisiteError) {
+    rememberLog(`[source-completion] detached recovery unavailable: ${prerequisiteError}`)
+
+    return false
+  }
+
+  const handoff = resolveUpdateScriptHandoff(updateRoot)
+
+  if (!handoff) {
+    rememberLog('[source-completion] checkout predates the repo Windows hand-off; using the safe in-process fallback')
+
+    return false
+  }
+
+  const conflict = updateHandoffConflict(HERMES_HOME)
+
+  if (conflict) {
+    rememberLog(`[source-completion] detached recovery deferred: ${conflict.message}`)
+
+    return false
+  }
+
+  const updateStartedAt = Math.floor(Date.now() / 1000)
+  const wrapped = wrapHandoffForDetachedConsole(handoff, [
+    '-InstallRoot',
+    updateRoot,
+    '-DesktopPid',
+    String(process.pid),
+    '-RelaunchExe',
+    process.execPath,
+    '-FinishSourceCompletion',
+    '-SourceCompletionFallbackPath',
+    fallback
+  ])
+  let child: ReturnType<typeof spawnUpdaterProcess>
+
+  try {
+    child = spawnUpdaterProcess(wrapped.command, wrapped.args, {
+      cwd: HERMES_HOME,
+      env: {
+        ...sourceUpdateEnvironment(updateRoot, HERMES_HOME),
+        HERMES_UPDATE_STARTED_AT: String(updateStartedAt)
+      },
+      detached: wrapped.detached,
+      stdio: 'ignore'
+    })
+  } catch (error) {
+    rememberLog(
+      `[source-completion] could not launch detached recovery; using fallback: ${error instanceof Error ? error.message : String(error)}`
+    )
+
+    return false
+  }
+
+  // Same bridge as the ordinary checkout updater: the short-lived cmd.exe
+  // owns the marker until PowerShell replaces it with its own PID.
+  if (Number.isInteger(child.pid)) {
+    writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
+  }
+
+  rememberLog(
+    `[source-completion] pending tail handed to ${handoff.scriptPath}; quitting Desktop so the packaged build can replace its executable`
+  )
+  const dwellStartedAt = Date.now()
+  const outcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
+
+  if (!outcome.ok) {
+    rememberLog(`[source-completion] detached recovery did not settle; using fallback: ${outcome.message}`)
+
+    return false
+  }
+
+  isQuittingForHandoff = true
+  setTimeout(
+    () => {
+      app.quit()
+    },
+    Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
+  )
+
+  return true
 }
 
 async function handOffWindowsBootstrapRecovery(reason) {
@@ -18834,7 +18982,11 @@ app.on('open-url', (event, url) => {
   handleDeepLink(url)
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  if (await handOffPendingWindowsSourceCompletion()) {
+    return
+  }
+
   // Post-update relaunch detection (App Installer arm): when the previous
   // version wrote the one-shot pending-relaunch marker before quitting into
   // an OS package swap, consume it here — the renderer toasts "Hermes

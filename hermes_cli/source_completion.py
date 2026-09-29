@@ -98,8 +98,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--finish-update", action="store_true",
                         help="Complete a source UPDATE tail instead of an install: the "
                              "same launchers/products/maintenance with update wording.")
+    parser.add_argument("--clear-pending-on-success", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args([argument for argument in argv if argument != _PREPARED])
     root = args.source.resolve()
+    if args.clear_pending_on_success and not args.finish_update:
+        parser.error("--clear-pending-on-success requires --finish-update")
     if not (root / "hermes_cli/source_completion.py").is_file():
         print(f"✗ {root} is not a Hermes source checkout", file=sys.stderr)
         return 1
@@ -125,6 +128,12 @@ def main(argv: list[str] | None = None) -> int:
                 root, desktop=args.desktop, assume_yes=not args.interactive,
                 completion_message="✓ Install complete!",
             )
+        if ok and args.clear_pending_on_success:
+            # The detached Desktop hand-off has no venv_sync parent left to
+            # consume the obligation. Clear it only after the full tail succeeds.
+            from hermes_cli.venv_sync import clear_completion
+
+            clear_completion(root)
         return 0 if ok else 1
 
     from pm.environments import activation_environment
@@ -133,7 +142,8 @@ def main(argv: list[str] | None = None) -> int:
     # every flag that decides WHICH tail runs has to survive into it. Losing
     # --finish-update here silently reports an update as an install.
     passthrough = (["--desktop"] if args.desktop else []) + \
-                  (["--finish-update"] if args.finish_update else [])
+                  (["--finish-update"] if args.finish_update else []) + \
+                  (["--clear-pending-on-success"] if args.clear_pending_on_success else [])
     command = _bootstrap_command(root, passthrough)
     return subprocess.call(command, cwd=root, env=activation_environment(root))
 
