@@ -291,3 +291,138 @@ def test_launch_under_the_owning_update_does_not_run_the_tail_again(tmp_path, mo
     assert completion_tail == []
     assert pending.is_file(), "the owning update's obligation was discharged by its own tail"
 
+
+
+class _FakeDesktopProc:
+    def __init__(self, pid, exe, parents=()):
+        self.pid = pid
+        self._exe = exe
+        self._parents = list(parents)
+
+    def parents(self):
+        return self._parents
+
+    def exe(self):
+        return self._exe
+
+
+def _arm_packaged_desktop_handoff(root, monkeypatch, parent_pid=4242):
+    import platform
+    import psutil
+
+    release = root / "apps/desktop/release/win-unpacked"
+    release.mkdir(parents=True)
+    exe = release / "Hermes.exe"
+    exe.write_text("")
+    script = root / "scripts/desktop-update/windows.ps1"
+    script.parent.mkdir(parents=True)
+    script.write_text("# fixture\n")
+    parent = _FakeDesktopProc(parent_pid, str(exe))
+    current = _FakeDesktopProc(os.getpid(), sys.executable, [parent])
+    real_process = psutil.Process
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv("HERMES_PARENT_PID", str(parent_pid))
+    monkeypatch.setenv("HERMES_DESKTOP_COMPLETION_HANDOFF", "1")
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda pid: current if pid == os.getpid() else parent if pid == parent_pid else real_process(pid),
+    )
+    return parent_pid
+
+
+def test_desktop_owned_windows_serve_hands_pending_tail_back_to_electron(
+    tmp_path, monkeypatch, completion_tail, capsys
+):
+    """The exact packaged Desktop backend exits before packaging; Electron owns graceful quit/rebuild."""
+    import pm
+    from hermes_cli import _launchers
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    pending = venv_sync.completion_pending_path(root)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text("owed\n")
+    parent_pid = _arm_packaged_desktop_handoff(root, monkeypatch)
+    published = []
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
+    monkeypatch.setattr(venv_sync, "publish_launchers", lambda published_root: published.append(published_root))
+
+    with pytest.raises(SystemExit) as exc:
+        venv_sync.prepare_launch(root, ["serve"])
+
+    assert exc.value.code == venv_sync.DESKTOP_COMPLETION_HANDOFF_EXIT
+    assert venv_sync.DESKTOP_COMPLETION_HANDOFF_SENTINEL in capsys.readouterr().err
+    assert completion_tail == []
+    assert published == [root], "the detached helper must have a current durable launcher"
+    assert pending.is_file(), "Electron helper, not the exiting backend, owns completion"
+    from hermes_cli.update_lock import update_marker_path
+    assert int(update_marker_path().read_text().splitlines()[0]) == parent_pid
+
+
+def test_desktop_handoff_falls_back_when_launcher_refresh_fails(
+    tmp_path, monkeypatch, completion_tail
+):
+    """Never quit Desktop for a helper the durable launcher cannot start."""
+    import pm
+    from hermes_cli import _launchers
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    pending = venv_sync.completion_pending_path(root)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text("owed\n")
+    _arm_packaged_desktop_handoff(root, monkeypatch)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
+
+    def fail_publish(_root):
+        raise RuntimeError("launcher unavailable")
+
+    monkeypatch.setattr(venv_sync, "publish_launchers", fail_publish)
+
+    assert venv_sync.prepare_launch(root, ["serve"]) is None
+    assert len(completion_tail) == 1, "failed launcher refresh must retain #123510's ordinary tail"
+    assert not pending.exists()
+
+
+def test_older_desktop_without_handoff_capability_keeps_123510_fallback(tmp_path, monkeypatch):
+    root = _self_checkout(tmp_path, monkeypatch)
+    _arm_packaged_desktop_handoff(root, monkeypatch)
+    monkeypatch.delenv("HERMES_DESKTOP_COMPLETION_HANDOFF")
+    assert venv_sync._desktop_completion_handoff_parent(root) is None
+
+
+def test_shell_serve_never_uses_desktop_completion_handoff(tmp_path, monkeypatch, completion_tail):
+    """#127296 regression: a terminal hermes serve must finish the ordinary tail itself."""
+    import pm
+    from hermes_cli import _launchers
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    pending = venv_sync.completion_pending_path(root)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text("owed\n")
+    (root / "apps/desktop/dist").mkdir(parents=True)
+    (root / "apps/desktop/dist/index.html").write_text("")
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_PARENT_PID", raising=False)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
+
+    assert venv_sync.prepare_launch(root, ["serve"]) is None
+    assert len(completion_tail) == 1
+    assert not pending.exists()
+
+
+def test_desktop_env_without_release_ancestor_cannot_request_handoff(tmp_path, monkeypatch):
+    """Inherited Desktop env is insufficient without real process-tree and release ownership."""
+    import platform
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    script = root / "scripts/desktop-update/windows.ps1"
+    script.parent.mkdir(parents=True)
+    script.write_text("# fixture\n")
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv("HERMES_PARENT_PID", str(os.getpid()))
+    assert venv_sync._desktop_completion_handoff_parent(root) is None

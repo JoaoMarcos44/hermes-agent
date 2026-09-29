@@ -25,13 +25,17 @@
 #     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
 #     [-NoUi]               headless (tests); default shows a progress window
 #     [-NoMarkerCleanup]    leave .hermes-update-in-progress in place (tests)
+#     [-FinishPendingSourceCompletion]
+#                            finish the already-armed source tail; do not pull code
 #
 # SAFETY POSTURE: both preflight gates FAIL CLOSED. A Desktop that never
 # exits, or a venv shim that never unlocks, aborts the hand-off without
 # mutating the install -- a skipped update is recoverable, a half-updated
 # venv is not. Every exit path (success, abort, crash) writes
 # .hermes-update-result.json for the relaunched Desktop to surface, and
-# relaunches the Desktop so the user is never left stranded.
+# relaunches the Desktop so the user is never left stranded. The one exception
+# is a failed -FinishPendingSourceCompletion: its durable pending marker stays
+# armed and we do not auto-relaunch into the same failing tail loop.
 #
 # Marker: we claim HERMES_HOME\.hermes-update-in-progress with OUR pid as
 # step 0 (the wrapper cmd.exe pid the Desktop saw is useless -- it exits
@@ -51,6 +55,7 @@ param(
     [switch]$NoUi,
     [switch]$NoMarkerCleanup,
     [switch]$NoGateway,
+    [switch]$FinishPendingSourceCompletion,
     [switch]$SelfTestUi,
     [switch]$SelfTestPipeDrain,
     [switch]$SelfTestMarker,
@@ -1601,6 +1606,35 @@ try {
         Write-HandoffLog "desktop exited"
     }
 
+    # Launch-time source completion is a hand-off, not another update. The
+    # backend already synchronized dependencies and left source-completion-pending
+    # armed. With Electron now gone, finish the shared tail once, clear that
+    # marker only on success, and let the normal finally block relaunch Desktop.
+    if ($FinishPendingSourceCompletion) {
+        try {
+            Publish-UiProgress "Finishing interrupted source update"
+            $completionCommand = @(Get-HermesRuntimeCommand -InstallRoot $InstallRoot -Module 'hermes_cli.source_completion_handoff')
+            $completionExe = $completionCommand[0]
+            $completionArgs = @($completionCommand | Select-Object -Skip 1) + @('--source', $InstallRoot)
+            Write-HandoffLog ("running pending source completion: " + $completionExe + " " + ($completionArgs -join " "))
+            $completion = Invoke-HermesStep $completionExe $completionArgs "source completion"
+            Write-HandoffLog "pending source completion exit code: $($completion.Code)"
+            if ($completion.Code -ne 0) {
+                $finalCode = $completion.Code
+                $finalMsg = "Hermes could not finish the interrupted source update. The pending marker was kept; run hermes update in a terminal, then reopen Hermes."
+                exit $finalCode
+            }
+            $finalCode = 0
+            $finalMsg = "Interrupted source update finished."
+            exit 0
+        } catch {
+            $finalCode = 9
+            $finalMsg = "Hermes could not finish the interrupted source update: $($_.Exception.Message). Run hermes update in a terminal, then reopen Hermes."
+            Write-HandoffLog $finalMsg
+            exit $finalCode
+        }
+    }
+
     # PM creates a new dependency generation. Live old Python readers do not
     # block it; Desktop exit above protects the application output replacement.
     $pythonExe = $runtimeCommand[0]
@@ -1746,7 +1780,11 @@ try {
         if ($finalCode -ne 0) {
             Show-ErrorFinale $finalMsg
             Close-ProgressWindow
-            [void](Start-DesktopRelaunch)
+            # A failed launch-time completion still owns source-completion-pending.
+            # Relaunching here would immediately request the same handoff again.
+            if (-not $FinishPendingSourceCompletion) {
+                [void](Start-DesktopRelaunch)
+            }
         } else {
             Publish-UiProgress "Opening Hermes"
             $cameBack = Start-DesktopRelaunch

@@ -155,6 +155,70 @@ def collect_superseded_generations(project_root: Path) -> None:
 #: a network-bound source-update completion.
 _METADATA_FLAGS = frozenset({"-h", "--help", "-V", "--version"})
 
+#: A Desktop-spawned Windows backend uses this distinguished exit only when it
+#: can hand the pending source tail back to Electron. The sentinel makes the
+#: exit unambiguous: EX_TEMPFAIL (75) is also used by ordinary retryable paths.
+DESKTOP_COMPLETION_HANDOFF_EXIT = 75
+DESKTOP_COMPLETION_HANDOFF_SENTINEL = "HERMES_DESKTOP_COMPLETION_HANDOFF_REQUIRED"
+
+
+def _desktop_completion_handoff_parent(project_root: Path) -> int | None:
+    """Return the owning packaged Desktop pid for a safe Windows handoff.
+
+    This is intentionally narrower than "serve": #127296 showed that treating
+    every serve as the Desktop backend strands shell-launched serves. Require
+    the Electron-only env, prove that exact pid is an ancestor, and prove its
+    executable lives under the packaged Desktop release tree for this checkout.
+    """
+    import platform
+
+    if (
+        platform.system() != "Windows"
+        or os.environ.get("HERMES_DESKTOP") != "1"
+        or os.environ.get("HERMES_DESKTOP_COMPLETION_HANDOFF") != "1"
+    ):
+        return None
+    if not (project_root / "scripts/desktop-update/windows.ps1").is_file():
+        return None
+    try:
+        parent_pid = int(os.environ.get("HERMES_PARENT_PID", ""))
+        if parent_pid <= 0:
+            return None
+        import psutil
+
+        me = psutil.Process(os.getpid())
+        ancestors = {int(proc.pid) for proc in me.parents()}
+        if parent_pid not in ancestors:
+            return None
+        parent_exe = Path(psutil.Process(parent_pid).exe()).resolve()
+        release_dir = (project_root / "apps/desktop/release").resolve()
+        if release_dir not in parent_exe.parents:
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    except Exception:
+        # Process inspection is a safety proof. If it is unavailable, retain
+        # the #123510 in-process skip rather than asking Electron to quit.
+        return None
+    return parent_pid
+
+
+def _transfer_update_lock_to_desktop(parent_pid: int) -> bool:
+    """Move this launch lock to Electron so no second tail enters the handoff gap."""
+    import time
+
+    from hermes_cli.update_lock import update_marker_path
+
+    marker = update_marker_path()
+    try:
+        owner = int(marker.read_text(encoding="utf-8-sig").splitlines()[0].strip())
+        if owner != os.getpid():
+            return False
+        marker.write_text(f"{parent_pid}\n{int(time.time())}\n", encoding="utf-8")
+    except (OSError, IndexError, ValueError):
+        return False
+    return True
+
 
 def completion_pending_path(project_root: Path) -> Path:
     """Marker for a source update whose dependency sync committed but whose tail
@@ -267,7 +331,15 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
                     # Relaunching would land back here and sync again, forever.
                     raise RuntimeError("dependency sync left this install out of date")
             else:
-                _finish_source_update(root, current=current, pending=pending)
+                desktop_handoff_parent = None
+                if command_argv(argv)[:1] == ["serve"]:
+                    desktop_handoff_parent = _desktop_completion_handoff_parent(root)
+                _finish_source_update(
+                    root,
+                    current=current,
+                    pending=pending,
+                    desktop_handoff_parent=desktop_handoff_parent,
+                )
         finally:
             lock.release()
     python = resolve_store_python(root)
@@ -285,8 +357,10 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     return None
 
 
-def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
-    """Sync dependencies when they are stale, then run the tail the marker still owes."""
+def _finish_source_update(
+    root: Path, *, current: bool, pending: Path, desktop_handoff_parent: int | None = None,
+) -> None:
+    """Sync dependencies when stale, then run or safely hand off the owed tail."""
     import sys
     from hermes_cli._early_recovery import _marker_owner_is_live
     from pm.environments import activation_environment
@@ -310,6 +384,40 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
     desktop_app = root / "apps/desktop"
     desktop = ((desktop_app / "dist/index.html").is_file()
                or any((desktop_app / "release").glob("*")))
+    if desktop and desktop_handoff_parent is not None:
+        # The detached PowerShell coordinator resolves the helper through the
+        # checkout-owned launcher. Publish that launcher before handing away
+        # the lock: a pending tail can come from a checkout newer than the
+        # durable launcher that started this Desktop. If publication is not
+        # possible, keep #123510's in-process fallback instead of handing off
+        # to a coordinator that cannot start the completion helper.
+        try:
+            publish_launchers(root)
+        except Exception as exc:
+            print(
+                f"hermes: Desktop completion handoff unavailable: launcher refresh failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            if _transfer_update_lock_to_desktop(desktop_handoff_parent):
+                # #123510 correctly stopped a launch-time tail from killing its own
+                # Windows Desktop, but necessarily deferred the packaged rebuild.
+                # Electron owns graceful app teardown; the detached handoff then
+                # finishes this same marker and relaunches the rebuilt Desktop.
+                # UpdateLock.release() sees the rewritten owner and leaves it intact
+                # until the detached helper claims it.
+                print(
+                    f"{DESKTOP_COMPLETION_HANDOFF_SENTINEL}={json.dumps(str(root))}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"hermes: handing the pending Desktop rebuild to pid {desktop_handoff_parent}...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise SystemExit(DESKTOP_COMPLETION_HANDOFF_EXIT)
     # The tail's progress lines go to stderr: this is an automatic repair in
     # front of whatever command the user ran, and that command may be
     # emitting machine-readable stdout (a JSON probe, a piped query).

@@ -515,6 +515,7 @@ import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection }
 import { createSshIsolatedKeepaliveRegistry } from './ssh-isolated-keepalive'
 import { createSshTeardownTracker } from './ssh-teardown'
 import { createStreamThrottle } from './stream-throttle'
+import { sourceCompletionHandoffRoot } from './source-completion-handoff'
 import { installSystemCaTrust } from './system-ca'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, titleBarOverlayOptions } from './titlebar-overlay-width'
@@ -543,9 +544,11 @@ import {
   observeUpdaterHandoff,
   resolveInstallationLauncher,
   resolveStagedUpdaterBinary,
+  resolveUpdateScriptHandoff,
   resolveVenvDir,
   spawnUpdaterProcess,
-  stagedUpdaterSupportsPrewrittenMarker
+  stagedUpdaterSupportsPrewrittenMarker,
+  wrapHandoffForDetachedConsole
 } from './updater-process'
 import { AppInstallerStrategy } from './updater/app-installer'
 import { createChannelAppInstallerStrategy } from './updater/app-installer'
@@ -3304,6 +3307,71 @@ function resolveUpdateRoot() {
   ].filter(Boolean)
 
   return candidates.find(isGitCheckout) || candidates[0] || ACTIVE_HERMES_ROOT
+}
+
+async function handoffPendingSourceCompletion(updateRoot: string): Promise<boolean> {
+  if (!IS_WINDOWS || isQuittingForHandoff) {
+    return isQuittingForHandoff
+  }
+
+  const handoff = resolveUpdateScriptHandoff(updateRoot)
+
+  if (!handoff) {
+    rememberLog('[source-completion] no repo-owned Windows hand-off script; keeping in-process recovery')
+    return false
+  }
+
+  const lockOwner = readLiveUpdateMarker(HERMES_HOME)
+  if (!lockOwner || lockOwner.pid !== process.pid) {
+    rememberLog(
+      `[source-completion] refusing hand-off: update marker is not owned by this Desktop (owner=${lockOwner?.pid ?? 'none'})`
+    )
+    return false
+  }
+
+  const startedAt = Math.floor((Date.now() - lockOwner.ageMs) / 1000)
+  const wrapped = wrapHandoffForDetachedConsole(handoff, [
+    '-InstallRoot',
+    updateRoot,
+    '-DesktopPid',
+    String(process.pid),
+    '-RelaunchExe',
+    process.execPath,
+    '-FinishPendingSourceCompletion'
+  ])
+  const child = spawnUpdaterProcess(wrapped.command, wrapped.args, {
+    cwd: HERMES_HOME,
+    env: {
+      ...process.env,
+      HERMES_HOME,
+      HERMES_INSTALL_ROOT: updateRoot,
+      HERMES_UPDATE_STARTED_AT: String(startedAt)
+    },
+    detached: wrapped.detached,
+    stdio: 'ignore'
+  })
+
+  // Same bridge as Update now: the cmd wrapper is short-lived; the PowerShell
+  // helper overwrites this with its own pid as step zero.
+  if (Number.isInteger(child.pid)) {
+    writeUpdateMarker(HERMES_HOME, child.pid, { startedAt })
+  }
+
+  const dwellStartedAt = Date.now()
+  const outcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
+
+  if (!outcome.ok) {
+    rememberLog(`[source-completion] detached hand-off not viable: ${outcome.message}`)
+    return false
+  }
+
+  rememberLog(`[source-completion] handed pending tail to ${handoff.scriptPath}; quitting Desktop for rebuild`)
+  isQuittingForHandoff = true
+  setTimeout(
+    () => app.quit(),
+    Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
+  )
+  return true
 }
 
 function runGit(args, options: any = {}): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -13157,6 +13225,10 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
             // Marks this dashboard backend as desktop-spawned so it runs the cron
             // scheduler tick loop (the gateway isn't running under the app).
             HERMES_DESKTOP: '1',
+            // Protocol capability: only an Electron generation that can parse
+            // the distinguished launch-tail exit may ask venv_sync to hand it
+            // the update lock. Older Desktops keep #123510's safe skip path.
+            HERMES_DESKTOP_COMPLETION_HANDOFF: '1',
             // Exact parent identity lets the backend self-exit after an unclean
             // Desktop death without mistaking a reused PID for its owner. If the
             // optional marker probe fails, retain legacy PID-only tracking.
@@ -13255,6 +13327,12 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     })
     hermesProcess.once('exit', (code, signal) => {
       releaseBackendChild(hermesProcess)
+      const pendingSourceRoot = sourceCompletionHandoffRoot({
+        isWindows: IS_WINDOWS,
+        code,
+        signal,
+        output: primaryOutputTail.text()
+      })
 
       if (!backendConnectionState.clearForCurrentProcess(processOwner)) {
         rememberLog(formatBackendExitLine('Ignoring stale Hermes backend exit', code, signal, primaryOutputTail))
@@ -13292,11 +13370,13 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
           },
           { allowDecrease: true }
         )
-        rejectBackendStart?.(
-          new Error(
-            `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
-          )
+        const startError: Error & { sourceCompletionHandoffRoot?: string } = new Error(
+          `Hermes backend exited before it became ready (${signal || code}). Log: ${DESKTOP_LOG_PATH}\n${recentHermesLog()}`
         )
+        if (pendingSourceRoot) {
+          startError.sourceCompletionHandoffRoot = pendingSourceRoot
+        }
+        rejectBackendStart?.(startError)
       }
     })
 
@@ -13389,6 +13469,26 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
     primaryProfilePin.clear()
 
     await backendConnectionState.stopProcess(localBackendLifecycle.stop)
+
+    const pendingSourceRoot =
+      error && typeof error === 'object' && typeof (error as any).sourceCompletionHandoffRoot === 'string'
+        ? (error as any).sourceCompletionHandoffRoot
+        : null
+    if (pendingSourceRoot) {
+      if (await handoffPendingSourceCompletion(pendingSourceRoot)) {
+        updateBootProgress({
+          phase: 'backend.update-handoff',
+          message: 'Finishing an interrupted update; Hermes will restart automatically',
+          progress: 96,
+          running: true,
+          error: null
+        })
+        // The accepted helper owns recovery now. Do not latch this deliberate
+        // pre-ready exit as a backend crash; app.quit() is already scheduled.
+        throw error
+      }
+      rememberLog('[source-completion] detached hand-off unavailable; surfacing the backend start failure')
+    }
 
     if (error instanceof FirstRunSetupResetError) {
       throw error
