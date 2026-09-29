@@ -99,12 +99,15 @@ class TestClassification:
     def test_gui_surface_tools_never_defer(self):
         """Session-gated GUI tools stay direct and stay off the global core list."""
         from tools.registry import discover_builtin_tools, registry
-        from tools.tool_search import _DIRECT_SURFACE_TOOLSETS, is_deferrable_tool_name
-        from toolsets import _HERMES_CORE_TOOLS
+        from tools.tool_search import is_deferrable_tool_name
+        from toolsets import CLIENT_SURFACE_TOOLSETS, TOOLSETS, _HERMES_CORE_TOOLS
 
         discover_builtin_tools()
+        direct_surface_toolsets = CLIENT_SURFACE_TOOLSETS | frozenset(
+            name for name, spec in TOOLSETS.items() if spec.get("role") is not None
+        )
         surface = [n for n, ts in registry.get_tool_to_toolset_map().items()
-                   if ts in _DIRECT_SURFACE_TOOLSETS]
+                   if ts in direct_surface_toolsets]
         assert surface
         for name in surface:
             assert not is_deferrable_tool_name(name), name
@@ -338,6 +341,42 @@ class TestAssembly:
         # The pre-existing tool_search was stripped (it would be re-injected if
         # activation happened; here it didn't).
         assert "tool_search" not in names
+
+
+    def test_default_defer_keeps_desktop_surface_tools_direct(
+        self, monkeypatch, _isolate_hermes_home,
+    ):
+        """The real Desktop resolver keeps its surface direct while other defaults defer."""
+        import model_tools
+        import tui_gateway.server as gateway_server
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+        monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+        discover_builtin_tools()
+
+        enabled = gateway_server._load_enabled_toolsets("desktop")
+        assert enabled is not None and "desktop_ui" in enabled
+        raw_definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        raw_names = {td["function"]["name"] for td in raw_definitions}
+        assert "read_window_below" in raw_names
+        assert "session_search" in raw_names
+
+        assembled = assemble_tool_defs(
+            raw_definitions,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        names = {td["function"]["name"] for td in assembled.tool_defs}
+
+        assert assembled.activated
+        assert "read_window_below" in names
+        assert "session_search" not in names
 
 
 # ---------------------------------------------------------------------------

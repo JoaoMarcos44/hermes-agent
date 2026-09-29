@@ -133,11 +133,19 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
-# Session-gated GUI toolsets: off ``_HERMES_CORE_TOOLS`` so non-GUI clients never pay
-# their schema; once enabled they stay direct unless the deferral list names them. ``setup``
-# is the setup profile's whole job: a guide that has to search for its one tool first
-# answers the user's install request with a tool_search round trip.
-_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "setup"})
+# Client-surface toolsets are defined in toolsets.CLIENT_SURFACE_TOOLSETS; role-gated
+# toolsets are derived from that same TOOLSETS table. Keep their schemas direct by default
+# for the sessions that receive them without duplicating toolset-name lists here.
+def _direct_surface_toolsets() -> frozenset[str]:
+    try:
+        from toolsets import CLIENT_SURFACE_TOOLSETS, TOOLSETS
+        role_toolsets = frozenset(
+            name for name, spec in TOOLSETS.items() if spec.get("role") is not None
+        )
+        return CLIENT_SURFACE_TOOLSETS | role_toolsets
+    except Exception:
+        return frozenset()
+
 
 # Event-triggered tools deferred BY DEFAULT (a catalog stub suffices). Keep the curated
 # list in DEFAULT_CONFIG so config discovery and runtime behavior cannot drift. An explicit
@@ -159,7 +167,7 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) 
         return False
     toolset = _registry_toolset(name)  # None (unregistered/malformed) never defers
     return toolset is not None and (
-        toolset.startswith("mcp-") or toolset not in _DIRECT_SURFACE_TOOLSETS)
+        toolset.startswith("mcp-") or toolset not in _direct_surface_toolsets())
 
 
 def _tool_def_names(tool_defs: Iterable[Dict[str, Any]]) -> Iterable[str]:
