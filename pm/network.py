@@ -24,6 +24,20 @@ _NETWORK_ERRNOS = frozenset({
 })
 
 
+def is_cloudflare_waf_block(exc: Exception) -> bool:
+    """Return True for Cloudflare's HTML 403 block response shape.
+
+    This uses headers only because retry_network closes HTTPError bodies
+    before re-raising them. Callers still scope the diagnosis to Hermes' asset
+    host so an unrelated Cloudflare-backed origin is never mislabeled.
+    """
+    if not isinstance(exc, urllib.error.HTTPError) or exc.code != 403 or not exc.headers:
+        return False
+    server = exc.headers.get("Server", "").strip().casefold()
+    content_type = exc.headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
+    return server == "cloudflare" and content_type == "text/html"
+
+
 def is_transient(exc: Exception) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in _HTTP_RETRY

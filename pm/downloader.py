@@ -31,13 +31,14 @@ import logging
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from pm.network import is_transient, retry_network
+from pm.network import is_cloudflare_waf_block, is_transient, retry_network
 
 # GitHub's release-asset CDN (release-assets.githubusercontent.com, which
 # TUR's pool 302s to) 403s unknown tool UAs from CI runner IP ranges --
@@ -121,7 +122,13 @@ class DownloadTransportError(DownloadError):
         self.fallback_allowed = (
             self.status in (401, 403, 404, 410) or is_transient(cause)
         )
-        reason = f"{cause}; the host refused access" if self.status in (401, 403) else str(cause)
+        if (self.status == 403 and urllib.parse.urlsplit(url).hostname == "hermes-assets.nousresearch.com"
+                and is_cloudflare_waf_block(cause)):
+            reason = f"{cause}; blocked by the asset CDN's bot protection from this network"
+        elif self.status in (401, 403):
+            reason = f"{cause}; the host refused access"
+        else:
+            reason = str(cause)
         super().__init__(f"download failed from {url}: {reason}")
 
 

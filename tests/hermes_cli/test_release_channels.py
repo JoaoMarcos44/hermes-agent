@@ -141,6 +141,33 @@ def test_passive_reads_and_missing_objects_make_one_attempt(monkeypatch):
     assert waits == []
 
 
+def test_asset_cdn_cloudflare_403_has_actionable_network_diagnosis():
+    from email.message import Message
+    from urllib.error import HTTPError
+    from hermes_cli.release_channels import ChannelError, ChannelReader
+
+    def blocked_reader(base_url, server):
+        def opener(request, timeout):
+            headers = Message()
+            headers["Server"] = server
+            headers["Content-Type"] = "text/html; charset=UTF-8"
+            raise HTTPError(request.full_url, 403, "Forbidden", headers, None)
+        return ChannelReader(base_url, opener=opener)
+
+    with pytest.raises(ChannelError, match="asset CDN's bot protection from this network"):
+        blocked_reader("https://hermes-assets.nousresearch.com", "cloudflare").read_bytes(
+            "releases/channels/main.json"
+        )
+    # Host and edge identity are both required: a Zscaler-style 403 and an
+    # unrelated Cloudflare origin keep the generic fail-closed diagnosis.
+    for base_url, server in [
+        ("https://hermes-assets.nousresearch.com", "Zscaler"),
+        ("https://releases.example", "cloudflare"),
+    ]:
+        with pytest.raises(ChannelError, match=r"Channel read unavailable: HTTP 403$"):
+            blocked_reader(base_url, server).read_bytes("releases/channels/main.json")
+
+
 def test_reader_rejects_cycles_identity_substitution_and_cross_authority():
     from hermes_cli.release_channels import ChannelReader, ChannelError, canonical_json
     with object_server() as (url, objects, headers, requests, faults):

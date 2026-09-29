@@ -107,3 +107,24 @@ def test_pause_interrupts_real_http_retry_backoff(tmp_path, dl_server, monkeypat
     assert len([value for value in requests if (value == "bytes=0-0") == (phase == "probe")]) == 1
     assert waits == [network._MAX_DELAY]
     assert not dest.exists()
+
+
+def test_asset_cdn_cloudflare_403_names_network_block_without_changing_fallback_policy():
+    from email.message import Message
+    from urllib.error import HTTPError
+
+    asset = "https://hermes-assets.nousresearch.com/upstream/sha256/" + "a" * 64
+    headers = Message()
+    headers["Server"] = "cloudflare"
+    headers["Content-Type"] = "text/html; charset=UTF-8"
+    blocked = DownloadTransportError(asset, HTTPError(asset, 403, "Forbidden", headers, None))
+    assert blocked.status == 403 and blocked.fallback_allowed
+    assert "blocked by the asset CDN's bot protection from this network" in str(blocked)
+
+    # A generic/proxy 403 keeps the existing wording and fallback behavior.
+    proxy_headers = Message()
+    proxy_headers["Server"] = "Zscaler"
+    proxy = DownloadTransportError(asset, HTTPError(asset, 403, "Forbidden", proxy_headers, None))
+    assert proxy.status == 403 and proxy.fallback_allowed
+    assert "the host refused access" in str(proxy)
+    assert "asset CDN" not in str(proxy)
