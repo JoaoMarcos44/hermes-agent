@@ -515,7 +515,10 @@ import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection }
 import { createSshIsolatedKeepaliveRegistry } from './ssh-isolated-keepalive'
 import { createSshTeardownTracker } from './ssh-teardown'
 import { createStreamThrottle } from './stream-throttle'
-import { sourceCompletionHandoffRoot } from './source-completion-handoff'
+import {
+  handoffPendingSourceCompletion,
+  sourceCompletionHandoffRoot
+} from './source-completion-handoff'
 import { installSystemCaTrust } from './system-ca'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, titleBarOverlayOptions } from './titlebar-overlay-width'
@@ -544,11 +547,9 @@ import {
   observeUpdaterHandoff,
   resolveInstallationLauncher,
   resolveStagedUpdaterBinary,
-  resolveUpdateScriptHandoff,
   resolveVenvDir,
   spawnUpdaterProcess,
-  stagedUpdaterSupportsPrewrittenMarker,
-  wrapHandoffForDetachedConsole
+  stagedUpdaterSupportsPrewrittenMarker
 } from './updater-process'
 import { AppInstallerStrategy } from './updater/app-installer'
 import { createChannelAppInstallerStrategy } from './updater/app-installer'
@@ -3307,71 +3308,6 @@ function resolveUpdateRoot() {
   ].filter(Boolean)
 
   return candidates.find(isGitCheckout) || candidates[0] || ACTIVE_HERMES_ROOT
-}
-
-async function handoffPendingSourceCompletion(updateRoot: string): Promise<boolean> {
-  if (!IS_WINDOWS || isQuittingForHandoff) {
-    return isQuittingForHandoff
-  }
-
-  const handoff = resolveUpdateScriptHandoff(updateRoot)
-
-  if (!handoff) {
-    rememberLog('[source-completion] no repo-owned Windows hand-off script; keeping in-process recovery')
-    return false
-  }
-
-  const lockOwner = readLiveUpdateMarker(HERMES_HOME)
-  if (!lockOwner || lockOwner.pid !== process.pid) {
-    rememberLog(
-      `[source-completion] refusing hand-off: update marker is not owned by this Desktop (owner=${lockOwner?.pid ?? 'none'})`
-    )
-    return false
-  }
-
-  const startedAt = Math.floor((Date.now() - lockOwner.ageMs) / 1000)
-  const wrapped = wrapHandoffForDetachedConsole(handoff, [
-    '-InstallRoot',
-    updateRoot,
-    '-DesktopPid',
-    String(process.pid),
-    '-RelaunchExe',
-    process.execPath,
-    '-FinishPendingSourceCompletion'
-  ])
-  const child = spawnUpdaterProcess(wrapped.command, wrapped.args, {
-    cwd: HERMES_HOME,
-    env: {
-      ...process.env,
-      HERMES_HOME,
-      HERMES_INSTALL_ROOT: updateRoot,
-      HERMES_UPDATE_STARTED_AT: String(startedAt)
-    },
-    detached: wrapped.detached,
-    stdio: 'ignore'
-  })
-
-  // Same bridge as Update now: the cmd wrapper is short-lived; the PowerShell
-  // helper overwrites this with its own pid as step zero.
-  if (Number.isInteger(child.pid)) {
-    writeUpdateMarker(HERMES_HOME, child.pid, { startedAt })
-  }
-
-  const dwellStartedAt = Date.now()
-  const outcome = await observeUpdaterHandoff(child, UPDATE_HANDOFF_DWELL_MS)
-
-  if (!outcome.ok) {
-    rememberLog(`[source-completion] detached hand-off not viable: ${outcome.message}`)
-    return false
-  }
-
-  rememberLog(`[source-completion] handed pending tail to ${handoff.scriptPath}; quitting Desktop for rebuild`)
-  isQuittingForHandoff = true
-  setTimeout(
-    () => app.quit(),
-    Math.max(0, UPDATE_HANDOFF_DWELL_MS - (Date.now() - dwellStartedAt))
-  )
-  return true
 }
 
 function runGit(args, options: any = {}): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -13475,7 +13411,19 @@ async function runHermesStart({ supervisorRecovery = false }: { supervisorRecove
         ? (error as any).sourceCompletionHandoffRoot
         : null
     if (pendingSourceRoot) {
-      if (await handoffPendingSourceCompletion(pendingSourceRoot)) {
+      if (
+        await handoffPendingSourceCompletion(pendingSourceRoot, {
+          isWindows: IS_WINDOWS,
+          isQuittingForHandoff: () => isQuittingForHandoff,
+          markQuittingForHandoff: () => {
+            isQuittingForHandoff = true
+          },
+          hermesHome: HERMES_HOME,
+          updateHandoffDwellMs: UPDATE_HANDOFF_DWELL_MS,
+          rememberLog,
+          quit: () => app.quit()
+        })
+      ) {
         updateBootProgress({
           phase: 'backend.update-handoff',
           message: 'Finishing an interrupted update; Hermes will restart automatically',

@@ -204,21 +204,20 @@ def _desktop_completion_handoff_parent(project_root: Path) -> int | None:
 
 
 def _transfer_update_lock_to_desktop(parent_pid: int) -> bool:
-    """Move this launch lock to Electron so no second tail enters the handoff gap."""
-    import time
-
+    """Move ownership to Electron without extending the shared marker TTL."""
     from hermes_cli.update_lock import update_marker_path
 
     marker = update_marker_path()
     try:
-        owner = int(marker.read_text(encoding="utf-8-sig").splitlines()[0].strip())
-        if owner != os.getpid():
+        lines = marker.read_text(encoding="utf-8-sig").splitlines()
+        owner = int(lines[0].strip())
+        started_at = int(lines[1].strip())
+        if owner != os.getpid() or started_at <= 0:
             return False
-        marker.write_text(f"{parent_pid}\n{int(time.time())}\n", encoding="utf-8")
+        marker.write_text(f"{parent_pid}\\n{started_at}\\n", encoding="utf-8")
     except (OSError, IndexError, ValueError):
         return False
     return True
-
 
 def completion_pending_path(project_root: Path) -> Path:
     """Marker for a source update whose dependency sync committed but whose tail
