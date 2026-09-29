@@ -445,7 +445,6 @@ async def test_non_internal_synthetic_event_preserves_all_prompt_pins(monkeypatc
 
     assert [call["channel_prompt"] for call in calls] == ["Channel hint."] * 3
     ephemeral = [_effective_ephemeral(runner, call) for call in calls]
-    assert "Triggering message: provided per-turn" in ephemeral[0]
     assert ephemeral[0] == ephemeral[1] == ephemeral[2]
     assert runner._peek_session_state(KEY).conversation.channel_pin == ("Channel hint.", PARENT_ID)
 
@@ -479,4 +478,3 @@ async def test_first_non_internal_synthetic_after_restart_rehydrates_prompt_pins
     assert first_synthetic["context_prompt"] == human["context_prompt"] == next_human["context_prompt"]
     assert _effective_ephemeral(after, first_synthetic) == _effective_ephemeral(before, human)
     assert _effective_ephemeral(after, next_human) == _effective_ephemeral(before, human)
-

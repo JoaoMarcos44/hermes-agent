@@ -246,6 +246,49 @@ async def test_pending_synthetic_and_human_text_keep_prompt_identity_separate():
 
 
 @pytest.mark.asyncio
+async def test_three_incompatible_busy_text_arrivals_remain_lossless_and_fifo():
+    """Pending A -> debounce B -> incoming C must retain all three in admission order."""
+    adapter = _make_adapter()
+    overflow: list[MessageEvent] = []
+
+    class _FifoOwner:
+        def _queue_or_replace_pending_event(self, session_key, event):
+            overflow.append(event)
+            event._gateway_accepted = True
+
+    adapter.gateway_runner = _FifoOwner()
+
+    synthetic = _make_event("synthetic-head", chat_type="group", user_id="alice")
+    synthetic.message_id = None
+    synthetic.preserve_prompt_pins = True
+    session_key = build_session_key(synthetic.source)
+    adapter._pending_messages[session_key] = synthetic
+
+    bob = _make_event("bob-buffered", chat_type="group", user_id="bob")
+    alice = _make_event("alice-must-survive", chat_type="group", user_id="alice")
+    await adapter._queue_text_debounce(session_key, bob)
+    await adapter._queue_text_debounce(session_key, alice)
+
+    assert adapter._pending_messages[session_key] is synthetic
+    assert overflow == [bob]
+    assert _debounced_event(adapter, session_key) is alice
+    assert bob._gateway_accepted is True
+    assert alice._gateway_accepted is True
+
+    drain_order = [adapter._pending_messages.pop(session_key).text]
+    adapter._pending_messages[session_key] = overflow.pop(0)
+    assert await adapter._flush_text_debounce_now(session_key) is False
+    drain_order.append(adapter._pending_messages.pop(session_key).text)
+    assert await adapter._flush_text_debounce_now(session_key) is True
+    drain_order.append(adapter._pending_messages.pop(session_key).text)
+
+    assert drain_order == ["synthetic-head", "bob-buffered", "alice-must-survive"]
+    assert [synthetic.preserve_prompt_pins, bob.preserve_prompt_pins, alice.preserve_prompt_pins] == [
+        True, False, False,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter = _make_adapter()
     started: list[str] = []

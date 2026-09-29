@@ -3819,7 +3819,25 @@ class BasePlatformAdapter(ABC):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
-                return
+                    event._gateway_accepted = True
+                    return
+
+                # Both storage positions are incompatible. Preserve admission order by moving the
+                # OLDER debounce event behind the pending head in the runner FIFO, then let the new
+                # arrival become the fresh debounce state. Returning here used to silently drop the
+                # third event (pending A -> debounce B -> incoming C).
+                queue_pending = getattr(
+                    getattr(self, "gateway_runner", None), "_queue_or_replace_pending_event", None
+                )
+                buffered = state.event
+                if not callable(queue_pending):
+                    return
+                queue_pending(session_key, buffered)
+                if not getattr(buffered, "_gateway_accepted", False):
+                    return
+                state.cancel_timer()
+                store.pop(session_key, None)
+                state = None
         now = time.monotonic()
         if state is None:
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
@@ -3835,6 +3853,7 @@ class BasePlatformAdapter(ABC):
             if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
                 state.event.reply_to_message_id = str(latest_anchor)
             state.last_ts = now
+        event._gateway_accepted = True
         state.cancel_timer()
         delay = self._text_debounce_delay(session_key)
         state.task = asyncio.create_task(self._flush_text_debounce(session_key, delay))
