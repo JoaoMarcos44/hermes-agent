@@ -3826,14 +3826,16 @@ class BasePlatformAdapter(ABC):
                 # OLDER debounce event behind the pending head in the runner FIFO, then let the new
                 # arrival become the fresh debounce state. Returning here used to silently drop the
                 # third event (pending A -> debounce B -> incoming C).
-                queue_pending = getattr(
-                    getattr(self, "gateway_runner", None), "_queue_or_replace_pending_event", None
+                transfer_pending = getattr(
+                    getattr(self, "gateway_runner", None), "_try_enqueue_fifo_event", None
                 )
                 buffered = state.event
-                if not callable(queue_pending):
+                if not callable(transfer_pending):
                     return
-                queue_pending(session_key, buffered)
-                if not getattr(buffered, "_gateway_accepted", False):
+                # The debounce admission receipt on buffered may already be True. Use this
+                # transfer own result, and bypass the generic photo merge path because the event
+                # was explicitly separated from both the pending head and the new arrival.
+                if not transfer_pending(session_key, buffered, self):
                     return
                 state.cancel_timer()
                 store.pop(session_key, None)

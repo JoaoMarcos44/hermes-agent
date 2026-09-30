@@ -113,6 +113,28 @@ class GatewayBusySessionMixin:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
 
+    def _try_enqueue_fifo_event(
+        self, session_key: str, queued_event: "MessageEvent", adapter: Any,
+    ) -> bool:
+        """Append queued_event without coalescing and report this transfer result.
+
+        Debounce uses this after it already decided two events must stay separate. Re-entering
+        the generic busy queue there would allow photo coalescing to undo the sender/prompt-identity
+        boundary. The boolean is a fresh receipt: an event may already carry an old
+        _gateway_accepted=True from its original debounce admission.
+        """
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not isinstance(pending_slot, dict):
+            return False
+        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+            logger.warning(
+                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                session_key, self._BUSY_QUEUE_MAX_PENDING,
+            )
+            return False
+        self._enqueue_fifo(session_key, queued_event, adapter)
+        return True
+
     def _requeue_before_pending_slot(
         self, session_key: str, queued_event: "MessageEvent", adapter: Any
     ) -> None:
@@ -430,14 +452,7 @@ class GatewayBusySessionMixin:
             event._gateway_accepted = True
             return
 
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
-            logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
-                session_key, self._BUSY_QUEUE_MAX_PENDING,
-            )
-            return
-
-        self._enqueue_fifo(session_key, event, adapter)
+        self._try_enqueue_fifo_event(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.

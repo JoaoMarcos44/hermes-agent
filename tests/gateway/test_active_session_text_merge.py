@@ -252,9 +252,10 @@ async def test_three_incompatible_busy_text_arrivals_remain_lossless_and_fifo():
     overflow: list[MessageEvent] = []
 
     class _FifoOwner:
-        def _queue_or_replace_pending_event(self, session_key, event):
+        def _try_enqueue_fifo_event(self, session_key, event, adapter):
             overflow.append(event)
             event._gateway_accepted = True
+            return True
 
     adapter.gateway_runner = _FifoOwner()
 
@@ -286,6 +287,82 @@ async def test_three_incompatible_busy_text_arrivals_remain_lossless_and_fifo():
     assert [synthetic.preserve_prompt_pins, bob.preserve_prompt_pins, alice.preserve_prompt_pins] == [
         True, False, False,
     ]
+
+@pytest.mark.asyncio
+async def test_debounce_spill_refusal_keeps_older_buffer_and_rejects_new_arrival():
+    """A full FIFO must not treat the buffer old acceptance flag as a transfer receipt."""
+    from gateway.run import GatewayRunner
+
+    adapter = _make_adapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._queued_events = {}
+    runner._BUSY_QUEUE_MAX_PENDING = 1
+    adapter.gateway_runner = runner
+
+    head = _make_event("head", chat_type="group", user_id="alice")
+    head.preserve_prompt_pins = True
+    session_key = build_session_key(head.source)
+    adapter._pending_messages[session_key] = head
+
+    buffered = _make_event("buffered", chat_type="group", user_id="bob")
+    incoming = _make_event("incoming", chat_type="group", user_id="carol")
+    await adapter._queue_text_debounce(session_key, buffered)
+    assert buffered._gateway_accepted is True
+
+    await adapter._queue_text_debounce(session_key, incoming)
+
+    assert adapter._pending_messages[session_key] is head
+    assert _debounced_event(adapter, session_key) is buffered
+    assert runner._queued_events.get(session_key, []) == []
+    assert incoming._gateway_accepted is False
+
+
+@pytest.mark.asyncio
+async def test_sender_separated_debounce_spill_bypasses_photo_coalescing():
+    """Alice PHOTO -> Bob TEXT -> Carol TEXT preserves three distinct owners in FIFO order."""
+    from gateway.run import GatewayRunner
+
+    adapter = _make_adapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._queued_events = {}
+    runner._BUSY_QUEUE_MAX_PENDING = 32
+    adapter.gateway_runner = runner
+
+    alice = MessageEvent(
+        text="alice-first",
+        message_type=MessageType.PHOTO,
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="group-1", chat_type="group",
+            user_id="101", user_name="alice",
+        ),
+        message_id="201",
+        media_urls=["/tmp/alice.jpg"],
+        media_types=["image/jpeg"],
+    )
+    bob = _make_event(
+        "bob-second", chat_id="group-1", chat_type="group", user_id="102", user_name="bob",
+    )
+    bob.message_id = "202"
+    carol = _make_event(
+        "carol-third", chat_id="group-1", chat_type="group", user_id="103", user_name="carol",
+    )
+    carol.message_id = "203"
+    session_key = build_session_key(alice.source)
+    assert session_key == build_session_key(bob.source) == build_session_key(carol.source)
+    adapter._pending_messages[session_key] = alice
+
+    await adapter._queue_text_debounce(session_key, bob)
+    await adapter._queue_text_debounce(session_key, carol)
+
+    assert adapter._pending_messages[session_key] is alice
+    assert [
+        (event.text, event.source.user_id, event.message_id)
+        for event in runner._queued_events[session_key]
+    ] == [("bob-second", "102", "202")]
+    assert _debounced_event(adapter, session_key) is carol
+    assert alice.text == "alice-first"
+    assert alice.source.user_id == "101"
+    assert alice.message_id == "201"
 
 
 @pytest.mark.asyncio
