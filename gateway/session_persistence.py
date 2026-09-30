@@ -266,17 +266,20 @@ class SessionPersistenceMixin:
         if cache_key in cache:
             return dict(cache[cache_key])
         getter = self._routing_db_method("get_meta")
+        if getter is None:
+            # A temporarily unavailable routing DB is not an authoritative negative lookup.
+            # Leave this miss unpublished so the next interaction retries after recovery.
+            return {}
         record: Dict[str, Optional[str]] = {}
-        if getter is not None:
-            raw = getter(self._relay_discord_context_meta_key(kind, scope_id, entity_id))
-            if raw:
-                loaded = json.loads(raw)
-                if isinstance(loaded, dict):
-                    record = {
-                        str(k): (str(v) if v is not None else None)
-                        for k, v in loaded.items()
-                        if k in {"chat_name", "chat_topic", "parent_chat_id", "user_name"}
-                    }
+        raw = getter(self._relay_discord_context_meta_key(kind, scope_id, entity_id))
+        if raw:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                record = {
+                    str(k): (str(v) if v is not None else None)
+                    for k, v in loaded.items()
+                    if k in {"chat_name", "chat_topic", "parent_chat_id", "user_name"}
+                }
         self._publish_relay_discord_context_record(cache, cache_key, record)
         return dict(record)
 
@@ -311,6 +314,10 @@ class SessionPersistenceMixin:
             return False
 
         setter = self._routing_db_method("set_meta")
+        if setter is None:
+            # Publish only values that are known durable. Otherwise an identical later
+            # observation would hit the cache and permanently suppress the persistence retry.
+            return False
         changed = False
         with self._relay_discord_context_lock():
             cache = self._relay_discord_context_cache()
@@ -325,11 +332,10 @@ class SessionPersistenceMixin:
                 }
                 if merged == current:
                     continue
-                if setter is not None:
-                    setter(
-                        self._relay_discord_context_meta_key(kind, scope_id, entity_id),
-                        json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
-                    )
+                setter(
+                    self._relay_discord_context_meta_key(kind, scope_id, entity_id),
+                    json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
+                )
                 cache = self._publish_relay_discord_context_record(
                     cache, (kind, scope_id, entity_id), merged
                 )
@@ -356,6 +362,8 @@ class SessionPersistenceMixin:
             return False
 
         setter = self._routing_db_method("set_meta")
+        if setter is None:
+            return False
         changed = False
         with self._relay_discord_context_lock():
             cache = self._relay_discord_context_cache()
@@ -364,11 +372,10 @@ class SessionPersistenceMixin:
                 merged = {**current, **incoming}
                 if merged == current:
                     continue
-                if setter is not None:
-                    setter(
-                        self._relay_discord_context_meta_key(kind, scope_id, entity_id),
-                        json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
-                    )
+                setter(
+                    self._relay_discord_context_meta_key(kind, scope_id, entity_id),
+                    json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
+                )
                 cache = self._publish_relay_discord_context_record(
                     cache, (kind, scope_id, entity_id), merged
                 )

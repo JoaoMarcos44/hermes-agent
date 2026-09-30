@@ -1,5 +1,6 @@
 """Relayed Discord messages and interactions must share one prompt/session identity."""
 
+import asyncio
 import json
 import threading
 from unittest.mock import AsyncMock
@@ -477,3 +478,79 @@ async def test_unchanged_text_context_skips_worker_round_trip(tmp_path, monkeypa
     repeat.message_id = "m2"
     await adapter._on_inbound(repeat)
     assert calls == 0
+
+
+
+def test_unavailable_context_db_stays_retryable(tmp_path, monkeypatch):
+    """Unavailable reads/writes must not become authoritative cache state."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    source = _message().source
+    original_method = store._routing_db_method
+    blocked = {"set": True, "get": False}
+
+    def routed_method(name):
+        if name == "set_meta" and blocked["set"]:
+            return None
+        if name == "get_meta" and blocked["get"]:
+            return None
+        return original_method(name)
+
+    monkeypatch.setattr(store, "_routing_db_method", routed_method)
+
+    # A recoverable write outage must not publish the new value. The identical next
+    # observation therefore still reaches persistence after the DB recovers.
+    assert store.observe_relay_discord_context(source) is False
+    assert store.cached_relay_discord_context("g1", "ch1", "u1") == {}
+
+    blocked["set"] = False
+    assert store.observe_relay_discord_context(source) is True
+    cached = store.cached_relay_discord_context("g1", "ch1", "u1")
+    assert cached["chat_name"] == source.chat_name
+    assert cached["user_name"] == source.user_name
+
+    # A recoverable cold-read outage is not the same thing as a durable miss either.
+    store._relay_discord_context_cache_map = {}
+    blocked["get"] = True
+    assert store.relay_discord_context("g1", "ch1", "u1") == {}
+    assert store.cached_relay_discord_context("g1", "ch1", "u1") == {}
+
+    blocked["get"] = False
+    restored = store.relay_discord_context("g1", "ch1", "u1")
+    assert restored["chat_name"] == source.chat_name
+    assert restored["user_name"] == source.user_name
+
+
+@pytest.mark.asyncio
+async def test_dm_interaction_uses_current_payload_identity(tmp_path):
+    """A DM user object is current; cached text identity must not overwrite it."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _ = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+
+    old = _event_from_wire({
+        "text": "hello",
+        "message_type": "text",
+        "source": {
+            "platform": "discord",
+            "chat_id": "dm1",
+            "chat_type": "dm",
+            "user_id": "u1",
+            "user_name": "ben",
+            "user_display_name": "Old Name",
+            "message_id": "dm-text-1",
+        },
+    })
+    await adapter._on_inbound(old)
+
+    current = await _passthrough_event(adapter, _forward(
+        guild_id=None,
+        channel_id="dm1",
+        id="dm-interaction-1",
+        member=None,
+        user={"id": "u1", "username": "ben", "global_name": "New Name"},
+    ))
+    assert current.source.user_name == "New Name"
+    assert store.cached_relay_discord_context("", "dm1", "u1")["user_name"] == "New Name"

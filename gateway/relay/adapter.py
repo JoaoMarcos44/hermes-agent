@@ -983,14 +983,18 @@ class RelayAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _discord_interaction_user_name(
-        member: Dict[str, Any], user: Dict[str, Any], known_name: Optional[str],
+        member: Dict[str, Any], user: Dict[str, Any], known_name: Optional[str], *,
+        is_guild: bool,
     ) -> Tuple[Optional[str], bool]:
         """Return (display name, payload-is-authoritative).
 
         Discord marks member.nick optional. Absence does not prove a known guild nickname was
-        removed, while an explicitly present null does. DMs have no guild member and are complete
-        from the user object.
+        removed, while an explicitly present null does. A DM has no guild-member ambiguity:
+        its user object is the current authoritative identity and must outrank cached text state.
         """
+        if not is_guild:
+            fallback = user.get("global_name") or user.get("username")
+            return (str(fallback) if fallback else None), True
         if "nick" in member:
             nick = member.get("nick")
             if nick:
@@ -1343,6 +1347,7 @@ class RelayAdapter(BasePlatformAdapter):
             member if isinstance(member, dict) else {},
             user,
             context.get("user_name"),
+            is_guild=bool(guild_id),
         )
         chat_name = context.get("chat_name")
         chat_topic = context.get("chat_topic")
