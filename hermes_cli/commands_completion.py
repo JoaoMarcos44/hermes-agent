@@ -183,6 +183,19 @@ def _extract_path_word(text: str) -> str | None:
     return word if word and "://" not in word and "/" in word else None
 
 
+def _is_namespace_or_unc_path(path: str) -> bool:
+    """Device namespaces and UNC paths can have a different drive than the CLI cwd."""
+    prefix = os.sep * 2
+    if not path.startswith(prefix):
+        return False
+    extended_prefix = prefix + "?" + os.sep
+    if path.startswith(extended_prefix):
+        drive_path = path[len(extended_prefix):]
+        if len(drive_path) >= 2 and drive_path[0].isalpha() and drive_path[1] == ":":
+            return False
+    return True
+
+
 def _dir_completions(
     expanded: str, word: str, limit: int, text_for: Callable[[str], str],
     want_dir: bool | None = None):
@@ -210,8 +223,15 @@ def _dir_completions(
         if count >= limit:
             break
         suffix = "/" if is_dir else ""
+        try:
+            text = text_for(full_path)
+        except ValueError:
+            if not _is_namespace_or_unc_path(full_path):
+                raise
+            typed_directory = word[:-len(prefix)] if prefix else word
+            text = typed_directory + entry
         yield _completion(
-            text_for(full_path) + suffix, word, entry + suffix,
+            text + suffix, word, entry + suffix,
             "dir" if is_dir else _file_size_label(full_path))
         count += 1
 
