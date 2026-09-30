@@ -1628,14 +1628,15 @@ class GatewayInboundMixin:
         # system prompt — it changes every turn and would bust the agent-cache signature. It is
         # the OUTERMOST prefix so strip_discord_triggering_note can peel exactly it off the
         # persisted transcript row without touching the reply pointer.
-        if (
-            source is not None
-            and getattr(source, "platform", None) == Platform.DISCORD
-            and getattr(event, "message_id", None)
-        ):
-            from gateway.session import _discord_tools_loaded as _disc_tools_loaded
-            if _disc_tools_loaded():
-                message_text = f"{discord_triggering_note(event.message_id)}\n\n{message_text}"
+        if source is not None and getattr(source, "platform", None) == Platform.DISCORD:
+            from gateway.platforms.base import _reply_anchor_for_event
+            triggering_message_id = _reply_anchor_for_event(event)
+            if triggering_message_id:
+                from gateway.session import _discord_tools_loaded as _disc_tools_loaded
+                if _disc_tools_loaded():
+                    message_text = (
+                        f"{discord_triggering_note(triggering_message_id)}\n\n{message_text}"
+                    )
         return message_text
 
     async def _inbound_model_context_length(self, source: SessionSource, session_key: str) -> int:

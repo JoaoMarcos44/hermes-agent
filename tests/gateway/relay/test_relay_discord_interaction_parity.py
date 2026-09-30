@@ -419,6 +419,8 @@ def test_message_identity_is_normalized_at_each_ingress_boundary():
     assert component.source.message_id == "actual-message-77"
     assert component.message_id == "interaction-1"
     assert component.metadata["discord_interaction_id"] == "interaction-1"
+    from gateway.platforms.base import _reply_anchor_for_event
+    assert _reply_anchor_for_event(component) == "actual-message-77"
 
     slash = adapter._discord_interaction_to_event(_forward(
         type=2,
@@ -430,6 +432,7 @@ def test_message_identity_is_normalized_at_each_ingress_boundary():
     assert slash.source.message_id is None
     assert slash.message_id == "interaction-2"
     assert slash.metadata["discord_interaction_id"] == "interaction-2"
+    assert _reply_anchor_for_event(slash) is None
 
 
 @pytest.mark.asyncio
@@ -691,3 +694,38 @@ async def test_two_component_presses_keep_distinct_durable_turn_identity(tmp_pat
     assert store.has_platform_message_id(entry.session_id, third.message_id)
     assert db.get_messages(entry.session_id)[-1]["content"] == FAILED_TURN_NOTICE
     db.close()
+
+
+
+def test_discord_interaction_triggering_note_uses_message_anchor(monkeypatch):
+    """Tool guidance must name a real Discord message, never an interaction id."""
+    import gateway.session as gateway_session
+
+    monkeypatch.setattr(gateway_session, "_discord_tools_loaded", lambda: True)
+    adapter, _ = _adapter(platform="discord")
+
+    component = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="press-anchor-1",
+        message={"id": "bot-message-88"},
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"custom_id": "foreign-button"},
+    ))
+    assert component is not None
+    prepared = gateway_run.GatewayRunner._prepend_inbound_reply_context(
+        component, component.source, "do it",
+    )
+    assert "Triggering message id: `bot-message-88`" in prepared
+    assert "press-anchor-1" not in prepared
+
+    slash = adapter._discord_interaction_to_event(_forward(
+        type=2,
+        id="slash-anchor-1",
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"name": "status"},
+    ))
+    assert slash is not None
+    slash_prepared = gateway_run.GatewayRunner._prepend_inbound_reply_context(
+        slash, slash.source, "status",
+    )
+    assert "Triggering message id:" not in slash_prepared
