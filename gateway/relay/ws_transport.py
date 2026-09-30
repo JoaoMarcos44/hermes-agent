@@ -197,7 +197,7 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         chat_id_alt=src.get("chat_id_alt"),
         scope_id=src.get("scope_id"),
         parent_chat_id=src.get("parent_chat_id"),
-        message_id=src.get("message_id"),
+        message_id=src.get("message_id") or raw.get("message_id"),
         # Multiplex mode: the connector stamps the target Hermes profile; None on
         # a single-profile gateway keeps the legacy ``agent:main`` namespace.
         profile=src.get("profile"),

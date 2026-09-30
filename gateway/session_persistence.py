@@ -264,7 +264,9 @@ class SessionPersistenceMixin:
                         for k, v in loaded.items()
                         if k in {"chat_name", "chat_topic", "parent_chat_id", "user_name"}
                     }
-        cache[cache_key] = record
+        published = dict(cache)
+        published[cache_key] = record
+        self._relay_discord_context_cache_map = published
         return dict(record)
 
     def observe_relay_discord_context(self, source: SessionSource) -> bool:
@@ -314,7 +316,50 @@ class SessionPersistenceMixin:
                         self._relay_discord_context_meta_key(kind, scope_id, entity_id),
                         json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
                     )
-                cache[(kind, scope_id, entity_id)] = merged
+                published = dict(cache)
+                published[(kind, scope_id, entity_id)] = merged
+                self._relay_discord_context_cache_map = published
+                cache = published
+                changed = True
+        return changed
+
+    def observe_relay_discord_interaction_context(
+        self, scope_id: str, chat_id: str, user_id: str, *,
+        user_name: Optional[str] = None, parent_chat_id: Optional[str] = None,
+    ) -> bool:
+        """Publish only context fields a raw Discord interaction proves.
+
+        A present member.nick (including explicit null, resolved by the caller to global
+        name/username) proves current display identity. A present thread parent_id proves
+        routing ancestry. Missing optional fields never erase a text-lane observation.
+        """
+        scope_id, chat_id, user_id = str(scope_id or ""), str(chat_id or ""), str(user_id or "")
+        updates: list[tuple[str, str, Dict[str, Optional[str]]]] = []
+        if chat_id and parent_chat_id:
+            updates.append(("chat", chat_id, {"parent_chat_id": str(parent_chat_id)}))
+        if user_id and user_name:
+            updates.append(("user", user_id, {"user_name": str(user_name)}))
+        if not updates:
+            return False
+
+        setter = self._routing_db_method("set_meta")
+        changed = False
+        with self._relay_discord_context_lock():
+            cache = self._relay_discord_context_cache()
+            for kind, entity_id, incoming in updates:
+                current = self._relay_discord_record_locked(kind, scope_id, entity_id)
+                merged = {**current, **incoming}
+                if merged == current:
+                    continue
+                if setter is not None:
+                    setter(
+                        self._relay_discord_context_meta_key(kind, scope_id, entity_id),
+                        json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
+                    )
+                published = dict(cache)
+                published[(kind, scope_id, entity_id)] = merged
+                self._relay_discord_context_cache_map = published
+                cache = published
                 changed = True
         return changed
 
@@ -332,7 +377,9 @@ class SessionPersistenceMixin:
     ) -> Dict[str, Optional[str]]:
         """Return only already-loaded context; safe for synchronous interaction conversion."""
         scope_id, chat_id, user_id = str(scope_id or ""), str(chat_id or ""), str(user_id or "")
-        cache = self._relay_discord_context_cache()
+        # Writers publish a new dict reference only after persistence succeeds. Reading the
+        # current snapshot is therefore lock-free and cannot block the event loop behind SQLite.
+        cache = getattr(self, "_relay_discord_context_cache_map", None) or {}
         result = dict(cache.get(("chat", scope_id, chat_id), {})) if chat_id else {}
         if user_id:
             result.update(cache.get(("user", scope_id, user_id), {}))

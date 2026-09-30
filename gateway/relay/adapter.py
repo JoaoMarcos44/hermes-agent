@@ -967,6 +967,54 @@ class RelayAdapter(BasePlatformAdapter):
             logger.debug("relay: persisted Discord interaction context unavailable", exc_info=True)
             return {}
 
+    @staticmethod
+    def _discord_interaction_user_name(
+        member: Dict[str, Any], user: Dict[str, Any], known_name: Optional[str],
+    ) -> Tuple[Optional[str], bool]:
+        """Return (display name, payload-is-authoritative).
+
+        Discord marks member.nick optional. Absence does not prove a known guild nickname was
+        removed, while an explicitly present null does. DMs have no guild member and are complete
+        from the user object.
+        """
+        if "nick" in member:
+            nick = member.get("nick")
+            if nick:
+                return str(nick), True
+            fallback = user.get("global_name") or user.get("username")
+            return (str(fallback) if fallback else None), True
+        if known_name:
+            return str(known_name), False
+        fallback = user.get("global_name") or user.get("username")
+        return (str(fallback) if fallback else None), False
+
+    async def _remember_discord_interaction_context(
+        self, payload: Dict[str, Any], event: MessageEvent,
+    ) -> None:
+        """Persist only raw-interaction facts that resolve a previous ambiguity."""
+        store = getattr(self, "_session_store", None)
+        observe = getattr(store, "observe_relay_discord_interaction_context", None) if store is not None else None
+        if not callable(observe):
+            return
+        member = payload.get("member") if isinstance(payload.get("member"), dict) else {}
+        channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+        is_guild = bool(payload.get("guild_id"))
+        user_is_authoritative = (not is_guild) or ("nick" in member)
+        parent = channel.get("parent_id") if channel.get("type") in (10, 11, 12) else None
+        if not user_is_authoritative and not parent:
+            return
+        try:
+            await asyncio.to_thread(
+                observe,
+                str(payload.get("guild_id") or ""),
+                str(payload.get("channel_id") or ""),
+                str(event.source.user_id or ""),
+                user_name=event.source.user_name if user_is_authoritative else None,
+                parent_chat_id=str(parent) if parent else None,
+            )
+        except Exception:
+            logger.debug("relay: failed to persist Discord interaction identity", exc_info=True)
+
     def _inbound_dedupe_key(self, event) -> Optional[str]:
         """Stable replay identity: (platform, chat, platform message id). The platform
         joins the key because one relay socket can front several platforms whose
@@ -1213,8 +1261,9 @@ class RelayAdapter(BasePlatformAdapter):
                 event = self._discord_interaction_to_event(forward, payload=payload, context=context)
                 if event is not None:
                     self._capture_scope(event)
-                    # Reconstructed interaction labels are consumers of text-lane observations,
-                    # never new observations themselves.
+                    await self._remember_discord_interaction_context(payload, event)
+                    # Reconstructed chat labels are consumers of text-lane observations; only
+                    # explicit raw interaction facts are allowed to update shared identity state.
                     # A prompt-token component press is consumed (same gate as _on_inbound).
                     if await self._consume_prompt_response(event):
                         return
@@ -1276,19 +1325,24 @@ class RelayAdapter(BasePlatformAdapter):
             if isinstance(context, dict)
             else self._cached_discord_context(scope, chat_id, str(user.get("id") or ""))
         )
-        # Match discord.py Member.display_name for complete payloads. Commit 2 below tightens the
-        # partial-member policy without changing this shared storage boundary.
-        user_name = next((
-            str(value) for value in (
-                member.get("nick") if isinstance(member, dict) else None,
-                user.get("global_name"),
-                user.get("username"),
-            ) if value
-        ), None)
+        user_name, _user_is_authoritative = self._discord_interaction_user_name(
+            member if isinstance(member, dict) else {},
+            user,
+            context.get("user_name"),
+        )
         chat_name = context.get("chat_name")
         chat_topic = context.get("chat_topic")
         channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
         is_thread = bool(guild_id) and channel.get("type") in (10, 11, 12)
+        parent_chat_id = None
+        if is_thread:
+            parent_chat_id = (
+                str(channel["parent_id"])
+                if channel.get("parent_id")
+                else context.get("parent_chat_id")
+            )
+        attached_message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        actual_message_id = str(attached_message["id"]) if attached_message.get("id") else None
         source = SessionSource(
             # The LOGICAL platform, not RELAY: session keys must match the connector's
             # capability binding (platform="discord"), /sethome must file under the
@@ -1297,13 +1351,13 @@ class RelayAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_type="thread" if is_thread else ("group" if guild_id else "dm"),
             thread_id=chat_id if is_thread else None,
-            parent_chat_id=str(channel["parent_id"]) if is_thread and channel.get("parent_id") else None,
+            parent_chat_id=parent_chat_id,
             user_id=str(user["id"]) if user.get("id") else None,
             user_name=user_name,
             chat_name=chat_name,
             chat_topic=chat_topic,
             scope_id=str(guild_id) if guild_id else None,
-            message_id=str(payload.get("id")) if payload.get("id") else None,
+            message_id=actual_message_id,
             # Same upstream-trust marker the relay text lane stamps. Set locally, never
             # read off the wire (engages /sethome's via_relay guard).
             delivered_via_upstream_relay=True,
@@ -1314,7 +1368,15 @@ class RelayAdapter(BasePlatformAdapter):
             # connector resolved a specific profile for it.
             profile=getattr(forward, "profile", None),
         )
-        event = MessageEvent(text=text, message_type=message_type, source=source)
+        event = MessageEvent(
+            text=text,
+            message_type=message_type,
+            source=source,
+            message_id=actual_message_id,
+            metadata={
+                "discord_interaction_id": str(payload.get("id"))
+            } if payload.get("id") else {},
+        )
         if itype == 3:
             # A component press whose custom_id is a Hermes prompt token
             # (hp1:<prompt_id>:<option_id>) becomes a STRUCTURED prompt answer;
@@ -1322,8 +1384,7 @@ class RelayAdapter(BasePlatformAdapter):
             decoded = self._decode_prompt_token(text)
             if decoded:
                 prompt_id, option_id = decoded
-                msg = payload.get("message") or {}
-                prompt_message_id = str(msg["id"]) if isinstance(msg, dict) and msg.get("id") else None
+                prompt_message_id = actual_message_id
                 event.prompt_response = {
                     "prompt_id": prompt_id,
                     "option_id": option_id,
