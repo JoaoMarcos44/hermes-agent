@@ -148,10 +148,11 @@ class RelayAdapter(BasePlatformAdapter):
         self._auto_thread_waiters: Dict[str, asyncio.Event] = {}
         # Bounded FIFO seen-set for inbound replay dedupe (insertion-ordered dict).
         self._seen_inbound: Dict[str, None] = {}
-        # Discord chat labels are authoritative on the connector text lane but absent from raw
-        # interaction forwards. Warm-process parity uses this bounded map; durable parity lives in
-        # SessionEntry.metadata so a channel rename survives restart without mutating routing origin.
-        self._discord_chat_labels: Dict[Tuple[str, str], Tuple[Optional[str], Optional[str]]] = {}
+        # Production adapters share one SessionStore, which owns Discord interaction context so
+        # observations made by one relay adapter are immediately visible to its peers. These two
+        # bounded maps are only the no-store compatibility path used by isolated adapters/tests.
+        self._discord_chat_fallback: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
+        self._discord_user_fallback: Dict[Tuple[str, str], Optional[str]] = {}
         # Live cards: draft_key -> draft_id of the OPEN native stream. Armed by
         # send_draft; consumed by send() to convert the turn-final into
         # draft(final=true) instead of a duplicate post. Keyed by _draft_key (chat +
@@ -886,7 +887,7 @@ class RelayAdapter(BasePlatformAdapter):
             self._seen_inbound[dedupe_key] = None
             self._evict_oldest(self._seen_inbound, self._SEEN_INBOUND_MAX)
         self._capture_scope(event)
-        self._remember_discord_labels(event.source)
+        await self._remember_discord_context(event.source)
         self._stamp_slack_session_thread(event)
         # A structured prompt answer resolves its waiting primitive and is CONSUMED —
         # never also dispatched as chat.
@@ -896,121 +897,75 @@ class RelayAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     _SEEN_INBOUND_MAX = 512
-    _DISCORD_LABELS_MAX = 2048
-    _DISCORD_LABEL_METADATA = "relay_discord_chat_labels"
+    _DISCORD_CONTEXT_MAX = 2048
 
-    def _remember_discord_labels(self, source) -> None:
-        """Remember the text lane's latest Discord chat labels, including across restarts.
-
-        SessionEntry.origin is creation-time routing state and intentionally is not rewritten on
-        every turn. Persist label observations in entry metadata instead, so a channel rename cannot
-        make the first post-restart slash command revive stale creation labels.
-        """
+    def _remember_discord_fallback(self, source) -> None:
+        """No-store compatibility cache. Production authority belongs to SessionStore."""
         platform = getattr(source, "platform", None)
         if getattr(platform, "value", platform) != Platform.DISCORD.value:
             return
-        chat_id = str(getattr(source, "chat_id", None) or "")
-        if not chat_id:
-            return
-        labels = (getattr(source, "chat_name", None), getattr(source, "chat_topic", None))
-        if not any(labels):
-            return
         scope = str(getattr(source, "scope_id", None) or "")
-        key = (scope, chat_id)
-        self._discord_chat_labels[key] = labels
-        self._evict_oldest(self._discord_chat_labels, self._DISCORD_LABELS_MAX)
+        chat_id = str(getattr(source, "chat_id", None) or "")
+        if chat_id:
+            key = (scope, chat_id)
+            previous = self._discord_chat_fallback.get(key, {})
+            current = {
+                "chat_name": getattr(source, "chat_name", None) or previous.get("chat_name"),
+                "chat_topic": getattr(source, "chat_topic", None) or previous.get("chat_topic"),
+                "parent_chat_id": (
+                    getattr(source, "parent_chat_id", None)
+                    if getattr(source, "chat_type", None) == "thread"
+                    else previous.get("parent_chat_id")
+                ),
+            }
+            self._discord_chat_fallback[key] = current
+            self._evict_oldest(self._discord_chat_fallback, self._DISCORD_CONTEXT_MAX)
+        user_id = str(getattr(source, "user_id", None) or "")
+        user_name = getattr(source, "user_name", None)
+        if user_id and user_name:
+            self._discord_user_fallback[(scope, user_id)] = str(user_name)
+            self._evict_oldest(self._discord_user_fallback, self._DISCORD_CONTEXT_MAX)
 
+    async def _remember_discord_context(self, source) -> None:
+        """Publish normalized Discord context into the shared SessionStore off the event loop."""
+        platform = getattr(source, "platform", None)
+        if getattr(platform, "value", platform) != Platform.DISCORD.value:
+            return
         store = getattr(self, "_session_store", None)
-        if store is None:
+        observe = getattr(store, "observe_relay_discord_context", None) if store is not None else None
+        if not callable(observe):
+            self._remember_discord_fallback(source)
             return
         try:
-            session_key = self._source_session_key(source)
-            peek = getattr(store, "peek_session_id", None)
-            if not callable(peek) or not peek(session_key):
-                return
-            get_meta = getattr(store, "get_session_metadata", None)
-            set_meta = getattr(store, "set_session_metadata", None)
-            if not callable(set_meta):
-                return
-            existing = get_meta(session_key, self._DISCORD_LABEL_METADATA) if callable(get_meta) else None
-            metadata_matches = isinstance(existing, dict) and (
-                existing.get("scope_id"), existing.get("chat_id"),
-                existing.get("chat_name"), existing.get("chat_topic"),
-            ) == (scope, chat_id, labels[0], labels[1])
-
-            # Keep the reset-inherited source current even if a prior metadata write succeeded but
-            # the origin refresh did not. The two stores are intentionally redundant boundaries.
-            refresh_origin = getattr(store, "set_session_origin_labels", None)
-            if callable(refresh_origin):
-                refresh_origin(
-                    session_key, chat_name=labels[0], chat_topic=labels[1],
-                )
-            if not metadata_matches:
-                set_meta(session_key, self._DISCORD_LABEL_METADATA, {
-                    "scope_id": scope,
-                    "chat_id": chat_id,
-                    "chat_name": labels[0],
-                    "chat_topic": labels[1],
-                    "observed_at_ns": time.time_ns(),
-                })
+            await asyncio.to_thread(observe, source)
         except Exception:
-            logger.debug("relay: failed to persist Discord chat labels", exc_info=True)
+            logger.debug("relay: failed to persist Discord interaction context", exc_info=True)
 
-    def _discord_chat_labels_for(self, scope: str, chat_id: str) -> Tuple[Optional[str], Optional[str]]:
-        """Return the newest text-lane labels for one Discord guild/channel pair.
-
-        On a cold process the newest durable metadata observation wins across per-user sessions.
-        Creation-time origin is only a fallback until a later text-lane observation exists.
-        """
-        key = (scope, chat_id)
-        cached = self._discord_chat_labels.get(key)
-        if cached is not None:
-            return cached
-
-        labels: Tuple[Optional[str], Optional[str]] = (None, None)
-        newest_ns = -1
+    def _cached_discord_context(self, scope: str, chat_id: str, user_id: str) -> Dict[str, Optional[str]]:
+        """Read only process-local state; never performs storage I/O."""
         store = getattr(self, "_session_store", None)
+        cached = getattr(store, "cached_relay_discord_context", None) if store is not None else None
+        if callable(cached):
+            try:
+                return dict(cached(scope, chat_id, user_id) or {})
+            except Exception:
+                logger.debug("relay: cached Discord context unavailable", exc_info=True)
+        result = dict(self._discord_chat_fallback.get((scope, chat_id), {}))
+        if user_id and (scope, user_id) in self._discord_user_fallback:
+            result["user_name"] = self._discord_user_fallback[(scope, user_id)]
+        return result
+
+    async def _discord_context_for(self, scope: str, chat_id: str, user_id: str) -> Dict[str, Optional[str]]:
+        """Load shared context off-loop. Failed reads stay retryable on the next interaction."""
+        store = getattr(self, "_session_store", None)
+        loader = getattr(store, "relay_discord_context", None) if store is not None else None
+        if not callable(loader):
+            return self._cached_discord_context(scope, chat_id, user_id)
         try:
-            entries = store.list_sessions() if store is not None else ()
-            for entry in entries:
-                metadata = getattr(entry, "metadata", None) or {}
-                observed = metadata.get(self._DISCORD_LABEL_METADATA)
-                if isinstance(observed, dict) and (
-                    str(observed.get("scope_id") or "") == scope
-                    and str(observed.get("chat_id") or "") == chat_id
-                    and (observed.get("chat_name") or observed.get("chat_topic"))
-                ):
-                    try:
-                        seen_ns = int(observed.get("observed_at_ns") or 0)
-                    except (TypeError, ValueError):
-                        seen_ns = 0
-                    if seen_ns >= newest_ns:
-                        newest_ns = seen_ns
-                        labels = (observed.get("chat_name"), observed.get("chat_topic"))
-
-                origin = getattr(entry, "origin", None)
-                origin_platform = getattr(origin, "platform", None) if origin is not None else None
-                if (
-                    origin is not None
-                    and getattr(origin_platform, "value", origin_platform) == Platform.DISCORD.value
-                    and str(getattr(origin, "scope_id", None) or "") == scope
-                    and str(getattr(origin, "chat_id", None) or "") == chat_id
-                    and (getattr(origin, "chat_name", None) or getattr(origin, "chat_topic", None))
-                ):
-                    created = getattr(entry, "created_at", None)
-                    try:
-                        created_ns = int(created.timestamp() * 1_000_000_000)
-                    except Exception:
-                        created_ns = 0
-                    if created_ns > newest_ns:
-                        newest_ns = created_ns
-                        labels = (getattr(origin, "chat_name", None), getattr(origin, "chat_topic", None))
+            return dict(await asyncio.to_thread(loader, scope, chat_id, user_id) or {})
         except Exception:
-            logger.debug("relay: persisted Discord labels unavailable", exc_info=True)
-
-        self._discord_chat_labels[key] = labels
-        self._evict_oldest(self._discord_chat_labels, self._DISCORD_LABELS_MAX)
-        return labels
+            logger.debug("relay: persisted Discord interaction context unavailable", exc_info=True)
+            return {}
 
     def _inbound_dedupe_key(self, event) -> Optional[str]:
         """Stable replay identity: (platform, chat, platform message id). The platform
@@ -1243,10 +1198,23 @@ class RelayAdapter(BasePlatformAdapter):
         try:
             platform = getattr(forward, "platform", "") or ""
             if platform == "discord":
-                event = self._discord_interaction_to_event(forward)
+                payload = self._discord_interaction_payload(forward)
+                if payload is None:
+                    return
+                member = payload.get("member") if isinstance(payload.get("member"), dict) else {}
+                user = (member.get("user") if isinstance(member, dict) else None) or payload.get("user") or {}
+                if not isinstance(user, dict):
+                    user = {}
+                context = await self._discord_context_for(
+                    str(payload.get("guild_id") or ""),
+                    str(payload.get("channel_id") or ""),
+                    str(user.get("id") or ""),
+                )
+                event = self._discord_interaction_to_event(forward, payload=payload, context=context)
                 if event is not None:
                     self._capture_scope(event)
-                    self._remember_discord_labels(event.source)
+                    # Reconstructed interaction labels are consumers of text-lane observations,
+                    # never new observations themselves.
                     # A prompt-token component press is consumed (same gate as _on_inbound).
                     if await self._consume_prompt_response(event):
                         return
@@ -1259,16 +1227,26 @@ class RelayAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 - a bad forward must never break the reader
             logger.warning("relay passthrough_forward handling failed", exc_info=True)
 
-    def _discord_interaction_to_event(self, forward):
-        """Convert a forwarded Discord interaction body to a MessageEvent, or None for
-        an unusable body (a PING is answered at the edge and never forwarded). The
-        session source mirrors the connector's ``interactionSessionSource`` so the
-        session key matches the one the follow-up capability was bound under."""
+    @staticmethod
+    def _discord_interaction_payload(forward) -> Optional[Dict[str, Any]]:
+        """Parse one forwarded Discord interaction body without performing any storage I/O."""
         try:
             payload = json.loads(bytes(getattr(forward, "body", b"")).decode("utf-8"))
         except Exception:  # noqa: BLE001
             return None
-        if not isinstance(payload, dict):
+        return payload if isinstance(payload, dict) else None
+
+    def _discord_interaction_to_event(
+        self, forward, *, payload: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Optional[str]]] = None,
+    ):
+        """Convert a Discord interaction to a MessageEvent.
+
+        Production callers preload *context* asynchronously. Direct synchronous callers use only
+        already-cached process state, so this conversion can never block on SQLite.
+        """
+        payload = payload if isinstance(payload, dict) else self._discord_interaction_payload(forward)
+        if payload is None:
             return None
         # type 2 = APPLICATION_COMMAND; 3 = MESSAGE_COMPONENT; 5 = MODAL_SUBMIT.
         itype = payload.get("type")
@@ -1293,7 +1271,13 @@ class RelayAdapter(BasePlatformAdapter):
         guild_id = payload.get("guild_id")
         scope = str(guild_id or "")
         chat_id = str(payload.get("channel_id") or "")
-        # Match discord.py Member.display_name: guild nick, then global display name, then username.
+        context = (
+            dict(context)
+            if isinstance(context, dict)
+            else self._cached_discord_context(scope, chat_id, str(user.get("id") or ""))
+        )
+        # Match discord.py Member.display_name for complete payloads. Commit 2 below tightens the
+        # partial-member policy without changing this shared storage boundary.
         user_name = next((
             str(value) for value in (
                 member.get("nick") if isinstance(member, dict) else None,
@@ -1301,7 +1285,8 @@ class RelayAdapter(BasePlatformAdapter):
                 user.get("username"),
             ) if value
         ), None)
-        chat_name, chat_topic = self._discord_chat_labels_for(scope, chat_id)
+        chat_name = context.get("chat_name")
+        chat_topic = context.get("chat_topic")
         channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
         is_thread = bool(guild_id) and channel.get("type") in (10, 11, 12)
         source = SessionSource(

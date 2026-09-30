@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 from utils import atomic_json_write
 
 if TYPE_CHECKING:
-    from gateway.session import SessionEntry
+    from gateway.session import SessionEntry, SessionSource
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.session")
@@ -233,6 +233,110 @@ class SessionPersistenceMixin:
         """Bound ``_routing_db.<name>`` if the handle exists and has it, else None."""
         method = getattr(self._routing_db or None, name, None)
         return method if callable(method) else None
+
+    @staticmethod
+    def _relay_discord_context_meta_key(kind: str, scope_id: str, entity_id: str) -> str:
+        return f"relay_discord_context:v1:{kind}:{scope_id}:{entity_id}"
+
+    def _relay_discord_context_lock(self):
+        return self._lazy("_relay_discord_context_guard", threading.Lock)
+
+    def _relay_discord_context_cache(self):
+        return self._lazy("_relay_discord_context_cache_map", dict)
+
+    def _relay_discord_record_locked(
+        self, kind: str, scope_id: str, entity_id: str,
+    ) -> Dict[str, Optional[str]]:
+        """Read one authoritative relay context record. Caller holds the context lock."""
+        cache = self._relay_discord_context_cache()
+        cache_key = (kind, scope_id, entity_id)
+        if cache_key in cache:
+            return dict(cache[cache_key])
+        getter = self._routing_db_method("get_meta")
+        record: Dict[str, Optional[str]] = {}
+        if getter is not None:
+            raw = getter(self._relay_discord_context_meta_key(kind, scope_id, entity_id))
+            if raw:
+                loaded = json.loads(raw)
+                if isinstance(loaded, dict):
+                    record = {
+                        str(k): (str(v) if v is not None else None)
+                        for k, v in loaded.items()
+                        if k in {"chat_name", "chat_topic", "parent_chat_id", "user_name"}
+                    }
+        cache[cache_key] = record
+        return dict(record)
+
+    def observe_relay_discord_context(self, source: SessionSource) -> bool:
+        """Publish connector-normalized Discord context under one shared, chat/user authority.
+
+        All adapters attached to this SessionStore see the same cache immediately. Storage writes
+        happen before publication, so a failed write never suppresses the next retry. Session
+        creation/reset timestamps are intentionally absent: they are not observations of channel
+        metadata.
+        """
+        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", None))
+        if platform != "discord":
+            return False
+        scope_id = str(getattr(source, "scope_id", None) or "")
+        chat_id = str(getattr(source, "chat_id", None) or "")
+        user_id = str(getattr(source, "user_id", None) or "")
+        updates: list[tuple[str, str, Dict[str, Optional[str]]]] = []
+        if chat_id:
+            updates.append(("chat", chat_id, {
+                "chat_name": getattr(source, "chat_name", None),
+                "chat_topic": getattr(source, "chat_topic", None),
+                "parent_chat_id": (
+                    getattr(source, "parent_chat_id", None)
+                    if getattr(source, "chat_type", None) == "thread"
+                    else None
+                ),
+            }))
+        if user_id and getattr(source, "user_name", None):
+            updates.append(("user", user_id, {"user_name": str(source.user_name)}))
+        if not updates:
+            return False
+
+        setter = self._routing_db_method("set_meta")
+        changed = False
+        with self._relay_discord_context_lock():
+            cache = self._relay_discord_context_cache()
+            for kind, entity_id, incoming in updates:
+                current = self._relay_discord_record_locked(kind, scope_id, entity_id)
+                merged = dict(current)
+                for key, value in incoming.items():
+                    if value is not None:
+                        merged[key] = str(value)
+                if merged == current:
+                    continue
+                if setter is not None:
+                    setter(
+                        self._relay_discord_context_meta_key(kind, scope_id, entity_id),
+                        json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
+                    )
+                cache[(kind, scope_id, entity_id)] = merged
+                changed = True
+        return changed
+
+    def relay_discord_context(self, scope_id: str, chat_id: str, user_id: str = "") -> Dict[str, Optional[str]]:
+        """Return shared Discord chat/user context, reading durable state on cache misses."""
+        scope_id, chat_id, user_id = str(scope_id or ""), str(chat_id or ""), str(user_id or "")
+        with self._relay_discord_context_lock():
+            result = self._relay_discord_record_locked("chat", scope_id, chat_id) if chat_id else {}
+            if user_id:
+                result.update(self._relay_discord_record_locked("user", scope_id, user_id))
+            return result
+
+    def cached_relay_discord_context(
+        self, scope_id: str, chat_id: str, user_id: str = "",
+    ) -> Dict[str, Optional[str]]:
+        """Return only already-loaded context; safe for synchronous interaction conversion."""
+        scope_id, chat_id, user_id = str(scope_id or ""), str(chat_id or ""), str(user_id or "")
+        cache = self._relay_discord_context_cache()
+        result = dict(cache.get(("chat", scope_id, chat_id), {})) if chat_id else {}
+        if user_id:
+            result.update(cache.get(("user", scope_id, user_id), {}))
+        return result
 
     def _load_routing_rows_locked(self) -> bool:
         """Load state.db routing entries into ``_entries``; False when there is no loader or the
