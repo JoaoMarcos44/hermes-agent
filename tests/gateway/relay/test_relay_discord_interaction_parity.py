@@ -729,3 +729,33 @@ def test_discord_interaction_triggering_note_uses_message_anchor(monkeypatch):
         slash, slash.source, "status",
     )
     assert "Triggering message id:" not in slash_prepared
+
+
+
+def test_discord_interaction_busy_reply_uses_attached_message_anchor():
+    """Busy-path replies must not send a Discord interaction id as reply_to."""
+    from gateway.platforms.base import _reply_anchor_for_event
+
+    adapter, _ = _adapter(platform="discord")
+    component = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="busy-press-1",
+        message={"id": "bot-message-99"},
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"custom_id": "foreign-button"},
+    ))
+    assert component is not None
+    anchor = _reply_anchor_for_event(component)
+    assert anchor == "bot-message-99"
+    assert gateway_run.GatewayRunner._busy_reply_to(component, anchor) == "bot-message-99"
+
+    slash = adapter._discord_interaction_to_event(_forward(
+        type=2,
+        id="busy-slash-1",
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"name": "status"},
+    ))
+    assert slash is not None
+    assert gateway_run.GatewayRunner._busy_reply_to(
+        slash, _reply_anchor_for_event(slash),
+    ) is None
