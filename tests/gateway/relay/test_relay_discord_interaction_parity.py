@@ -482,7 +482,6 @@ async def test_unchanged_text_context_skips_worker_round_trip(tmp_path, monkeypa
     assert calls == 0
 
 
-
 def test_unavailable_context_db_stays_retryable(tmp_path, monkeypatch):
     """Unavailable reads/writes must not become authoritative cache state."""
     config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
@@ -558,11 +557,10 @@ async def test_dm_interaction_uses_current_payload_identity(tmp_path):
     assert store.cached_relay_discord_context("", "dm1", "u1")["user_name"] == "New Name"
 
 
-
 @pytest.mark.asyncio
 async def test_two_component_presses_keep_distinct_durable_turn_identity(tmp_path):
     """Two presses on one bot message share a reply anchor, never an inbound owner."""
-    from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
+    from agent.turn_failure_copy import FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 
     adapter, _ = _adapter(platform="discord")
     member = {"user": {"id": "u1", "username": "ben"}}
@@ -691,5 +689,5 @@ async def test_two_component_presses_keep_distinct_durable_turn_identity(tmp_pat
     )
     assert db.message_count() == before + 2
     assert store.has_platform_message_id(entry.session_id, third.message_id)
-    assert db.get_messages(entry.session_id)[-1]["content"] == PARTIAL_FAILED_TURN_NOTICE
+    assert db.get_messages(entry.session_id)[-1]["content"] == FAILED_TURN_NOTICE
     db.close()
