@@ -220,6 +220,28 @@ class TestMissingProviderKeyBlocks:
         assert "openrouter" not in calls
 
 
+class TestModelCooldownIsNotMissingCredential:
+    def test_anthropic_model_cooldown_fails_open_to_runtime(self, monkeypatch):
+        """A healthy Anthropic credential cooled for one model is not a missing-key verdict."""
+        from cron.scheduler_preflight import _preflight_check_provider_key
+        from hermes_cli.auth import ANTHROPIC_MODEL_RATE_LIMITED_CODE, AuthError
+
+        def _cooldown(**_kwargs):
+            raise AuthError(
+                "Anthropic credentials are rate-limited for claude-opus-5-5",
+                provider="anthropic",
+                code=ANTHROPIC_MODEL_RATE_LIMITED_CODE,
+                retry_after=90.0,
+                retryable=True,
+            )
+
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _cooldown)
+
+        assert _preflight_check_provider_key(
+            _job(provider="anthropic", model="claude-opus-5-5"), {}
+        ) is None
+
+
 class TestHealthyJobUnaffected:
     def test_healthy_job_runs_normally(self, tmp_path):
         job = _job()

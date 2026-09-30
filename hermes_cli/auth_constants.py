@@ -131,6 +131,9 @@ ACTUAL_LOCAL_NOAUTH_PLACEHOLDER = "dummy-actual-local-api-key"
 # Upstream rate-limit / usage-quota exhaustion (HTTP 429): transient, re-authenticating cannot resolve
 # it, so it must stay distinct from missing/expired-credential errors.
 CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
+# A native Anthropic credential can be healthy globally while one model is inside a persisted
+# rate-limit cooldown. Keep that state provider-specific instead of borrowing Codex's sentinel.
+ANTHROPIC_MODEL_RATE_LIMITED_CODE = "anthropic_model_rate_limited"
 
 
 class AuthError(RuntimeError):

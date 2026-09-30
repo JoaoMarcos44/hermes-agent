@@ -104,7 +104,8 @@ from hermes_cli.auth_constants import (  # noqa: F401  re-exported
     XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL, DEFAULT_SPOTIFY_API_BASE_URL, SPOTIFY_DOCS_URL,
     DEFAULT_SPOTIFY_SCOPE, SERVICE_PROVIDER_NAMES, LMSTUDIO_NOAUTH_PLACEHOLDER,
-    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, CODEX_RATE_LIMITED_CODE, AuthError, _nous_err, httpx)
+    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, ANTHROPIC_MODEL_RATE_LIMITED_CODE, CODEX_RATE_LIMITED_CODE,
+    AuthError, _nous_err, httpx)
 
 logger = logging.getLogger(__name__)
 
@@ -441,11 +442,17 @@ def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) 
 
 # ── Error formatting (AuthError itself lives in auth_constants) ─────────────────────────────────────
 
+_RATE_LIMITED_AUTH_CODES = frozenset({
+    CODEX_RATE_LIMITED_CODE,
+    ANTHROPIC_MODEL_RATE_LIMITED_CODE,
+})
+
+
 def is_rate_limited_auth_error(error: Exception) -> bool:
     """True when an :class:`AuthError` is upstream rate-limiting / quota: transient, and
     re-authenticating cannot fix it, so callers should say "retry later", not ``hermes auth``."""
     return (isinstance(error, AuthError) and not error.relogin_required
-            and error.code == CODEX_RATE_LIMITED_CODE)
+            and error.code in _RATE_LIMITED_AUTH_CODES)
 
 
 def primary_failure_wording(error: Exception) -> tuple[str, str]:
