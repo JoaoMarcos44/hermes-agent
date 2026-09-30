@@ -108,6 +108,10 @@ TOOLSETS = {
         "instructions and knowledge",
         ["skills_list", "skill_view", "skill_manage"],
     ),
+    # A cron job with attached skills needs to read their instructions even when its own
+    # enabled_toolsets is narrow. Keep that implicit capability read-only: adding the full
+    # "skills" toolset would also grant unattended skill mutation via skill_manage.
+    "skills_read": _ts("Read attached skill instructions without mutation", ["skill_view"]),
     # web_search belongs to `web`/`search` only. Listing it here too let
     # `disabled_toolsets: [browser]` (headless/Docker deployments) strip
     # web_search from every session, because disabled toolsets are a strict

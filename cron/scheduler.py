@@ -486,10 +486,29 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     return result
 
 
+def _cron_job_declares_skills(job: dict) -> bool:
+    """True when the persisted job explicitly attaches one or more skills/bundles."""
+    return bool(job.get("skills") or job.get("skill"))
+
+
+def _ensure_cron_skill_reader(job: dict, toolsets: list[str]) -> list[str]:
+    """Attach the narrow read-only skill_view toolset when a job's own allowlist omitted it."""
+    if not _cron_job_declares_skills(job):
+        return toolsets
+    from toolsets import resolve_toolset
+    if any("skill_view" in resolve_toolset(name) for name in toolsets):
+        return toolsets
+    return [*toolsets, "skills_read"]
+
+
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
     """Toolset list for a cron job. Precedence: per-job ``enabled_toolsets`` (+ MCP merge) >
     ``cron`` platform config (``_get_platform_tools``, which strips _DEFAULT_OFF_TOOLSETS so fresh
     installs run without ``moa``). A lookup failure fails CLOSED: the run errors out.
+
+    A job that explicitly attaches skills also gets the read-only ``skills_read`` capability when
+    its selected toolsets do not already expose ``skill_view``. This preserves attached-skill
+    semantics after cron stops embedding SKILL.md bodies without granting ``skill_manage``.
 
     1. Per-job ``enabled_toolsets`` (set via ``cronjob`` tool on create/update). Keeps the agent's
     job-scoped toolset override intact — #6130. Enabled MCP servers are layered on per
@@ -502,15 +521,17 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
-    try:
-        from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(cfg or {}, "cron"))
-    except Exception as exc:
-        raise RuntimeError(
-            "Cron toolset resolution failed, so this run was refused rather than given every "
-            f"tool. Check `platform_toolsets.cron` in config.yaml (`hermes cron doctor`): {exc}"
-        ) from exc
+        resolved = _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+    else:
+        try:
+            from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
+            resolved = sorted(_get_platform_tools(cfg or {}, "cron"))
+        except Exception as exc:
+            raise RuntimeError(
+                "Cron toolset resolution failed, so this run was refused rather than given every "
+                f"tool. Check `platform_toolsets.cron` in config.yaml (`hermes cron doctor`): {exc}"
+            ) from exc
+    return _ensure_cron_skill_reader(job, resolved)
 
 
 def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
@@ -2242,7 +2263,7 @@ def _prepare_job_prompt(
             f"**Job ID:** {job_id}\n"
             f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**Status:** BLOCKED\n\n"
-            "The assembled prompt (user prompt + loaded skill content) tripped "
+            "The job prompt or attached skill content tripped "
             "the cron injection scanner and the agent was NOT run.\n\n"
             f"**Scanner result:** {block_exc}\n\n"
             "Audit the skill(s) attached to this job for prompt-injection "
@@ -2412,6 +2433,17 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
+    enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+    disabled_toolsets = _resolve_cron_disabled_toolsets(_cfg)
+    if _cron_job_declares_skills(job):
+        # Disabled toolsets subtract last. If an operator explicitly disabled the whole "skills"
+        # surface, do not run an unattended job with a dangling "call skill_view" instruction.
+        from model_tools import _select_tool_names
+        if "skill_view" not in _select_tool_names(enabled_toolsets, disabled_toolsets, True):
+            raise RuntimeError(
+                "Cron job declares attached skills but skill_view is unavailable after toolset policy. "
+                "Enable read access to skills for this profile or detach the job's skills."
+            )
     return AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
@@ -2432,8 +2464,8 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         providers_order=pr.get("order"),
         provider_sort=pr.get("sort"),
         openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-        enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-        disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
         quiet_mode=True,
         # Project context files only with a configured workdir; SOUL.md always.
         skip_context_files=not bool(workdir),

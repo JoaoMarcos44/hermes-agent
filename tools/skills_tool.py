@@ -31,6 +31,44 @@ from tools.skill_provenance import is_background_review
 
 logger = logging.getLogger(__name__)
 
+
+def _cron_safe_skill_view_response(payload: str) -> str:
+    """Re-scan live skill content when skill_view runs inside an unattended cron turn.
+
+    Cron validates attached skills before constructing the agent, but deferred loading creates a
+    time-of-check/time-of-use window: the SKILL.md may change before the model calls skill_view.
+    Re-applying the cron skill scanner here also preserves the old inline path's invisible-Unicode
+    sanitization. Non-cron callers are byte-identical.
+    """
+    try:
+        from gateway.session_context import get_session_env
+        if get_session_env("HERMES_CRON_SESSION") != "1":
+            return payload
+        parsed = json.loads(payload)
+        if not isinstance(parsed, dict) or not parsed.get("success") or "content" not in parsed:
+            return payload
+        from tools.cronjob_prompt_scan import _scan_cron_skill_assembled
+        cleaned, scan_error = _scan_cron_skill_assembled(str(parsed.get("content") or ""))
+        if scan_error:
+            logger.warning("Cron skill_view blocked live skill content: %s", scan_error)
+            return _fail(
+                f"Cron skill content blocked by the prompt-injection scanner: {scan_error}",
+                error_type="blocked",
+            )
+        if cleaned != parsed.get("content"):
+            parsed["content"] = cleaned
+            return _json(parsed)
+        return payload
+    except Exception as exc:
+        # Fail closed only for an active cron turn: a scanner/parsing failure must not hand an
+        # unattended agent content that the scheduler could not validate.
+        logger.warning("Cron skill_view safety check failed: %s", exc, exc_info=True)
+        return _fail(
+            "Cron skill content could not be safety-checked; refusing to load it for this run.",
+            error_type="blocked",
+        )
+
+
 # Per-session discovery cache: {cache_key: (signature, timestamp, skills_list)}. Signature =
 # per-dir max mtime of the dir and its immediate children (add/remove inside a category does
 # NOT bump the root mtime) + the disabled set (config-only change, no mtime) + platform; the
@@ -585,7 +623,7 @@ def skill_view(
         if ":" in name:  # plugin registry; bare names use the flat-tree scan below
             served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess)
             if served is not None:
-                return served
+                return _cron_safe_skill_view_response(served)
         # The fall-through form (namespace/bare) joins onto each search dir too; re-validate it
         # since `bare` is not namespace-checked.
         if local_category_name and (lookup_error := _skill_lookup_path_error(local_category_name)):
@@ -607,9 +645,9 @@ def skill_view(
         if _is_skill_disabled(resolved_name):
             return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")
         if file_path and skill_dir:
-            return _serve_skill_file(
+            return _cron_safe_skill_view_response(_serve_skill_file(
                 skill_dir, file_path, name, list_available=True, mark_read=True,
-                hint="Use a relative path within the skill directory")
+                hint="Use a relative path within the skill directory"))
         # tags/related_skills: metadata.hermes.* (agentskills.io) first, then top-level.
         metadata = frontmatter.get("metadata")
         hermes_meta = (metadata.get("hermes", {}) or {}) if isinstance(metadata, dict) else {}
@@ -676,7 +714,7 @@ def skill_view(
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):
             result["metadata"] = metadata
-        return _json(result)
+        return _cron_safe_skill_view_response(_json(result))
     except Exception as e:
         return tool_error(str(e), success=False)
 

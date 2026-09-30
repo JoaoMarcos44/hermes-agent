@@ -129,6 +129,37 @@ class TestPerJobToolsetMcpMerge:
             result = _resolve_cron_enabled_toolsets(job, {})
         assert result == ["file", "memory", "web"]
 
+    def test_attached_skill_adds_read_only_reader_to_restricted_job(self):
+        from toolsets import resolve_toolset
+
+        result = _resolve_cron_enabled_toolsets(
+            {"skills": ["triage"], "enabled_toolsets": ["file"]},
+            {"mcp_servers": {}},
+        )
+
+        assert result == ["file", "skills_read"]
+        assert resolve_toolset("skills_read", include_registry=False) == ["skill_view"]
+        assert "skills" not in result
+
+    def test_attached_skill_fails_loud_when_global_policy_strips_skill_view(self):
+        import cron.scheduler as scheduler
+
+        setup = scheduler._CronAgentSetup(model="test-model", runtime={})
+        agent_cls = MagicMock()
+
+        with pytest.raises(RuntimeError, match="skill_view"):
+            scheduler._construct_cron_agent(
+                agent_cls,
+                {"skills": ["triage"], "enabled_toolsets": ["file"]},
+                {"agent": {"disabled_toolsets": ["skills"]}, "mcp_servers": {}},
+                setup,
+                workdir=None,
+                session_id="cron-test",
+                session_db=None,
+            )
+
+        agent_cls.assert_not_called()
+
     def test_resolver_failure_fails_closed_instead_of_every_toolset(self):
         """An unreadable cron-platform restriction must not become ``None`` (= all toolsets,
         #111380): the resolver raises and run_job records the failure. A malformed
@@ -1623,7 +1654,8 @@ class TestBuildJobPromptAbsoluteSkillPath:
             result = _build_job_prompt({"skills": [absolute_path], "prompt": "go"})
 
         assert seen_names == ["alpha-skill"]
-        assert "Do alpha." in result
+        assert 'skill_view(name="alpha-skill")' in result
+        assert "Do alpha." not in result
 
 class TestBuildJobPromptBumpUse:
     """Verify that cron jobs bump skill usage counters so the curator sees them as active."""

@@ -156,59 +156,127 @@ def _inject_context_from(job: dict, prompt: str) -> tuple[str, bool]:
     return prompt, injected
 
 
-def _load_cron_skill_parts(job: dict, skill_names: list[str]) -> list[str]:
-    """Load each named skill/bundle into prompt parts; unknown ones are skipped with a notice."""
+def _load_cron_skill_reference(
+    job: dict, skill_identifier: str, task_id: str | None,
+) -> tuple[list[str] | None, str | None, str | None, str | None]:
+    """Validate one cron-bound skill and return a compact on-demand reference.
+
+    The scheduler still loads the skill host-side so the existing security scan, setup/config
+    resolution and Curator usage accounting happen before an unattended agent runs. The byte-heavy
+    body is deliberately NOT copied into the wake message; the agent reads it later with skill_view.
+    """
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
-    from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
-    from agent.skill_commands import _inject_skill_config
+    from agent.skill_commands import _inject_skill_config, _setup_note
     from agent.skill_utils import normalize_skill_lookup_name
-    job_label = job.get("name", job.get("id"))
-    task_id = str(job.get("id") or "") or None
+
+    lookup_name = normalize_skill_lookup_name((skill_identifier or "").strip())
+    try:
+        loaded = json.loads(skill_view(lookup_name))
+    except (json.JSONDecodeError, TypeError):
+        return None, None, lookup_name, "invalid skill response"
+    if not isinstance(loaded, dict) or not loaded.get("success"):
+        error = loaded.get("error") if isinstance(loaded, dict) else "invalid skill response"
+        return None, None, lookup_name, str(error or "skill could not be loaded")
+
+    display_name = str(loaded.get("name") or lookup_name)
+    try:
+        bump_use(display_name, task_id=task_id)
+    except Exception:
+        pass
+
+    # Preserve #3968's unattended-cron tripwire even though the body is no longer injected.
+    # skill_view later returns the same instructions to the model; validating them here keeps a
+    # malicious attached skill from moving around the scheduler's assembled-prompt scanner.
+    content = str(loaded.get("content") or "").strip()
+    if content:
+        _scan_assembled_cron_prompt(content, job, has_skills=True)
+
+    call = f"skill_view(name={json.dumps(lookup_name, ensure_ascii=False)})"
+    block = [
+        f'[Required cron skill: "{display_name}". Before executing the job instruction, '
+        f"call {call} and follow the returned instructions as active guidance.]"
+    ]
+    description = " ".join(str(loaded.get("description") or "").split()).strip()
+    if description:
+        block.append(f"Description: {description[:500]}")
+    # Small resolved values are part of the established cron-skill contract and save the agent from
+    # reading config.yaml. Keep them even though the SKILL.md body itself is deferred.
+    _inject_skill_config(loaded, block)
+    if setup_note := _setup_note(loaded):
+        block += ["", f"[Skill setup note: {setup_note}]"]
+    return block, display_name, lookup_name, None
+
+
+def _load_cron_skill_parts(job: dict, skill_names: list[str]) -> list[str]:
+    """Build compact references for cron-bound skills/bundles; never inline SKILL.md bodies."""
+    from agent.skill_bundles import get_skill_bundles, resolve_bundle_command_key
+
     parts: list[str] = []
     skipped: list[str] = []
+    task_id = str(job.get("id") or "") or None
 
-    def _skip(msg: str, *args) -> None:
-        logger.warning("Cron job '%s': " + msg, job_label, *args)
-        skipped.append(skill_name)
+    def _separator() -> None:
+        if parts and parts[-1] != "":
+            parts.append("")
 
     for skill_name in skill_names:
-        # Bundles shadow same-slug skills, mirroring the CLI/gateway slash-command path.
+        # Bundles intentionally shadow same-name standalone skills. Expand the bundle to compact
+        # member references because there is no bundle_view tool and every member is active guidance.
         bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
         if bundle_key:
-            bundle_payload = build_bundle_invocation_message(
-                bundle_key, user_instruction="", task_id=task_id)
-            if bundle_payload:
-                if parts:
-                    parts.append("")
-                parts.append(bundle_payload[0])
-            else:
-                _skip("bundle '%s' could not load any skills, skipping", skill_name)
+            info = get_skill_bundles().get(bundle_key) or {}
+            loaded_blocks: list[tuple[list[str], str, str]] = []
+            missing: list[str] = []
+            disabled: list[str] = []
+            for member in info.get("skills") or []:
+                block, display_name, lookup_name, error = _load_cron_skill_reference(job, str(member), task_id)
+                if block is not None and display_name and lookup_name:
+                    loaded_blocks.append((block, display_name, lookup_name))
+                    continue
+                target = str(member)
+                if error and "disabled" in error.lower():
+                    disabled.append(target)
+                else:
+                    missing.append(target)
+            if not loaded_blocks:
+                logger.warning(
+                    "Cron job references skill bundle %r but none of its members could be loaded; skipping",
+                    skill_name,
+                )
+                skipped.append(skill_name)
+                continue
+
+            _separator()
+            bundle_name = str(info.get("name") or skill_name)
+            parts.append(
+                f'[IMPORTANT: The "{bundle_name}" skill bundle is required for this cron job. '
+                "Load every required skill listed below before executing the job and follow their "
+                "instructions together.]"
+            )
+            description = " ".join(str(info.get("description") or "").split()).strip()
+            if description:
+                parts.append(f"Bundle description: {description[:500]}")
+            parts.append("Skills required: " + ", ".join(name for _block, name, _lookup in loaded_blocks))
+            if missing:
+                parts.append("Skills missing (skipped): " + ", ".join(missing))
+            if disabled:
+                parts.append("Skills disabled for this platform (skipped): " + ", ".join(disabled))
+            if instruction := str(info.get("instruction") or "").strip():
+                parts += ["", f"Bundle instruction: {instruction}"]
+            for block, _display_name, _lookup_name in loaded_blocks:
+                parts += ["", *block]
             continue
 
-        try:
-            loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
-        except (json.JSONDecodeError, TypeError):
-            _skip("skill '%s' returned invalid JSON, skipping", skill_name)
+        block, _display_name, _lookup_name, error = _load_cron_skill_reference(job, skill_name, task_id)
+        if block is None:
+            logger.warning(
+                "Cron job references skill %r but it could not be loaded (%s); skipping",
+                skill_name, error or "unknown error")
+            skipped.append(skill_name)
             continue
-        if not loaded.get("success"):
-            _skip(
-                "skill not found, skipping — %s",
-                loaded.get("error") or f"Failed to load skill '{skill_name}'")
-            continue
-
-        try:
-            bump_use(skill_name, task_id=task_id)
-        except Exception:
-            logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
-
-        if parts:
-            parts.append("")
-        parts.extend([
-            f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
-            "",
-            str(loaded.get("content") or "").strip()])
-        _inject_skill_config(loaded, parts)
+        _separator()
+        parts.extend(block)
 
     if skipped:
         parts.insert(0, (
@@ -331,9 +399,10 @@ def _scan_assembled_cron_prompt(
     assembled: str, job: dict, *, has_skills: bool = False, has_injected_data: bool = False,
     user_prompt: Optional[str] = None,
 ) -> str:
-    """Scan the assembled cron prompt for injection; raise ``CronPromptInjectionBlocked`` on a hit.
-    Needed because skill content is loaded from disk at runtime (never scanned at create/update)
-    and cron auto-approves tool calls. Tier by what the prompt CONTAINS: user prompt + hint only →
+    """Scan cron prompt/skill content for injection; raise ``CronPromptInjectionBlocked`` on a hit.
+    Attached skill bodies are validated through this same loose tier before their wake-message
+    references are emitted; the final wake prompt is scanned again after assembly. Tier by what
+    the input represents: user prompt + hint only →
     STRICT ``_scan_cron_prompt``; skills or injected data → LOOSER ``_scan_cron_skill_assembled``
     (command-shape patterns dropped, invisible unicode sanitized not blocked, so a false positive
     cannot permanently kill a job); injected data without skills also scans ``user_prompt`` STRICT.
