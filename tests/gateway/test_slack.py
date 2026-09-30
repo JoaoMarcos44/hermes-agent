@@ -249,6 +249,54 @@ class TestSlashCommandSessionIsolation:
         assert event.source.user_id == "U123"
         assert event.source.scope_id == "T123"
 
+    @pytest.mark.asyncio
+    async def test_slash_turn_matches_message_prompt_inputs(self, adapter):
+        adapter.config.extra.update({
+            "channel_prompts": {"C123": "Answer in haiku."},
+            "channel_skill_bindings": [{"id": "C123", "skill": "triage"}],
+        })
+        adapter._bot_display_name = "HermesBot"
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"id": "C123", "name": "ops"}})
+        adapter.set_authorization_check(lambda _user, _type, _chat: True)
+
+        await adapter._handle_slash_command({
+            "command": "/hermes", "text": "what broke?", "user_id": "U123",
+            "channel_id": "C123", "team_id": "T123",
+        })
+        slash = adapter.handle_message.await_args.args[0]
+
+        message = await adapter._build_message_event(
+            {"user": "U123", "channel": "C123"},
+            text="what broke?", original_text="what broke?", command_probe_text="what broke?",
+            is_command_text=False, channel_id="C123", team_id="T123", ts="171.001",
+            user_id="U123", thread_ts=None, is_dm=False, media_urls=[], media_types=[],
+            media_text_inlined=[], channel_context=None)
+
+        assert message.channel_prompt
+        assert 'bot "@HermesBot"' in message.channel_prompt
+        assert "Answer in haiku." in message.channel_prompt
+        assert slash.channel_prompt == message.channel_prompt
+        assert slash.auto_skill == message.auto_skill == ["triage"]
+        assert (slash.source.chat_name, slash.source.user_name) == (
+            message.source.chat_name, message.source.user_name) == ("ops", "Test User")
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_slash_stops_before_name_enrichment(self, adapter):
+        adapter.set_authorization_check(lambda _user, _type, _chat: False)
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"id": "C123", "name": "ops"}})
+        adapter._app.client.users_info.reset_mock()
+
+        await adapter._handle_slash_command({
+            "command": "/hermes", "text": "what broke?", "user_id": "U_BAD",
+            "channel_id": "C123", "team_id": "T123",
+        })
+
+        adapter._app.client.conversations_info.assert_not_awaited()
+        adapter._app.client.users_info.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+
 
 class TestSlackWorkspaceCollisionIsolation:
     @pytest.mark.asyncio

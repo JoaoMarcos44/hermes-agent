@@ -4418,6 +4418,24 @@ class SlackAdapter(BasePlatformAdapter):
                 else identity_prompt)
         return channel_prompt
 
+    async def _resolve_turn_prompt_inputs(
+        self, channel_id: str, team_id: str, user_id: str,
+    ) -> Tuple[str, str, Optional[str], Optional[List[str]]]:
+        """Resolve prompt-sensitive inputs shared by Slack turn producers.
+
+        Keeping these inputs behind one boundary prevents ordinary messages and slash commands
+        from drifting apart in the session-context pin, channel prompt, or new-session skill load.
+        """
+        user_name = await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
+        channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        from gateway.platforms.base import resolve_channel_skills
+        return (
+            channel_name,
+            user_name,
+            self._channel_prompt_with_identity(channel_id, team_id),
+            resolve_channel_skills(self.config.extra, channel_id, None),
+        )
+
     def _track_reacting_message(self, team_id: str, ts: str) -> None:
         """Mark ``ts`` for the reaction lifecycle, evicting oldest-ts-first past the cap."""
         self._reacting_message_ids.add(self._workspace_message_marker(team_id, ts))
@@ -4699,8 +4717,8 @@ class SlackAdapter(BasePlatformAdapter):
         if is_command_text:
             text = command_probe_text
         msg_type = MessageType.COMMAND if is_command_text else self._media_message_type(media_types)
-        user_name = await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
-        channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        channel_name, user_name, channel_prompt, auto_skill = (
+            await self._resolve_turn_prompt_inputs(channel_id, team_id, user_id))
         # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.
         if is_dm and thread_ts and msg_type != MessageType.COMMAND:
             await self._set_assistant_thread_title(
@@ -4717,7 +4735,6 @@ class SlackAdapter(BasePlatformAdapter):
             # Workflow/app posts have user=None; flag them so the SLACK_ALLOW_BOTS bypass can
             # authorize them. Same predicate as the drop gate (api_human_users stay human).
             is_bot=self._event_declares_bot_sender(event))
-        from gateway.platforms.base import resolve_channel_skills
         # Remaining ``<@UID>`` are OTHER participants (own mention stripped
         # above); render as ``@DisplayName`` so the agent knows who is addressed.
         text = await self._humanize_user_mentions(text, chat_id=channel_id, team_id=team_id)
@@ -4731,12 +4748,12 @@ class SlackAdapter(BasePlatformAdapter):
             media_types=media_types,
             media_text_inlined=media_text_inlined,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
-            channel_prompt=self._channel_prompt_with_identity(channel_id, team_id),
+            channel_prompt=channel_prompt,
             channel_context=channel_context,
             reply_expected=reply_expected,
             # thread_ts is the thread root, not an explicit reply (root is in channel_context).
             reply_to_text=None,
-            auto_skill=resolve_channel_skills(self.config.extra, channel_id, None),
+            auto_skill=auto_skill,
             metadata={
                 "slack_team_id": team_id, "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts})
@@ -6058,13 +6075,21 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Ignoring slash command from DM because Slack DMs are disabled: channel=%s user=%s",
                 channel_id, user_id)
             return
+        # Match ordinary-message ingress: rejected senders must not trigger name-resolution API
+        # calls before the gateway rejects the turn.
+        if self._early_reject_unauthorized(user_id, channel_id, is_dm):
+            return
+        channel_name, user_name, channel_prompt, auto_skill = (
+            await self._resolve_turn_prompt_inputs(channel_id, team_id, user_id))
         source = self.build_source(
-            chat_id=channel_id, chat_type="dm" if is_dm else "group", user_id=user_id,
+            chat_id=channel_id, chat_name=channel_name,
+            chat_type="dm" if is_dm else "group", user_id=user_id, user_name=user_name,
             thread_id=thread_id, scope_id=team_id or None)
         event = MessageEvent(
             text=text,
             message_type=(MessageType.COMMAND if text.startswith("/") else MessageType.TEXT),
-            source=source, raw_message=command)
+            source=source, raw_message=command,
+            channel_prompt=channel_prompt, auto_skill=auto_skill)
         # Stash response_url so the first reply for this channel+user goes ephemeral. COMMAND
         # events only: free-form "/hermes <question>" replies must stay public.
         response_url = command.get("response_url", "")
