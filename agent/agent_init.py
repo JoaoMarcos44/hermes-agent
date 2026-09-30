@@ -921,14 +921,15 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
         )
         _exhausted_message = (
             pool_billing_message(_explicit, model=agent.model, pool=_pool)
-            or pool_cooldown_message(_explicit)
+            or pool_cooldown_message(_explicit, model=agent.model)
         )
         if _exhausted_message:
             raise ProviderCredentialsExhaustedError(_exhausted_message, provider=_explicit)
     if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
         # Explicit non-OpenRouter provider with no creds and no usable fallback: fail fast.
         from agent.auxiliary_unavailable import ProviderNotConfiguredError, missing_provider_credentials_message
-        raise ProviderNotConfiguredError(missing_provider_credentials_message(_explicit))
+        raise ProviderNotConfiguredError(
+            missing_provider_credentials_message(_explicit, model=agent.model))
     from hermes_constants import profile_cli_selector
     from agent.auxiliary_unavailable import ProviderNotConfiguredError
     _sel = profile_cli_selector()

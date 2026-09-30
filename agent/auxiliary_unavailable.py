@@ -55,17 +55,22 @@ def _sentence(text: object) -> str:
     return str(text).strip().rstrip(".") + "."
 
 
-def pool_cooldown_message(provider_id: str) -> Optional[str]:
+def pool_cooldown_message(provider_id: str, *, model: Optional[str] = None) -> Optional[str]:
     """The "all N credentials … are cooling down" error when the provider's pool is fully benched.
 
     ``resolve_provider_client()`` returns ``None`` both when no credential exists and when every
     pool entry sits in a 429/quota cooldown, so the raise sites could only say "no credentials
     were found. Run hermes auth add …" — wrong on both counts for a valid OAuth grant that is
-    merely rate-limited (#56810). Read the persisted pool state (no seeding, no writes) and name
-    the cooldown and its reset time instead; ``None`` when the pool is empty or a credential is
-    usable (the caller keeps the missing-credential diagnostic).
+    merely rate-limited (#56810). A model-scoped cooldown leaves the credential itself healthy,
+    but it is equally unavailable for that requested model; when *model* is known, include that
+    state in the same diagnostic instead of misreporting missing credentials (#128995).
+
+    Read the persisted pool state (no seeding, no writes) and name the cooldown and its reset
+    time. Return ``None`` when the pool is empty or any live credential can serve the requested
+    scope, so the caller keeps the ordinary missing-credential diagnostic.
     """
     from agent.credential_pool import STATUS_DEAD, PooledCredential, _exhausted_until
+    from agent.credential_pool_model_cooldowns import model_cooldown_until
     from hermes_cli.auth import read_credential_pool
 
     entries = []
@@ -76,14 +81,33 @@ def pool_cooldown_message(provider_id: str) -> Optional[str]:
     if not live:
         return None
     now = time.time()
-    resets = [until for e in live
-              for until in (_exhausted_until(e, sole_credential=len(live) == 1),)
-              if until is not None and until > now]
-    if len(resets) != len(live):
-        return None
+    resets = []
+    has_model_cooldown = False
+    for entry in live:
+        candidates = []
+        exhausted_until = _exhausted_until(entry, sole_credential=len(live) == 1)
+        if exhausted_until is not None and exhausted_until > now:
+            candidates.append(exhausted_until)
+        model_until = model_cooldown_until(entry, model) if model else None
+        if model_until is not None and model_until > now:
+            candidates.append(model_until)
+            has_model_cooldown = True
+        if not candidates:
+            return None
+        # This credential becomes usable for the requested model only after every
+        # applicable bench on it has elapsed.
+        resets.append(max(candidates))
+
     when = safe_strftime(datetime.fromtimestamp(min(resets)).astimezone(), "%Y-%m-%d %H:%M %Z")
     which = ("its only credential is" if len(live) == 1
              else f"all {len(live)} credentials are")
+    if model and has_model_cooldown:
+        return (
+            f"Provider '{provider_id}' is set in config.yaml but {which} cooling down for "
+            f"model '{model}'; the next one becomes eligible at {when}. Wait for the cooldown, "
+            f"clear credential cooldown state with `hermes auth reset {provider_id}`, or switch "
+            "to a different provider with `hermes model`."
+        )
     return (f"Provider '{provider_id}' is set in config.yaml but {which} cooling down after a "
             f"rate limit / quota error (429); the next one resets at {when}. Wait for the reset, "
             f"add another credential with `hermes auth add {provider_id}`, or switch to a "
@@ -188,7 +212,7 @@ class ProviderNotConfiguredError(RuntimeError):
     """
 
 
-def missing_provider_credentials_message(provider_id: str) -> str:
+def missing_provider_credentials_message(provider_id: str, *, model: Optional[str] = None) -> str:
     """The "Provider 'X' is set in config.yaml but …" error for an explicit provider with no credentials.
 
     The remedy comes from the registry, never from the provider id: ``f"{id.upper()}_API_KEY"``
@@ -197,7 +221,7 @@ def missing_provider_credentials_message(provider_id: str) -> str:
     env var at all, so they are pointed at the sign-in command instead. A pool whose every
     credential is cooling down is not "missing" — that case names the cooldown (#56810).
     """
-    cooldown = pool_cooldown_message(provider_id)
+    cooldown = pool_cooldown_message(provider_id, model=model)
     if cooldown:
         return cooldown
     pconfig = None
