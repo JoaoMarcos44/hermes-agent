@@ -1056,6 +1056,10 @@ class SlackAdapter(BasePlatformAdapter):
         # posts lacking bot_id/bot_message markers; DM channel IDs are per-user, hence bounded).
         self._user_name_cache: Dict[Tuple[str, str], str] = {}
         self._channel_name_cache: Dict[Tuple[str, str], str] = {}
+        # Slash commands and Block Kit interactions do not carry Slack channel_type. Cache
+        # successful workspace-scoped classification for ambiguous G... ids (MPIM vs private
+        # channel); unresolved classification is never cached and callers fail closed.
+        self._conversation_kind_cache: Dict[Tuple[str, str], Tuple[bool, bool]] = {}
         self._user_is_bot_cache: Dict[Tuple[str, str], bool] = {}
         # channel_id → owning team_id (bounded; re-learned on the next event, _get_client falls
         # back to primary). Kept only while exactly one workspace claims the id — _channel_teams
@@ -1885,7 +1889,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Post a seed message and return its ``ts`` as the handoff ``thread_id``. Slack threads
         anchor to a parent message, not a channel-level object. Returns ``None`` on failure."""
-        if not self._app:
+        if not getattr(self, "_app", None):
             return None
         try:
             client = self._get_client(parent_chat_id)
@@ -3322,6 +3326,62 @@ class SlackAdapter(BasePlatformAdapter):
         self._trim_oldest_dict_entries(self._user_name_cache, self._USER_NAME_CACHE_MAX)
         return name
 
+    async def _classify_conversation(
+        self, channel_id: str, team_id: str = "",
+    ) -> Optional[Tuple[bool, bool]]:
+        """Return (is_dm, is_one_to_one_dm) for Slack surfaces without channel_type.
+
+        D... is unambiguously a 1:1 IM. G... is ambiguous (MPIM or legacy private channel), so
+        resolve it with conversations.info and cache only a successful answer. Returning None
+        is deliberate fail-closed behavior: an unresolved G id must not silently select the
+        broader of the configured DM/channel authorization policies.
+        """
+        channel_id = str(channel_id or "")
+        if channel_id.startswith("D"):
+            return True, True
+        if not channel_id.startswith("G"):
+            return False, False
+        if not self._app:
+            return None
+
+        team_id = str(team_id or getattr(self, "_channel_team", {}).get(channel_id, ""))
+        if not team_id:
+            return None
+        cache_key = (team_id, channel_id)
+        cache = self._lazy_attr("_conversation_kind_cache", dict)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            response = await self._get_client(
+                channel_id, team_id=team_id or None
+            ).conversations_info(channel=channel_id)
+            payload = _slack_response_payload(response)
+            if not payload.get("ok"):
+                return None
+            channel = payload.get("channel") or {}
+            if "is_mpim" not in channel:
+                return None
+            result = (bool(channel.get("is_mpim")), False)
+
+            # This lookup can also satisfy later cosmetic channel-name enrichment.
+            names = self._lazy_attr("_channel_name_cache", dict)
+            names[cache_key] = (
+                channel.get("name") or channel.get("name_normalized") or channel_id
+            )
+            self._trim_oldest_dict_entries(names, self._CHANNEL_NAME_CACHE_MAX)
+        except Exception as exc:
+            logger.debug(
+                "[Slack] Could not classify conversation %s in workspace %s: %s",
+                channel_id, team_id, exc,
+            )
+            return None
+
+        cache[cache_key] = result
+        self._trim_oldest_dict_entries(cache, self._CHANNEL_NAME_CACHE_MAX)
+        return result
+
     async def _resolve_channel_name(self, channel_id: str, team_id: str = "") -> str:
         """Channel ID → name (cached): channel name, or the peer's display name for DMs. Falls back
         to the raw id on any error so message handling never breaks."""
@@ -4418,16 +4478,17 @@ class SlackAdapter(BasePlatformAdapter):
                 else identity_prompt)
         return channel_prompt
 
-    async def _resolve_turn_prompt_inputs(
+    def _cached_turn_prompt_inputs(
         self, channel_id: str, team_id: str, user_id: str,
     ) -> Tuple[str, str, Optional[str], Optional[List[str]]]:
-        """Resolve prompt-sensitive inputs shared by Slack turn producers.
-
-        Keeping these inputs behind one boundary prevents ordinary messages and slash commands
-        from drifting apart in the session-context pin, channel prompt, or new-session skill load.
-        """
-        user_name = await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
-        channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        """Prompt inputs without network I/O, for admission-only and urgent-control turns."""
+        team_id = str(team_id or getattr(self, "_channel_team", {}).get(channel_id, ""))
+        channel_name = self._lazy_attr("_channel_name_cache", dict).get(
+            (team_id, str(channel_id)), str(channel_id)
+        )
+        user_name = self._lazy_attr("_user_name_cache", dict).get(
+            (team_id, str(user_id)), str(user_id)
+        )
         from gateway.platforms.base import resolve_channel_skills
         return (
             channel_name,
@@ -4435,6 +4496,17 @@ class SlackAdapter(BasePlatformAdapter):
             self._channel_prompt_with_identity(channel_id, team_id),
             resolve_channel_skills(self.config.extra, channel_id, None),
         )
+
+    async def _resolve_turn_prompt_inputs(
+        self, channel_id: str, team_id: str, user_id: str,
+    ) -> Tuple[str, str, Optional[str], Optional[List[str]]]:
+        """Resolve prompt-sensitive inputs shared by Slack turn producers."""
+        user_name = await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
+        channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
+        _cached_channel, _cached_user, channel_prompt, auto_skill = (
+            self._cached_turn_prompt_inputs(channel_id, team_id, user_id)
+        )
+        return channel_name, user_name, channel_prompt, auto_skill
 
     def _track_reacting_message(self, team_id: str, ts: str) -> None:
         """Mark ``ts`` for the reaction lifecycle, evicting oldest-ts-first past the cap."""
@@ -5252,16 +5324,9 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=channel_id,
-            user_name=user_name,
-            team_id=team_id,
+        if not await self._authorize_interaction_user(
+            "model picker", user_id, user_name, channel_id, team_id
         ):
-            logger.warning(
-                "[Slack] Unauthorized model picker click by %s (%s) - ignoring",
-                user_name, user_id,
-            )
             return
 
         # Look up the picker state. The send path may have stored it under a
@@ -5478,12 +5543,12 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _is_interactive_user_authorized(
         self, user_id: str, *, channel_id: str = "", user_name: Optional[str] = None,
-        team_id: str = "") -> bool:
+        team_id: str = "", chat_type: Optional[str] = None) -> bool:
         """Return whether a Slack interactive caller may perform gated actions."""
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
-        chat_type = "dm" if str(channel_id or "").startswith("D") else "group"
+        chat_type = chat_type or ("dm" if str(channel_id or "").startswith("D") else "group")
         # Preferred: the injected profile-bound check (``set_authorization_check``); unlike the
         # ``__self__`` introspection below it works under multiplex (handler is a closure).
         # getattr: object.__new__ test doubles never ran BasePlatformAdapter.__init__.
@@ -5524,6 +5589,39 @@ class SlackAdapter(BasePlatformAdapter):
             return "*" in allowed_ids or normalized_user_id in allowed_ids
         return _env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
+    async def _authorize_interaction_user(
+        self, kind: str, user_id: str, user_name: str, channel_id: str, team_id: str, *,
+        team_scoped: bool = True,
+    ) -> bool:
+        """Authorize a Block Kit caller under the same conversation policy as message ingress."""
+        if self._is_ignored_channel(channel_id):
+            return False
+        classification = await self._classify_conversation(channel_id, team_id)
+        if classification is None:
+            logger.warning(
+                "[Slack] Refusing %s interaction because conversation %s could not be classified",
+                kind, channel_id,
+            )
+            return False
+        is_dm, is_one_to_one_dm = classification
+        if is_dm and self._slack_disable_dms():
+            return False
+        allowed_channels = self._slack_allowed_channels()
+        if not is_one_to_one_dm and allowed_channels and channel_id not in allowed_channels:
+            return False
+        authorized = self._is_interactive_user_authorized(
+            user_id,
+            channel_id=channel_id,
+            user_name=user_name,
+            team_id=team_id if team_scoped else "",
+            chat_type="dm" if is_dm else "group",
+        )
+        if not authorized:
+            logger.warning(
+                "[Slack] Unauthorized %s click by %s (%s) - ignoring", kind, user_name, user_id
+            )
+        return authorized
+
     @staticmethod
     def _interaction_fields(body: dict, action: dict) -> Tuple[str, str, dict, str, str, str, str]:
         """Unpack a Block Kit interaction payload into
@@ -5544,12 +5642,9 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = self._event_team_id({}, body)
         action_id, value, message, msg_ts, channel_id, user_name, user_id = (
             self._interaction_fields(body, action))
-        auth_kwargs: Dict[str, Any] = {"channel_id": channel_id, "user_name": user_name}
-        if team_scoped:
-            auth_kwargs["team_id"] = team_id
-        if not self._is_interactive_user_authorized(user_id, **auth_kwargs):
-            logger.warning(
-                "[Slack] Unauthorized %s click by %s (%s) - ignoring", kind, user_name, user_id)
+        if not await self._authorize_interaction_user(
+            kind, user_id, user_name, channel_id, team_id, team_scoped=team_scoped
+        ):
             return None
         return team_id, action_id, value, message, msg_ts, channel_id, user_name, user_id
 
@@ -6060,8 +6155,7 @@ class SlackAdapter(BasePlatformAdapter):
         return media_urls, media_types
 
     async def _handle_slash_command(self, command: dict) -> None:
-        """Slash commands: native ``/<command> [args]`` for every COMMAND_REGISTRY entry, or
-        ``/hermes <subcommand> [args]``; other text after ``/hermes`` is a regular message."""
+        """Slash commands: native /<command> [args] for registry entries, or /hermes text."""
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
@@ -6069,18 +6163,46 @@ class SlackAdapter(BasePlatformAdapter):
             self._remember_channel_team(channel_id, team_id)
         text = self._slash_command_text(command)
         thread_id = self._slash_thread_id(command)
-        is_dm = str(channel_id).startswith("D")
+
+        # Slash payloads omit channel_type. Apply conversation policy before cosmetic enrichment.
+        if self._is_ignored_channel(channel_id):
+            return
+        classification = await self._classify_conversation(channel_id, team_id)
+        if classification is None:
+            logger.warning(
+                "[Slack] Ignoring slash command because conversation %s could not be classified",
+                channel_id,
+            )
+            return
+        is_dm, is_one_to_one_dm = classification
         if is_dm and self._slack_disable_dms():
             logger.info(
                 "[Slack] Ignoring slash command from DM because Slack DMs are disabled: channel=%s user=%s",
                 channel_id, user_id)
             return
-        # Match ordinary-message ingress: rejected senders must not trigger name-resolution API
-        # calls before the gateway rejects the turn.
-        if self._early_reject_unauthorized(user_id, channel_id, is_dm):
+        allowed_channels = self._slack_allowed_channels()
+        if not is_one_to_one_dm and allowed_channels and channel_id not in allowed_channels:
+            logger.debug("[Slack] Ignoring slash command in non-allowed channel: %s", channel_id)
             return
-        channel_name, user_name, channel_prompt, auto_skill = (
-            await self._resolve_turn_prompt_inputs(channel_id, team_id, user_id))
+
+        denied = self._early_reject_unauthorized(user_id, channel_id, is_dm)
+        # Unauthorized channel callers are a pure drop. Unauthorized DMs must still reach the
+        # gateway pair/decline/ignore policy, without spending Slack metadata I/O first.
+        if denied and not is_dm:
+            return
+
+        command_name = text[1:].split(None, 1)[0] if text.startswith("/") else None
+        from hermes_cli.commands import is_interrupt_then_dispatch
+        urgent_control = bool(command_name and is_interrupt_then_dispatch(command_name))
+        if denied or urgent_control:
+            channel_name, user_name, channel_prompt, auto_skill = (
+                self._cached_turn_prompt_inputs(channel_id, team_id, user_id)
+            )
+        else:
+            channel_name, user_name, channel_prompt, auto_skill = (
+                await self._resolve_turn_prompt_inputs(channel_id, team_id, user_id)
+            )
+
         source = self.build_source(
             chat_id=channel_id, chat_name=channel_name,
             chat_type="dm" if is_dm else "group", user_id=user_id, user_name=user_name,
@@ -6090,13 +6212,11 @@ class SlackAdapter(BasePlatformAdapter):
             message_type=(MessageType.COMMAND if text.startswith("/") else MessageType.TEXT),
             source=source, raw_message=command,
             channel_prompt=channel_prompt, auto_skill=auto_skill)
-        # Stash response_url so the first reply for this channel+user goes ephemeral. COMMAND
-        # events only: free-form "/hermes <question>" replies must stay public.
+        # Store response context before gateway admission so denied-DM policy/control replies can
+        # finish the ephemeral Running acknowledgement.
         response_url = command.get("response_url", "")
         if response_url and user_id and channel_id and text.startswith("/"):
             self._stash_slash_context(team_id, channel_id, user_id, response_url)
-        # ContextVar lets send() match the right response_url under
-        # concurrent slashes from multiple users.
         _slash_user_id_token = _slash_user_id.set(user_id or None)
         try:
             await self.handle_message(event)
