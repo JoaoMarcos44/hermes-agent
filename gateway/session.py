@@ -1087,6 +1087,27 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return default if entry is None else entry.metadata.get(key, default)
 
+    def set_session_origin_labels(
+        self, session_key: str, *, chat_name: Optional[str], chat_topic: Optional[str],
+    ) -> bool:
+        """Refresh non-routing display labels on the persisted source for an existing route.
+
+        IDs, platform, profile and transport ownership remain untouched. Keeping these labels current
+        matters for sources restored after restart and for reset(), which deliberately inherits origin.
+        """
+        from dataclasses import replace
+
+        def _update(entry: SessionEntry) -> bool:
+            origin = entry.origin
+            if origin is None:
+                return False
+            if origin.chat_name == chat_name and origin.chat_topic == chat_topic:
+                return False
+            entry.origin = replace(origin, chat_name=chat_name, chat_topic=chat_topic)
+            return True
+
+        return self._update_entry(session_key, _update)
+
     def set_session_metadata(self, session_key: str, key: str, value: Any) -> bool:
         """Persist a small JSON-serializable metadata value. Deliberately does NOT advance
         ``updated_at``: a background write must not make an idle session look fresh.

@@ -148,6 +148,10 @@ class RelayAdapter(BasePlatformAdapter):
         self._auto_thread_waiters: Dict[str, asyncio.Event] = {}
         # Bounded FIFO seen-set for inbound replay dedupe (insertion-ordered dict).
         self._seen_inbound: Dict[str, None] = {}
+        # Discord chat labels are authoritative on the connector text lane but absent from raw
+        # interaction forwards. Warm-process parity uses this bounded map; durable parity lives in
+        # SessionEntry.metadata so a channel rename survives restart without mutating routing origin.
+        self._discord_chat_labels: Dict[Tuple[str, str], Tuple[Optional[str], Optional[str]]] = {}
         # Live cards: draft_key -> draft_id of the OPEN native stream. Armed by
         # send_draft; consumed by send() to convert the turn-final into
         # draft(final=true) instead of a duplicate post. Keyed by _draft_key (chat +
@@ -882,6 +886,7 @@ class RelayAdapter(BasePlatformAdapter):
             self._seen_inbound[dedupe_key] = None
             self._evict_oldest(self._seen_inbound, self._SEEN_INBOUND_MAX)
         self._capture_scope(event)
+        self._remember_discord_labels(event.source)
         self._stamp_slack_session_thread(event)
         # A structured prompt answer resolves its waiting primitive and is CONSUMED —
         # never also dispatched as chat.
@@ -891,6 +896,121 @@ class RelayAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     _SEEN_INBOUND_MAX = 512
+    _DISCORD_LABELS_MAX = 2048
+    _DISCORD_LABEL_METADATA = "relay_discord_chat_labels"
+
+    def _remember_discord_labels(self, source) -> None:
+        """Remember the text lane's latest Discord chat labels, including across restarts.
+
+        SessionEntry.origin is creation-time routing state and intentionally is not rewritten on
+        every turn. Persist label observations in entry metadata instead, so a channel rename cannot
+        make the first post-restart slash command revive stale creation labels.
+        """
+        platform = getattr(source, "platform", None)
+        if getattr(platform, "value", platform) != Platform.DISCORD.value:
+            return
+        chat_id = str(getattr(source, "chat_id", None) or "")
+        if not chat_id:
+            return
+        labels = (getattr(source, "chat_name", None), getattr(source, "chat_topic", None))
+        if not any(labels):
+            return
+        scope = str(getattr(source, "scope_id", None) or "")
+        key = (scope, chat_id)
+        self._discord_chat_labels[key] = labels
+        self._evict_oldest(self._discord_chat_labels, self._DISCORD_LABELS_MAX)
+
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return
+        try:
+            session_key = self._source_session_key(source)
+            peek = getattr(store, "peek_session_id", None)
+            if not callable(peek) or not peek(session_key):
+                return
+            get_meta = getattr(store, "get_session_metadata", None)
+            set_meta = getattr(store, "set_session_metadata", None)
+            if not callable(set_meta):
+                return
+            existing = get_meta(session_key, self._DISCORD_LABEL_METADATA) if callable(get_meta) else None
+            metadata_matches = isinstance(existing, dict) and (
+                existing.get("scope_id"), existing.get("chat_id"),
+                existing.get("chat_name"), existing.get("chat_topic"),
+            ) == (scope, chat_id, labels[0], labels[1])
+
+            # Keep the reset-inherited source current even if a prior metadata write succeeded but
+            # the origin refresh did not. The two stores are intentionally redundant boundaries.
+            refresh_origin = getattr(store, "set_session_origin_labels", None)
+            if callable(refresh_origin):
+                refresh_origin(
+                    session_key, chat_name=labels[0], chat_topic=labels[1],
+                )
+            if not metadata_matches:
+                set_meta(session_key, self._DISCORD_LABEL_METADATA, {
+                    "scope_id": scope,
+                    "chat_id": chat_id,
+                    "chat_name": labels[0],
+                    "chat_topic": labels[1],
+                    "observed_at_ns": time.time_ns(),
+                })
+        except Exception:
+            logger.debug("relay: failed to persist Discord chat labels", exc_info=True)
+
+    def _discord_chat_labels_for(self, scope: str, chat_id: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return the newest text-lane labels for one Discord guild/channel pair.
+
+        On a cold process the newest durable metadata observation wins across per-user sessions.
+        Creation-time origin is only a fallback until a later text-lane observation exists.
+        """
+        key = (scope, chat_id)
+        cached = self._discord_chat_labels.get(key)
+        if cached is not None:
+            return cached
+
+        labels: Tuple[Optional[str], Optional[str]] = (None, None)
+        newest_ns = -1
+        store = getattr(self, "_session_store", None)
+        try:
+            entries = store.list_sessions() if store is not None else ()
+            for entry in entries:
+                metadata = getattr(entry, "metadata", None) or {}
+                observed = metadata.get(self._DISCORD_LABEL_METADATA)
+                if isinstance(observed, dict) and (
+                    str(observed.get("scope_id") or "") == scope
+                    and str(observed.get("chat_id") or "") == chat_id
+                    and (observed.get("chat_name") or observed.get("chat_topic"))
+                ):
+                    try:
+                        seen_ns = int(observed.get("observed_at_ns") or 0)
+                    except (TypeError, ValueError):
+                        seen_ns = 0
+                    if seen_ns >= newest_ns:
+                        newest_ns = seen_ns
+                        labels = (observed.get("chat_name"), observed.get("chat_topic"))
+
+                origin = getattr(entry, "origin", None)
+                origin_platform = getattr(origin, "platform", None) if origin is not None else None
+                if (
+                    origin is not None
+                    and getattr(origin_platform, "value", origin_platform) == Platform.DISCORD.value
+                    and str(getattr(origin, "scope_id", None) or "") == scope
+                    and str(getattr(origin, "chat_id", None) or "") == chat_id
+                    and (getattr(origin, "chat_name", None) or getattr(origin, "chat_topic", None))
+                ):
+                    created = getattr(entry, "created_at", None)
+                    try:
+                        created_ns = int(created.timestamp() * 1_000_000_000)
+                    except Exception:
+                        created_ns = 0
+                    if created_ns > newest_ns:
+                        newest_ns = created_ns
+                        labels = (getattr(origin, "chat_name", None), getattr(origin, "chat_topic", None))
+        except Exception:
+            logger.debug("relay: persisted Discord labels unavailable", exc_info=True)
+
+        self._discord_chat_labels[key] = labels
+        self._evict_oldest(self._discord_chat_labels, self._DISCORD_LABELS_MAX)
+        return labels
 
     def _inbound_dedupe_key(self, event) -> Optional[str]:
         """Stable replay identity: (platform, chat, platform message id). The platform
@@ -1126,6 +1246,7 @@ class RelayAdapter(BasePlatformAdapter):
                 event = self._discord_interaction_to_event(forward)
                 if event is not None:
                     self._capture_scope(event)
+                    self._remember_discord_labels(event.source)
                     # A prompt-token component press is consumed (same gate as _on_inbound).
                     if await self._consume_prompt_response(event):
                         return
@@ -1170,17 +1291,32 @@ class RelayAdapter(BasePlatformAdapter):
         if not isinstance(user, dict):
             user = {}
         guild_id = payload.get("guild_id")
+        scope = str(guild_id or "")
+        chat_id = str(payload.get("channel_id") or "")
+        # Match discord.py Member.display_name: guild nick, then global display name, then username.
+        user_name = next((
+            str(value) for value in (
+                member.get("nick") if isinstance(member, dict) else None,
+                user.get("global_name"),
+                user.get("username"),
+            ) if value
+        ), None)
+        chat_name, chat_topic = self._discord_chat_labels_for(scope, chat_id)
+        channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+        is_thread = bool(guild_id) and channel.get("type") in (10, 11, 12)
         source = SessionSource(
             # The LOGICAL platform, not RELAY: session keys must match the connector's
             # capability binding (platform="discord"), /sethome must file under the
             # logical platform, and _capture_scope skips the generic "relay".
             platform=Platform.DISCORD,
-            chat_id=str(payload.get("channel_id") or ""),
-            # "group", not "channel": both the connector's capability binding and the
-            # native Discord adapter key guild channels as "group".
-            chat_type="group" if guild_id else "dm",
+            chat_id=chat_id,
+            chat_type="thread" if is_thread else ("group" if guild_id else "dm"),
+            thread_id=chat_id if is_thread else None,
+            parent_chat_id=str(channel["parent_id"]) if is_thread and channel.get("parent_id") else None,
             user_id=str(user["id"]) if user.get("id") else None,
-            user_name=str(user["username"]) if user.get("username") else None,
+            user_name=user_name,
+            chat_name=chat_name,
+            chat_topic=chat_topic,
             scope_id=str(guild_id) if guild_id else None,
             message_id=str(payload.get("id")) if payload.get("id") else None,
             # Same upstream-trust marker the relay text lane stamps. Set locally, never
