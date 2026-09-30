@@ -1,6 +1,7 @@
 """Relayed Discord messages and interactions must share one prompt/session identity."""
 
 import json
+import threading
 from unittest.mock import AsyncMock
 
 import pytest
@@ -65,6 +66,13 @@ def _prompt_sequence(*sources):
     ]
 
 
+async def _passthrough_event(adapter, forward):
+    adapter.handle_message = AsyncMock()
+    await adapter._on_passthrough(forward)
+    assert adapter.handle_message.await_count == 1
+    return adapter.handle_message.await_args.args[0]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("thread", [False, True], ids=["channel", "thread"])
 async def test_message_interaction_message_keeps_prompt_and_session_identity(thread):
@@ -116,11 +124,10 @@ async def test_channel_rename_survives_restart_with_latest_text_lane_labels(tmp_
     restarted_store = SessionStore(tmp_path, config)
     restarted, _stub = _adapter(platform="discord")
     restarted.set_session_store(restarted_store)
-    slash = restarted._discord_interaction_to_event(_forward(
+    slash = await _passthrough_event(restarted, _forward(
         member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
     ))
 
-    assert slash is not None
     assert (slash.source.chat_name, slash.source.chat_topic) == (
         renamed.source.chat_name,
         renamed.source.chat_topic,
@@ -135,10 +142,9 @@ async def test_channel_rename_survives_restart_with_latest_text_lane_labels(tmp_
     after_reset = SessionStore(tmp_path, config)
     reset_adapter, _stub = _adapter(platform="discord")
     reset_adapter.set_session_store(after_reset)
-    slash_after_reset = reset_adapter._discord_interaction_to_event(_forward(
+    slash_after_reset = await _passthrough_event(reset_adapter, _forward(
         member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
     ))
-    assert slash_after_reset is not None
     assert (slash_after_reset.source.chat_name, slash_after_reset.source.chat_topic) == (
         renamed.source.chat_name,
         renamed.source.chat_topic,
@@ -171,11 +177,10 @@ async def test_latest_channel_labels_win_across_per_user_sessions_after_restart(
     restarted_store = SessionStore(tmp_path, config)
     restarted, _stub = _adapter(platform="discord")
     restarted.set_session_store(restarted_store)
-    slash = restarted._discord_interaction_to_event(_forward(
+    slash = await _passthrough_event(restarted, _forward(
         member={"user": {"id": "u2", "username": "bob", "global_name": "Bob"}},
     ))
 
-    assert slash is not None
     assert (slash.source.chat_name, slash.source.chat_topic) == (
         renamed.source.chat_name, renamed.source.chat_topic,
     )
@@ -194,3 +199,231 @@ def test_cold_interaction_uses_discord_display_name_order(member, expected):
     event = adapter._discord_interaction_to_event(_forward(member=member))
     assert event is not None
     assert event.source.user_name == expected
+
+
+@pytest.mark.asyncio
+async def test_peer_reset_cannot_outvote_newer_channel_observation(tmp_path):
+    """A reset inherits routing state; it must never manufacture a newer channel observation."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _stub = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+
+    alice = _message(chat_name="A", user_id="u1", user_display_name="Alice")
+    bob = _message(chat_name="A", user_id="u2", user_name="bob", user_display_name="Bob")
+    for event in (alice, bob):
+        store.get_or_create_session(event.source)
+        await adapter._on_inbound(event)
+
+    renamed = _message(chat_name="B", user_id="u1", user_display_name="Alice")
+    await adapter._on_inbound(renamed)
+    store.reset_session(build_session_key(bob.source))
+    store.close_all_db_handles()
+
+    restarted_store = SessionStore(tmp_path, config)
+    restarted, _stub = _adapter(platform="discord")
+    restarted.set_session_store(restarted_store)
+    slash = await _passthrough_event(restarted, _forward(
+        member={"user": {"id": "u2", "username": "bob", "global_name": "Bob"}},
+    ))
+    assert slash.source.chat_name == "B"
+
+
+@pytest.mark.asyncio
+async def test_latest_equal_peer_value_survives_restart(tmp_path):
+    """A -> B -> A must persist the final A even when that observer's older value was also A."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _stub = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+
+    for uid in ("u1", "u2"):
+        event = _message(chat_name="A", user_id=uid, user_display_name=uid)
+        store.get_or_create_session(event.source)
+        await adapter._on_inbound(event)
+    await adapter._on_inbound(_message(chat_name="B", user_id="u1", user_display_name="u1"))
+    await adapter._on_inbound(_message(chat_name="A", user_id="u2", user_display_name="u2"))
+    store.close_all_db_handles()
+
+    restarted_store = SessionStore(tmp_path, config)
+    restarted, _stub = _adapter(platform="discord")
+    restarted.set_session_store(restarted_store)
+    slash = await _passthrough_event(restarted, _forward(
+        member={"user": {"id": "u2", "username": "u2", "global_name": "u2"}},
+    ))
+    assert slash.source.chat_name == "A"
+
+
+@pytest.mark.asyncio
+async def test_label_observation_never_replaces_session_origin(tmp_path):
+    """The context cache is independent of routing provenance stored on SessionEntry.origin."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    original = _message(chat_name="A")
+    entry = store.get_or_create_session(original.source)
+    origin = entry.origin
+    marker = object()
+    origin._transport_adapter_ref = marker
+
+    adapter, _stub = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+    await adapter._on_inbound(_message(chat_name="B"))
+
+    current = store._entries[entry.session_key]
+    assert current.origin is origin
+    assert current.origin._transport_adapter_ref is marker
+
+
+@pytest.mark.asyncio
+async def test_missing_nick_uses_known_name_but_explicit_null_invalidates_it(tmp_path):
+    """Optional nick omission preserves known identity; explicit null proves nickname removal."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _stub = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+    await adapter._on_inbound(_message(user_display_name="Benny"))
+    store.close_all_db_handles()
+
+    restarted_store = SessionStore(tmp_path, config)
+    restarted, _stub = _adapter(platform="discord")
+    restarted.set_session_store(restarted_store)
+
+    missing = await _passthrough_event(restarted, _forward(member={
+        "user": {"id": "u1", "username": "ben", "global_name": "Ben D"},
+    }))
+    assert missing.source.user_name == "Benny"
+
+    removed = await _passthrough_event(restarted, _forward(member={
+        "nick": None,
+        "user": {"id": "u1", "username": "ben", "global_name": "Ben D"},
+    }))
+    assert removed.source.user_name == "Ben D"
+    restarted_store.close_all_db_handles()
+
+    after = SessionStore(tmp_path, config)
+    after_adapter, _stub = _adapter(platform="discord")
+    after_adapter.set_session_store(after)
+    missing_after_removal = await _passthrough_event(after_adapter, _forward(member={
+        "user": {"id": "u1", "username": "ben", "global_name": "Ben D"},
+    }))
+    assert missing_after_removal.source.user_name == "Ben D"
+
+
+@pytest.mark.asyncio
+async def test_shared_store_invalidates_peer_adapter_context_cache(tmp_path):
+    """A successful miss or hit in one adapter must see later observations from a peer adapter."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    reader, _ = _adapter(platform="discord")
+    writer, _ = _adapter(platform="discord")
+    reader.set_session_store(store)
+    writer.set_session_store(store)
+    writer.handle_message = AsyncMock()
+
+    first = await _passthrough_event(reader, _forward(
+        member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
+    ))
+    assert first.source.chat_name is None
+
+    await writer._on_inbound(_message(chat_name="A"))
+    second = await _passthrough_event(reader, _forward(
+        member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
+    ))
+    assert second.source.chat_name == "A"
+
+    await writer._on_inbound(_message(chat_name="B"))
+    third = await _passthrough_event(reader, _forward(
+        member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
+    ))
+    assert third.source.chat_name == "B"
+
+
+@pytest.mark.asyncio
+async def test_cold_context_read_runs_off_event_loop(tmp_path):
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    seed, _ = _adapter(platform="discord")
+    seed.set_session_store(store)
+    seed.handle_message = AsyncMock()
+    await seed._on_inbound(_message(chat_name="A"))
+    store.close_all_db_handles()
+
+    cold_store = SessionStore(tmp_path, config)
+    adapter, _ = _adapter(platform="discord")
+    adapter.set_session_store(cold_store)
+    loop_thread = threading.get_ident()
+    read_threads = []
+    original = cold_store.relay_discord_context
+
+    def recording_read(*args):
+        read_threads.append(threading.get_ident())
+        return original(*args)
+
+    cold_store.relay_discord_context = recording_read
+    event = await _passthrough_event(adapter, _forward(
+        member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
+    ))
+    assert event.source.chat_name == "A"
+    assert read_threads and all(thread_id != loop_thread for thread_id in read_threads)
+
+
+@pytest.mark.asyncio
+async def test_partial_thread_channel_recovers_known_parent(tmp_path):
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _ = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+    message = _message(thread=True)
+    await adapter._on_inbound(message)
+
+    interaction = await _passthrough_event(adapter, _forward(
+        channel_id="th1",
+        channel={"id": "th1", "type": 11},
+        member={"nick": "Ben D", "user": {"id": "u1", "username": "ben"}},
+    ))
+    assert interaction.source.parent_chat_id == "ch1"
+    assert build_session_key(interaction.source) == build_session_key(message.source)
+
+
+def test_message_identity_is_normalized_at_each_ingress_boundary():
+    text = _event_from_wire({
+        "text": "hello",
+        "message_type": "text",
+        "message_id": "platform-message-1",
+        "source": {
+            "platform": "discord",
+            "chat_id": "ch1",
+            "chat_type": "group",
+            "scope_id": "g1",
+            "user_id": "u1",
+        },
+    })
+    assert text.message_id == "platform-message-1"
+    assert text.source.message_id == "platform-message-1"
+
+    adapter, _ = _adapter(platform="discord")
+    component = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="interaction-1",
+        message={"id": "actual-message-77"},
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"custom_id": "foreign-button"},
+    ))
+    assert component is not None
+    assert component.message_id == component.source.message_id == "actual-message-77"
+    assert component.metadata["discord_interaction_id"] == "interaction-1"
+
+    slash = adapter._discord_interaction_to_event(_forward(
+        type=2,
+        id="interaction-2",
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"name": "status"},
+    ))
+    assert slash is not None
+    assert slash.message_id is None and slash.source.message_id is None
+    assert slash.metadata["discord_interaction_id"] == "interaction-2"
