@@ -1,7 +1,11 @@
+"""Dry-run uninstall regressions, including GUI safety from #128974."""
+
 from pathlib import Path
 from types import SimpleNamespace
 
-from hermes_cli import uninstall
+import pytest
+
+from hermes_cli import main, uninstall
 
 
 def test_dry_run_prints_plan_without_mutating(monkeypatch, tmp_path, capsys):
@@ -68,3 +72,57 @@ def test_build_uninstall_parser_accepts_dry_run():
 
     assert args.dry_run is True
     assert args.full is True
+
+
+@pytest.mark.parametrize("yes", [False, True])
+def test_gui_dry_run_never_prompts_or_mutates(monkeypatch, tmp_path, capsys, yes):
+    """Regression for #128974: --gui --dry-run is read-only for every confirmation mode."""
+    hermes_home = tmp_path / ".hermes"
+    agent_root = hermes_home / "hermes-agent"
+    (agent_root / "hermes_cli").mkdir(parents=True)
+    desktop_dist = agent_root / "apps" / "desktop" / "dist"
+    desktop_dist.mkdir(parents=True)
+    shared_dep = agent_root / "node_modules" / "web" / "package.json"
+    shared_dep.parent.mkdir(parents=True)
+    shared_dep.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(uninstall, "get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(uninstall, "_refuse_if_steward_owned", lambda: None)
+    monkeypatch.setattr("hermes_cli.gui_uninstall.packaged_gui_app_paths", lambda: [])
+    monkeypatch.setattr("hermes_cli.gui_uninstall.desktop_userdata_dir", lambda: tmp_path / "none")
+
+    def _unexpected_prompt(*_args, **_kwargs):
+        pytest.fail("GUI dry-run must not prompt")
+
+    monkeypatch.setattr(uninstall, "_confirm_yes", _unexpected_prompt)
+
+    uninstall.run_gui_uninstall(SimpleNamespace(dry_run=True, yes=yes))
+
+    out = capsys.readouterr().out
+    assert "Dry run: no files or processes changed." in out
+    assert str(desktop_dist) in out
+    assert str(agent_root / "node_modules") not in out
+    assert desktop_dist.exists()
+    assert shared_dep.exists()
+
+
+def test_gui_dry_run_bypasses_tty_gate(monkeypatch):
+    """A read-only dry-run is valid from scripts/CI just like --data --dry-run."""
+    dispatched = []
+
+    def _unexpected_tty(*_args, **_kwargs):
+        pytest.fail("GUI dry-run must not require a TTY")
+
+    monkeypatch.setattr(main, "_require_tty", _unexpected_tty)
+    monkeypatch.setattr(uninstall, "run_gui_uninstall", lambda args: dispatched.append(args))
+    args = SimpleNamespace(
+        gui_summary=False,
+        data=False,
+        gui=True,
+        yes=False,
+        dry_run=True,
+    )
+
+    main.cmd_uninstall(args)
+
+    assert dispatched == [args]

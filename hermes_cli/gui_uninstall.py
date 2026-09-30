@@ -35,13 +35,21 @@ def desktop_userdata_dir() -> Path:
 
 
 def source_built_gui_artifacts(hermes_home: Path) -> "list[Path]":
-    """GUI build artifacts produced by ``hermes desktop`` inside the checkout (same ``hermes-agent/`` layout
-    install.sh uses). The Python agent runs from source + venv and never needs the Electron build output or
-    node_modules (the workspace-root node_modules only carries Electron, ~200MB)."""
+    """GUI-owned artifacts produced by ``hermes desktop`` inside the source checkout.
+
+    The workspace-root ``node_modules`` is deliberately excluded: desktop dependency
+    preparation installs the ``ui-tui``, ``web``, and ``apps/desktop`` workspace
+    union there, so removing it for a GUI-only uninstall would delete dependencies
+    owned by the agent's other source frontends (#128974).
+    """
     agent_root = hermes_home / "hermes-agent"
     desktop_dir = agent_root / "apps" / "desktop"
-    return [desktop_dir / "dist", desktop_dir / "release", desktop_dir / "node_modules",
-            agent_root / "node_modules", hermes_home / "desktop-build-stamp.json"]
+    return [
+        desktop_dir / "dist",
+        desktop_dir / "release",
+        desktop_dir / "node_modules",
+        hermes_home / "desktop-build-stamp.json",
+    ]
 
 
 def desktop_install_record() -> Path:
@@ -144,7 +152,7 @@ def uninstall_gui(hermes_home: "Path | None" = None, *, remove_userdata: bool = 
                 log_success(f"Removed {path}")
                 removed.append(path)
         return found
-    log_info("Removing built GUI artifacts (renderer, release, node_modules)...")
+    log_info("Removing built GUI artifacts (renderer, release, desktop node_modules)...")
     _remove_existing([*source_built_gui_artifacts(home), desktop_install_record()])
     log_info("Removing installed desktop app...")
     if not _remove_existing(packaged_gui_app_paths()):

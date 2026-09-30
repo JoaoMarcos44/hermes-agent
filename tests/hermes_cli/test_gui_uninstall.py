@@ -4,6 +4,9 @@ Covers the cross-platform artifact discovery, the agent/GUI detection the
 desktop UI gates options on, and that ``uninstall_gui`` removes only GUI
 artifacts (built renderer/release/node_modules, packaged bundle, Electron
 userData) while leaving the Python agent + config/sessions/.env intact.
+
+Regression coverage for #128974 keeps the shared workspace-root node_modules
+out of GUI ownership because TUI/web and Desktop are prepared as one npm union.
 """
 
 import sys
@@ -49,6 +52,49 @@ def test_gui_install_summary_shape(tmp_path, monkeypatch):
     assert all(isinstance(p, str) for p in summary["source_built_artifacts"])
     assert summary["hermes_home"] == str(hermes_home)
     assert summary["platform"] == sys.platform
+
+
+def test_shared_workspace_node_modules_is_not_a_gui_install(tmp_path, monkeypatch):
+    """Regression for #128974: root node_modules serves TUI/web as well as Desktop."""
+    hermes_home = tmp_path / ".hermes"
+    agent_root = _make_agent(hermes_home)
+    shared_dep = agent_root / "node_modules" / "web" / "package.json"
+    shared_dep.parent.mkdir(parents=True)
+    shared_dep.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gu, "packaged_gui_app_paths", lambda: [])
+    monkeypatch.setattr(gu, "desktop_userdata_dir", lambda: tmp_path / "none")
+
+    summary = gu.gui_install_summary(hermes_home)
+
+    assert summary["gui_installed"] is False
+    assert str(agent_root / "node_modules") not in summary["source_built_artifacts"]
+    assert shared_dep.exists()
+
+
+def test_gui_uninstall_preserves_shared_workspace_dependencies(tmp_path, monkeypatch):
+    """GUI-only removal must not prune the workspace union prepared for TUI/web."""
+    hermes_home = tmp_path / ".hermes"
+    agent_root = _make_agent(hermes_home)
+    _make_gui_build(hermes_home)
+    shared_dep = agent_root / "node_modules" / "web" / "package.json"
+    shared_dep.parent.mkdir(parents=True, exist_ok=True)
+    shared_dep.write_text("{}", encoding="utf-8")
+    desktop = agent_root / "apps" / "desktop"
+
+    monkeypatch.setattr(gu, "packaged_gui_app_paths", lambda: [])
+    monkeypatch.setattr(gu, "desktop_userdata_dir", lambda: tmp_path / "none")
+    monkeypatch.setattr(gu, "desktop_install_record", lambda: tmp_path / "no-install-record")
+
+    removed = gu.uninstall_gui(hermes_home)
+
+    assert (desktop / "dist") in removed
+    assert (desktop / "release") in removed
+    assert (desktop / "node_modules") in removed
+    assert not (desktop / "dist").exists()
+    assert not (desktop / "release").exists()
+    assert not (desktop / "node_modules").exists()
+    assert shared_dep.exists()
+    assert (agent_root / "node_modules").is_dir()
 
 
 @pytest.mark.platforms("linux")
