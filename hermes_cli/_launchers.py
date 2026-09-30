@@ -31,6 +31,17 @@ def _inline_string_literal(value: str) -> str:
     return "'" + escaped.replace("'", "\\x27").replace('"', "\\x22") + "'"
 
 
+def _bytecode_owner_prelude(repo_root: Path) -> str:
+    """Emit the pre-import guard that keeps cache files under the checkout owner's UID."""
+    root = _inline_string_literal(str(Path(repo_root).resolve()))
+    return (
+        f"_hermes_owner = getattr(os.stat({root}), 'st_uid', None); "
+        "_hermes_euid = getattr(os, 'geteuid', lambda: _hermes_owner)(); "
+        "sys.dont_write_bytecode = "
+        "_hermes_owner is not None and _hermes_euid != _hermes_owner"
+    )
+
+
 def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main",
                     code: str | None = None, python: str | Path | None = None,
                     home: str | Path | None = None) -> list[str]:
@@ -46,8 +57,10 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
         f"runpy.run_module({_inline_string_literal(module)}, run_name='__main__', alter_sys=True)")
     default_home = (_inline_string_literal(str(home)) if home is not None else
                     "str(__import__('hermes_constants').get_default_hermes_root())")
+    bytecode_prelude = _bytecode_owner_prelude(root)
     bootstrap = (
         "import os, sys, runpy; "
+        f"{bytecode_prelude}; "
         "os.environ.pop('PYTHONHOME', None); os.environ.pop('PYTHONPATH', None); "
         "os.environ.pop('VIRTUAL_ENV', None); "
         f"sys.path.insert(0, {_inline_string_literal(str(root))}); "
@@ -55,7 +68,8 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
         "import hermes_bootstrap; "
         + entry
     )
-    return [str(python), "-I", "-c", bootstrap, *args]
+    interpreter_flags = ["-I"] if os.name == "nt" else ["-I", "-B"]
+    return [str(python), *interpreter_flags, "-c", bootstrap, *args]
 
 
 def print_runtime_command(repo_root: Path, argv: list[str]) -> None:
@@ -276,10 +290,12 @@ def mint_launcher(
 
 def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> str:
     module, func = ENTRY_POINTS[name]
+    bytecode_prelude = _bytecode_owner_prelude(repo_root)
     # Profile boot repairs shared launchers: their default must stay at the
     # install's dependency root, not whichever profile triggered publication.
     return (
         "import os, re, sys\n"
+        f"{bytecode_prelude}\n"
         "os.environ.pop('PYTHONHOME', None)\n"
         "os.environ.pop('PYTHONPATH', None)\n"
         f"sys.path.insert(0, {str(repo_root.resolve())!r})\n"
@@ -322,7 +338,7 @@ def _write_shell(target: Path, command: list[str]) -> Path | None:
 
 
 def _mint_shell_launcher(name: str, out_dir: Path, python_exe: Path, script: str) -> Path | None:
-    return _write_shell(out_dir / name, [str(python_exe), "-I", "-c", script])
+    return _write_shell(out_dir / name, [str(python_exe), "-I", "-B", "-c", script])
 
 
 def _owns_launcher(target: Path, root: Path) -> bool:

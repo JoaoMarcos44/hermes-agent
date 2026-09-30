@@ -128,6 +128,68 @@ def test_launcher_resolves_default_home_at_use_not_publication(tmp_path, monkeyp
     assert published_home != new_user_home / ".hermes"
 
 
+@pytest.mark.platforms("posix")
+def test_posix_source_launchers_disable_bytecode_before_owner_check(tmp_path):
+    command = _launchers.runtime_command(tmp_path, python="/opt/python")
+    assert command[:4] == ["/opt/python", "-I", "-B", "-c"]
+
+    shell = _launchers._mint_shell_launcher("hermes", tmp_path, Path("/opt/python"), "pass")
+    assert shell is not None
+    tokens = shlex.split(shell.read_text(encoding="utf-8").splitlines()[1].removeprefix("exec "))
+    assert tokens[:4] == ["/opt/python", "-I", "-B", "-c"]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize(("euid", "owner", "blocked"), [
+    (0, 1000, True),
+    (1000, 1000, False),
+    (1001, 1000, True),
+    (0, 0, False),
+])
+def test_bytecode_owner_prelude_blocks_only_foreign_owners(euid, owner, blocked):
+    class FakeStat:
+        st_uid = owner
+
+    class FakeOS:
+        def stat(self, _path):
+            return FakeStat()
+
+        def geteuid(self):
+            return euid
+
+    class FakeSys:
+        dont_write_bytecode = True
+
+    fake_sys = FakeSys()
+    exec(
+        _launchers._bytecode_owner_prelude(Path("/source")),
+        {"os": FakeOS(), "sys": fake_sys},
+    )
+    assert fake_sys.dont_write_bytecode is blocked
+
+
+@pytest.mark.platforms("posix")
+def test_bytecode_owner_prelude_restores_cache_for_checkout_owner(tmp_path):
+    probe = tmp_path / "owner_cache_probe.py"
+    probe.write_text("VALUE = 1\n", encoding="utf-8")
+    prelude = _launchers._bytecode_owner_prelude(tmp_path)
+    code = (
+        "import os, sys; "
+        f"{prelude}; "
+        f"sys.path.insert(0, {str(tmp_path)!r}); "
+        "import owner_cache_probe"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", code],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list((tmp_path / "__pycache__").glob("owner_cache_probe*.pyc"))
+
+
 @pytest.mark.parametrize("publisher", [
     pytest.param("boot", marks=pytest.mark.platforms("posix")),
     pytest.param("repair", marks=pytest.mark.platforms("posix")),
