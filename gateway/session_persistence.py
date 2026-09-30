@@ -243,6 +243,19 @@ class SessionPersistenceMixin:
 
     def _relay_discord_context_cache(self):
         return self._lazy("_relay_discord_context_cache_map", dict)
+    _RELAY_DISCORD_CONTEXT_MAX = 4096
+
+    def _publish_relay_discord_context_record(
+        self, cache: dict, cache_key: tuple, record: Dict[str, Optional[str]],
+    ) -> dict:
+        """Copy-on-write publication for lock-free readers, bounded process-wide."""
+        published = dict(cache)
+        published.pop(cache_key, None)
+        published[cache_key] = dict(record)
+        while len(published) > self._RELAY_DISCORD_CONTEXT_MAX:
+            published.pop(next(iter(published)))
+        self._relay_discord_context_cache_map = published
+        return published
 
     def _relay_discord_record_locked(
         self, kind: str, scope_id: str, entity_id: str,
@@ -264,9 +277,7 @@ class SessionPersistenceMixin:
                         for k, v in loaded.items()
                         if k in {"chat_name", "chat_topic", "parent_chat_id", "user_name"}
                     }
-        published = dict(cache)
-        published[cache_key] = record
-        self._relay_discord_context_cache_map = published
+        self._publish_relay_discord_context_record(cache, cache_key, record)
         return dict(record)
 
     def observe_relay_discord_context(self, source: SessionSource) -> bool:
@@ -305,10 +316,13 @@ class SessionPersistenceMixin:
             cache = self._relay_discord_context_cache()
             for kind, entity_id, incoming in updates:
                 current = self._relay_discord_record_locked(kind, scope_id, entity_id)
-                merged = dict(current)
-                for key, value in incoming.items():
-                    if value is not None:
-                        merged[key] = str(value)
+                # The normalized text lane is authoritative, including explicit absence: a
+                # channel topic removed upstream must clear the durable topic instead of reviving
+                # the old one on the next interaction.
+                merged = {
+                    **current,
+                    **{key: (str(value) if value is not None else None) for key, value in incoming.items()},
+                }
                 if merged == current:
                     continue
                 if setter is not None:
@@ -316,10 +330,9 @@ class SessionPersistenceMixin:
                         self._relay_discord_context_meta_key(kind, scope_id, entity_id),
                         json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
                     )
-                published = dict(cache)
-                published[(kind, scope_id, entity_id)] = merged
-                self._relay_discord_context_cache_map = published
-                cache = published
+                cache = self._publish_relay_discord_context_record(
+                    cache, (kind, scope_id, entity_id), merged
+                )
                 changed = True
         return changed
 
@@ -356,10 +369,9 @@ class SessionPersistenceMixin:
                         self._relay_discord_context_meta_key(kind, scope_id, entity_id),
                         json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
                     )
-                published = dict(cache)
-                published[(kind, scope_id, entity_id)] = merged
-                self._relay_discord_context_cache_map = published
-                cache = published
+                cache = self._publish_relay_discord_context_record(
+                    cache, (kind, scope_id, entity_id), merged
+                )
                 changed = True
         return changed
 

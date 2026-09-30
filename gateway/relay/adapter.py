@@ -936,6 +936,20 @@ class RelayAdapter(BasePlatformAdapter):
         if not callable(observe):
             self._remember_discord_fallback(source)
             return
+        scope = str(getattr(source, "scope_id", None) or "")
+        chat_id = str(getattr(source, "chat_id", None) or "")
+        user_id = str(getattr(source, "user_id", None) or "")
+        cached = self._cached_discord_context(scope, chat_id, user_id)
+        expected = {
+            "chat_name": getattr(source, "chat_name", None),
+            "chat_topic": getattr(source, "chat_topic", None),
+        }
+        if getattr(source, "chat_type", None) == "thread":
+            expected["parent_chat_id"] = getattr(source, "parent_chat_id", None)
+        if getattr(source, "user_name", None):
+            expected["user_name"] = str(source.user_name)
+        if expected and all(cached.get(key) == value for key, value in expected.items()):
+            return
         try:
             await asyncio.to_thread(observe, source)
         except Exception:

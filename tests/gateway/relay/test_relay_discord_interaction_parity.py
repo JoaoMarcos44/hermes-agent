@@ -427,3 +427,53 @@ def test_message_identity_is_normalized_at_each_ingress_boundary():
     assert slash is not None
     assert slash.message_id is None and slash.source.message_id is None
     assert slash.metadata["discord_interaction_id"] == "interaction-2"
+
+
+@pytest.mark.asyncio
+async def test_topic_removal_is_an_authoritative_observation(tmp_path):
+    """A removed Discord topic must not revive from durable context on the next interaction."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _ = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._on_inbound(_message(chat_topic="old topic"))
+    await adapter._on_inbound(_message(chat_topic=None))
+    store.close_all_db_handles()
+
+    restarted_store = SessionStore(tmp_path, config)
+    restarted, _ = _adapter(platform="discord")
+    restarted.set_session_store(restarted_store)
+    slash = await _passthrough_event(restarted, _forward(
+        member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
+    ))
+    assert slash.source.chat_topic is None
+
+
+@pytest.mark.asyncio
+async def test_unchanged_text_context_skips_worker_round_trip(tmp_path, monkeypatch):
+    """After publication, repeated identical text messages take the lock-free fast path."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _ = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+    first = _message()
+    await adapter._on_inbound(first)
+
+    calls = 0
+    real_to_thread = asyncio.to_thread
+
+    async def recording_to_thread(func, *args, **kwargs):
+        nonlocal calls
+        if getattr(func, "__name__", "") == "observe_relay_discord_context":
+            calls += 1
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", recording_to_thread)
+    repeat = _message()
+    repeat.source.message_id = "m2"
+    repeat.message_id = "m2"
+    await adapter._on_inbound(repeat)
+    assert calls == 0
