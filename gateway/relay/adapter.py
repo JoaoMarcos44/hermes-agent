@@ -1362,6 +1362,7 @@ class RelayAdapter(BasePlatformAdapter):
             )
         attached_message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
         actual_message_id = str(attached_message["id"]) if attached_message.get("id") else None
+        interaction_id = str(payload["id"]) if payload.get("id") else None
         source = SessionSource(
             # The LOGICAL platform, not RELAY: session keys must match the connector's
             # capability binding (platform="discord"), /sethome must file under the
@@ -1391,10 +1392,14 @@ class RelayAdapter(BasePlatformAdapter):
             text=text,
             message_type=message_type,
             source=source,
-            message_id=actual_message_id,
+            # The attached bot message is a reply/prompt anchor, not the inbound action.
+            # Every Discord interaction has its own platform identity; keep that on the
+            # MessageEvent so owner, dedupe, transcript and delivery-ledger consumers do
+            # not collapse two presses of the same component message into one turn.
+            message_id=interaction_id,
             metadata={
-                "discord_interaction_id": str(payload.get("id"))
-            } if payload.get("id") else {},
+                "discord_interaction_id": interaction_id
+            } if interaction_id else {},
         )
         if itype == 3:
             # A component press whose custom_id is a Hermes prompt token

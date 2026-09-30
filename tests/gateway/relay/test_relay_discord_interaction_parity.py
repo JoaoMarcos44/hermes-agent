@@ -416,7 +416,8 @@ def test_message_identity_is_normalized_at_each_ingress_boundary():
         data={"custom_id": "foreign-button"},
     ))
     assert component is not None
-    assert component.message_id == component.source.message_id == "actual-message-77"
+    assert component.source.message_id == "actual-message-77"
+    assert component.message_id == "interaction-1"
     assert component.metadata["discord_interaction_id"] == "interaction-1"
 
     slash = adapter._discord_interaction_to_event(_forward(
@@ -426,7 +427,8 @@ def test_message_identity_is_normalized_at_each_ingress_boundary():
         data={"name": "status"},
     ))
     assert slash is not None
-    assert slash.message_id is None and slash.source.message_id is None
+    assert slash.source.message_id is None
+    assert slash.message_id == "interaction-2"
     assert slash.metadata["discord_interaction_id"] == "interaction-2"
 
 
@@ -554,3 +556,140 @@ async def test_dm_interaction_uses_current_payload_identity(tmp_path):
     ))
     assert current.source.user_name == "New Name"
     assert store.cached_relay_discord_context("", "dm1", "u1")["user_name"] == "New Name"
+
+
+
+@pytest.mark.asyncio
+async def test_two_component_presses_keep_distinct_durable_turn_identity(tmp_path):
+    """Two presses on one bot message share a reply anchor, never an inbound owner."""
+    from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
+
+    adapter, _ = _adapter(platform="discord")
+    member = {"user": {"id": "u1", "username": "ben"}}
+    first = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="press-1",
+        message={"id": "bot-message-77"},
+        member=member,
+        data={"custom_id": "foreign-button-1"},
+    ))
+    second = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="press-2",
+        message={"id": "bot-message-77"},
+        member=member,
+        data={"custom_id": "foreign-button-2"},
+    ))
+    assert first is not None and second is not None
+    assert first.source.message_id == second.source.message_id == "bot-message-77"
+    assert first.message_id == "press-1"
+    assert second.message_id == "press-2"
+
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    entry = store.get_or_create_session(first.source)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.session_store = store
+    runner.config = config
+    runner._session_db = None
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def open_session(*args, **kwargs):
+        return False, False
+
+    async def keep_history(event, source, session_entry, session_key, history, *args, **kwargs):
+        return history
+
+    async def inbound_text(*, event, **kwargs):
+        return event.text
+
+    runner._hmwa_open_session = open_session
+    runner._set_session_env = lambda *args, **kwargs: []
+    runner._pinned_session_context_prompt = lambda *args, **kwargs: ""
+    runner._hmwa_acquire_turn_lease = noop
+    runner._mark_durable_active_turn = noop
+    runner._hmwa_run_session_hygiene = keep_history
+    runner._hmwa_first_contact_notes = noop
+    runner._voice_channel_sidecar_note = lambda *args, **kwargs: None
+    runner._prepare_profile_scoped_inbound_message_text = inbound_text
+    runner._hmwa_apply_message_timestamp = lambda event, text: (text, text, None)
+    runner._delivery_adapter_for = lambda *args, **kwargs: None
+    runner._bind_adapter_run_generation = lambda *args, **kwargs: None
+    runner._hmwa_stop_typing_for_turn = noop
+    runner._refresh_agent_cache_message_count = noop
+
+    async def prepare(event, generation):
+        prepared, _tokens = await runner._hmwa_prepare_turn(
+            event, event.source, entry, entry.session_key, entry.session_key, generation,
+        )
+        assert isinstance(prepared, runner._PreparedTurn)
+        return prepared
+
+    first_prepared = await prepare(first, 1)
+    db = store._db_for_session_id(entry.session_id)
+    db.append_message(
+        entry.session_id,
+        "user",
+        first.text,
+        platform_message_id=first.message_id,
+        display_metadata={"gateway_input_owner": first_prepared.persistence_owner},
+    )
+    db.append_message(entry.session_id, "assistant", "first reply")
+
+    second_prepared = await prepare(second, 2)
+    assert second_prepared.persistence_owner != first_prepared.persistence_owner
+    before = db.message_count()
+    reply = await runner._hmwa_agent_error_reply(
+        RuntimeError("controlled second-press failure"),
+        second,
+        second.source,
+        entry,
+        entry.session_key,
+        second_prepared,
+    )
+    assert db.message_count() == before + 2
+    assert store.has_input_owner(entry.session_id, second_prepared.persistence_owner)
+    assert store.has_platform_message_id(entry.session_id, second.message_id)
+    assert PARTIAL_FAILED_TURN_NOTICE in reply
+    assert db.get_messages(entry.session_id)[-1]["content"] == PARTIAL_FAILED_TURN_NOTICE
+
+    # The transient-result writer uses platform_message_id dedupe instead of input-owner
+    # dedupe. A third press on the same attached bot message must survive that path too.
+    third = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="press-3",
+        message={"id": "bot-message-77"},
+        member=member,
+        data={"custom_id": "foreign-button-3"},
+    ))
+    assert third is not None and third.message_id == "press-3"
+    third_prepared = await prepare(third, 3)
+    before = db.message_count()
+    failed = {
+        "failed": True,
+        "final_response": "429",
+        "error": "429",
+        "messages": [],
+        "history_offset": len(third_prepared.history),
+        "last_prompt_tokens": 0,
+        "agent_persisted": False,
+    }
+    await runner._hmwa_persist_turn_transcript(
+        event=third,
+        source=third.source,
+        session_entry=entry,
+        session_key=entry.session_key,
+        agent_result=failed,
+        agent_messages=[],
+        prepared=third_prepared,
+        response="rate limited",
+        agent_failed_early=True,
+        hidden_reasoning_incomplete=False,
+        is_context_overflow_failure=False,
+    )
+    assert db.message_count() == before + 2
+    assert store.has_platform_message_id(entry.session_id, third.message_id)
+    assert db.get_messages(entry.session_id)[-1]["content"] == PARTIAL_FAILED_TURN_NOTICE
+    db.close()
