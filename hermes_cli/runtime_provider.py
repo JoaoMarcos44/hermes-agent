@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
@@ -21,7 +22,8 @@ from agent.credential_pool import (  # custom_provider_pool_key_candidates is re
 )
 from agent.secret_scope import get_secret_str
 from hermes_cli.auth import (  # resolve_external_process_provider_credentials is read via origin by runtime_provider_backends
-    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, AuthError, DEFAULT_CODEX_BASE_URL, DEFAULT_QWEN_BASE_URL, DEFAULT_XAI_OAUTH_BASE_URL,
+    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, ANTHROPIC_MODEL_RATE_LIMITED_CODE, AuthError, DEFAULT_CODEX_BASE_URL,
+    DEFAULT_QWEN_BASE_URL, DEFAULT_XAI_OAUTH_BASE_URL,
     PROVIDER_REGISTRY, _agent_key_is_usable, _nous_inference_env_override, format_auth_error, resolve_provider,
     resolve_nous_runtime_credentials, resolve_codex_runtime_credentials, resolve_xai_oauth_runtime_credentials,
     resolve_qwen_runtime_credentials, resolve_api_key_provider_credentials,
@@ -348,15 +350,34 @@ def _anthropic_cfg_base_url(model_cfg: Dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
+def _anthropic_model_cooldown_retry_after(model: str) -> float | None:
+    """Seconds until the earliest Anthropic credential can serve *model* again, when known."""
+    try:
+        reset_at = load_pool("anthropic").next_available_at(model=model)
+        if reset_at is None:
+            return None
+        remaining = float(reset_at) - time.time()
+    except Exception:
+        logger.debug("Failed to read Anthropic model cooldown reset", exc_info=True)
+        return None
+    return remaining if remaining > 0 else None
+
+
 def _anthropic_token_or_raise(*, model: str | None = None) -> str:
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
     if not token:
-        # A key the pool benched for *this* model is not a missing credential; telling the
-        # user to re-authenticate would send them chasing a cooldown that lifts on its own.
+        # A key the pool benched for *this* model is not a missing credential. Preserve the
+        # structured cooldown so cron/gateway callers can retry later instead of asking for login.
         if model and resolve_anthropic_token():
-            raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
-                            "other Claude models remain available (see `hermes auth list`).")
+            raise AuthError(
+                f"Anthropic credentials are rate-limited for {model}; "
+                "other Claude models remain available (see `hermes auth list`).",
+                provider="anthropic",
+                code=ANTHROPIC_MODEL_RATE_LIMITED_CODE,
+                retry_after=_anthropic_model_cooldown_retry_after(model),
+                retryable=True,
+            )
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
 

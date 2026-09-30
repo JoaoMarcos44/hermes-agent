@@ -8,6 +8,50 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+def test_anthropic_model_cooldown_is_structured_and_carries_reset_window(monkeypatch):
+    """The model-scoped cooldown must reach cron as quota state with the pool's exact reset hint."""
+    from cron.quota_hold import hold_seconds_from_failure
+    from hermes_cli.auth import ANTHROPIC_MODEL_RATE_LIMITED_CODE, is_rate_limited_auth_error
+
+    model = "claude-opus-5-5"
+    reset_at = time.time() + 90.0
+
+    class _Pool:
+        provider = "anthropic"
+
+        def has_credentials(self):
+            return True
+
+        def select(self, **kwargs):
+            assert kwargs.get("model") == model
+            return None
+
+        def next_available_at(self, **kwargs):
+            assert kwargs.get("model") == model
+            return reset_at
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(
+        rp, "_get_model_config", lambda: {"provider": "anthropic", "default": model}
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.resolve_anthropic_token",
+        lambda *, model=None: None if model else "healthy-for-other-models",
+    )
+
+    with pytest.raises(rp.AuthError) as exc_info:
+        rp.resolve_runtime_provider(requested="anthropic", target_model=model)
+
+    err = exc_info.value
+    assert err.provider == "anthropic"
+    assert err.code == ANTHROPIC_MODEL_RATE_LIMITED_CODE
+    assert err.retryable is True
+    assert 0 < err.retry_after <= 90.0
+    assert is_rate_limited_auth_error(err) is True
+    assert hold_seconds_from_failure(err) == pytest.approx(err.retry_after)
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(
