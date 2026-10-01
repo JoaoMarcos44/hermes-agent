@@ -13,7 +13,7 @@ import {
 import { translateNow } from '@/i18n/runtime'
 import { type ChatMessage, chatMessageText, toChatMessages } from '@/lib/chat-messages'
 import { markReasoningEffortPending } from '@/lib/chat-runtime'
-import { profileScopeForSessionOwner, refreshIfTranscriptStale } from '@/lib/stale-transcript-guard'
+import { profileScopeForSessionOwner, transcriptRefreshIfBehind } from '@/lib/stale-transcript-guard'
 import { noteMessageSent } from '@/store/desktop-metrics'
 import { notify } from '@/store/notifications'
 import {
@@ -473,29 +473,37 @@ export function useSessionTileDelegate({
           const cached = sessionStateByRuntimeIdRef.current.get(runtimeId)
           const owner = await ownerForStoredSession(storedSessionId)
 
-          const refreshed = await refreshIfTranscriptStale(storedSessionId, cached?.messages ?? [], {
+          const refresh = await transcriptRefreshIfBehind(storedSessionId, cached?.messages ?? [], {
             profile: profileScopeForSessionOwner(owner)
           })
 
-          if (refreshed) {
+          if (refresh) {
+            if (refresh.competingView) {
+              updateSessionState(
+                runtimeId,
+                state => ({
+                  ...state,
+                  awaitingResponse: false,
+                  busy: false,
+                  messages: refresh.messages,
+                  pendingBranchGroup: null
+                }),
+                storedSessionId
+              )
+              notify({
+                kind: 'warning',
+                message: translateNow('desktop.staleSessionBody'),
+                title: translateNow('desktop.staleSessionTitle')
+              })
+
+              return
+            }
+
             updateSessionState(
               runtimeId,
-              state => ({
-                ...state,
-                awaitingResponse: false,
-                busy: false,
-                messages: refreshed,
-                pendingBranchGroup: null
-              }),
+              state => ({ ...state, messages: refresh.messages }),
               storedSessionId
             )
-            notify({
-              kind: 'warning',
-              message: translateNow('desktop.staleSessionBody'),
-              title: translateNow('desktop.staleSessionTitle')
-            })
-
-            return
           }
         }
 
