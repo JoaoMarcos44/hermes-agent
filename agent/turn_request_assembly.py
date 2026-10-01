@@ -13,7 +13,10 @@ from dataclasses import dataclass
 import logging
 from typing import Any
 
-from agent.message_sanitization import _sanitize_messages_surrogates
+from agent.message_sanitization import (
+    _sanitize_messages_surrogates,
+    normalize_parallel_provider_tool_call_history,
+)
 from agent.usage_anchor import anchored_context_tokens
 from agent.prompt_caching import build_prompt_cache_plan, effective_cache_ttl
 from agent.turn_context import build_api_messages
@@ -142,6 +145,11 @@ def assemble_api_request(
     api_messages = _apply_context_engine_selection(
         agent, api_messages, messages, _sel_incoming, logger=request_logger
     )
+
+    # Legacy sessions can already contain the provider-minted parallel id shape. Repair
+    # the structural request copy as one call/result unit; append-only durable history is
+    # intentionally untouched.
+    normalize_parallel_provider_tool_call_history(api_messages)
 
     # Runs unconditionally (not gated on context_compressor) so orphaned tool
     # results from session loading or manual message edits are always caught.

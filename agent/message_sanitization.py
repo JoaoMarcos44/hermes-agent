@@ -456,6 +456,7 @@ __all__ = [
     # call_id policy owners
     "deterministic_call_id", "coalesce_tool_call_id", "tool_call_id_variants",
     "tool_result_id_variants", "uniquify_tool_call_ids",
+    "normalize_parallel_provider_tool_call_ids", "normalize_parallel_provider_tool_call_history",
     # reasoning_content policy owners
     "reasoning_echo_family", "matches_reasoning_echo_family", "needs_reasoning_echo",
     "stale_thinking_reaches_wire", "apply_reasoning_content_policy", "reapply_reasoning_echo",
@@ -568,6 +569,91 @@ def uniquify_tool_call_ids(tool_calls: list) -> list:
             "call/result pairing lossless.", cid, new_id, _fn_name,
         )
     return tool_calls
+
+
+# Some OpenAI-compatible backends mint chatcmpl-tool-* ids that they accept on the
+# producing turn but reject when a replayed assistant message contains a fully
+# provider-minted parallel batch (#130363). Keep this list evidence-based: unknown
+# id shapes stay byte-identical for prompt-cache stability.
+_PARALLEL_PROVIDER_TOOL_CALL_ID_PREFIXES = ("chatcmpl-tool-",)
+
+
+def _rewrite_tool_call_identifier(tc: Any, key: str, old_id: str, new_id: str) -> None:
+    """Rewrite one call-id field while preserving a composite response-item half."""
+    raw = _tc_field(tc, key)
+    value = raw.strip() if isinstance(raw, str) else ""
+    if value == old_id:
+        _tc_set(tc, key, new_id)
+    elif value.startswith(old_id + "|"):
+        _tc_set(tc, key, new_id + value[len(old_id):])
+
+
+def normalize_parallel_provider_tool_call_ids(tool_calls: list) -> dict[str, str]:
+    """Normalize a known-bad provider id shape only for a fully affected parallel batch.
+
+    Single calls, mixed batches and unknown prefixes are returned byte-identical. Replacements
+    are deterministic so retries and prompt-cache prefixes remain stable. response_item_id is
+    deliberately untouched; composite call_id|response_item_id values keep their right half.
+    Returns old_call_id -> new_call_id for callers that also own matching results.
+    """
+    calls = tool_calls or []
+    if len(calls) < 2:
+        return {}
+    call_ids = [coalesce_tool_call_id(tc) for tc in calls]
+    if not all(cid and cid.startswith(_PARALLEL_PROVIDER_TOOL_CALL_ID_PREFIXES) for cid in call_ids):
+        return {}
+
+    rewrites: dict[str, str] = {}
+    for tc, old_id in zip(calls, call_ids):
+        new_id = f"call_{hashlib.sha256(old_id.encode('utf-8', errors='replace')).hexdigest()[:12]}"
+        rewrites[old_id] = new_id
+        _rewrite_tool_call_identifier(tc, "id", old_id, new_id)
+        _rewrite_tool_call_identifier(tc, "call_id", old_id, new_id)
+    return rewrites
+
+
+def _rewrite_tool_result_identifier(raw: Any, rewrites: dict[str, str]) -> Any:
+    """Apply a call-id rewrite to a result id without touching its response-item half."""
+    if not isinstance(raw, str):
+        return raw
+    value = raw.strip()
+    call_id, sep, response_item_id = value.partition("|")
+    new_id = rewrites.get(call_id.strip())
+    if not new_id:
+        return raw
+    return new_id + (f"|{response_item_id}" if sep else "")
+
+
+def normalize_parallel_provider_tool_call_history(messages: list) -> bool:
+    """Repair legacy poisoned ids on a request-copy, preserving call/result pairing.
+
+    The mapping is scoped to the immediately following tool-result run, matching the positional
+    invariant enforced by the pre-call sanitizer. Call this on structural wire copies, not the
+    append-only durable transcript.
+    """
+    changed = False
+    active_rewrites: dict[str, str] = {}
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            active_rewrites = {}
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            active_rewrites = normalize_parallel_provider_tool_call_ids(
+                tool_calls if isinstance(tool_calls, list) else []
+            )
+            changed |= bool(active_rewrites)
+            continue
+        if role == "tool" and active_rewrites:
+            old_result_id = msg.get("tool_call_id")
+            new_result_id = _rewrite_tool_result_identifier(old_result_id, active_rewrites)
+            if new_result_id != old_result_id:
+                msg["tool_call_id"] = new_result_id
+                changed = True
+            continue
+        active_rewrites = {}
+    return changed
 
 
 # -- reasoning_content policy: single owner of strip-vs-re-pad; adapters keep only SYNTAX --
