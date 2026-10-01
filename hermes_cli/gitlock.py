@@ -550,8 +550,7 @@ def _drop_unreadable_tracking_ref(git_cmd: List[str], fetch_args: List[str], rep
         return False
 
     # A partial clone may otherwise lazy-fetch the very object whose absence we are diagnosing.
-    env = dict(os.environ)
-    env["GIT_NO_LAZY_FETCH"] = "1"
+    env = {**os.environ, **NO_LAZY_FETCH_ENV}
     readable = subprocess.run(
         git_cmd + ["cat-file", "-e", f"{target}^{{commit}}"], env=env, **run_kwargs)
     if readable.returncode == 0:
