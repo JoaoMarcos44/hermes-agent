@@ -277,7 +277,7 @@ class TestSummarizeToolResultRefusals:
         ("execute_code", {"code": "dangerous()"}),
         ("browser_click", {"ref": "button-1"}),
     ])
-    def test_approval_required_is_bounded_and_never_claims_completion(self, tool_name, args):
+    def test_approval_required_does_not_invent_a_user_decision(self, tool_name, args):
         summary = _summarize_tool_result(
             tool_name,
             json.dumps(args),
@@ -286,8 +286,8 @@ class TestSummarizeToolResultRefusals:
 
         assert summary.startswith(f"[{tool_name}] BLOCKED, not performed")
         assert "approval pending" in summary
-        assert "user has NOT consented" in summary
-        assert "do NOT retry" in summary
+        assert "consent" not in summary
+        assert "retry" not in summary
         assert len(summary) < _PRUNE_MIN_CHARS
 
     def test_refusal_target_is_one_line_and_bounded(self):
