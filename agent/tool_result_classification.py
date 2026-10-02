@@ -23,6 +23,41 @@ def tool_may_have_side_effect(tool_name: str) -> bool:
     return tool_name not in NO_EFFECT_TOOL_NAMES
 
 
+REFUSAL_BLOCKED = "blocked"
+REFUSAL_PENDING_APPROVAL = "pending_approval"
+
+
+def classify_no_effect_refusal(tool_name: str, result: Any) -> str | None:
+    """Classify producer-owned refusal results that prove a call did not take effect.
+
+    A tool's domain payload may legitimately contain status="blocked" after
+    successful execution, so that field is execution evidence only for terminal,
+    whose result envelope owns the approval status contract. Other tools require
+    the explicit no-consent / do-not-retry contract emitted by write approvals.
+    """
+    data = result
+    if isinstance(result, str):
+        try:
+            data = json.loads(result.strip())
+        except Exception:
+            data = None
+
+    if isinstance(data, dict) and tool_name == "terminal":
+        status = data.get("status")
+        if status in {REFUSAL_BLOCKED, REFUSAL_PENDING_APPROVAL}:
+            return status
+
+    error = data.get("error") if isinstance(data, dict) else result
+    if (
+        tool_may_have_side_effect(tool_name)
+        and isinstance(error, str)
+        and "user has NOT consented" in error
+        and "Do NOT retry" in error
+    ):
+        return REFUSAL_BLOCKED
+    return None
+
+
 # Set by a tool that REFUSED a call the harness judged redundant (repeated identical
 # read/search). The body still carries ``"error"`` so the model reads it as a stop
 # signal, but nothing failed: failure classifiers must not count it, or the cheap

@@ -380,6 +380,86 @@ class TestSummarizeToolResultClarify:
         assert "Choice B" in summary
 
 
+
+def _approval_refusals_for_compaction():
+    from tools import approval
+    from tools.registry import tool_error
+    from tools.terminal_tool import _error_json
+
+    gate = approval._COMMAND_GATE
+    return [
+        ("terminal", {"command": "rm -rf build"},
+         _error_json(gate.cli_denied.format(description="", breaker=""), status="blocked")),
+        ("terminal", {"command": "rm -rf build"},
+         _error_json("", status="pending_approval")),
+        ("write_file", {"path": "AGENTS.md", "content": "a\\nb"},
+         tool_error("BLOCKED: write to protected agent-instruction file(s) (AGENTS.md) was denied by "
+                    "the user. The user has NOT consented to this write. Do NOT retry it or attempt "
+                    "the same edit via another path (terminal, execute_code, etc.).")),
+    ]
+
+
+class TestSummarizeNoEffectToolResults:
+    @pytest.mark.parametrize("tool_name,args,content", _approval_refusals_for_compaction())
+    def test_legacy_refusals_remain_not_run(self, tool_name, args, content):
+        summary = _summarize_tool_result(tool_name, json.dumps(args), content)
+
+        assert "not run" in summary
+        assert "ran " not in summary and "wrote to" not in summary
+        assert len(summary) <= _PRUNE_MIN_CHARS - 1
+
+    def test_domain_blocked_status_is_not_execution_status(self):
+        content = json.dumps({
+            "status": "blocked",
+            "task": {"id": "t1", "reason": "needs human input"},
+            "details": "x" * 300,
+        })
+
+        summary = _summarize_tool_result("kanban_create", '{"title":"t"}', content)
+
+        assert "not run" not in summary and "BLOCKED, not run" not in summary
+        assert summary.startswith("[kanban_create]")
+
+    def test_bare_blocked_text_from_read_tool_is_data(self):
+        content = "BLOCKED: quoted documentation, not an execution refusal. " + "x" * 300
+
+        summary = _summarize_tool_result(
+            "read_file", json.dumps({"path": "notes.txt", "offset": 1}), content,
+        )
+
+        assert summary.startswith("[read_file] read notes.txt")
+        assert "not run" not in summary
+
+    def test_structured_no_effect_beats_success_shaped_template(self):
+        content = json.dumps({"error": "tool is unavailable in this session"}) + "x" * 300
+
+        summary = _summarize_tool_result(
+            "write_file", json.dumps({"path": "out.txt", "content": "x"}), content, "none",
+        )
+
+        assert summary == "[write_file] 'out.txt' not completed; no effect"
+        assert "wrote to" not in summary
+
+    def test_prune_consumes_persisted_effect_disposition(self, compressor):
+        content = json.dumps({"error": "blocked by a pre-tool policy"}) + "x" * 300
+        messages = [
+            {"role": "assistant", "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "write_file", "arguments": json.dumps({"path": "out.txt", "content": "x"})},
+            }]},
+            {"role": "tool", "tool_call_id": "t1", "tool_name": "write_file",
+             "effect_disposition": "none", "content": content},
+            {"role": "user", "content": "recent request"},
+            {"role": "assistant", "content": "recent response"},
+        ]
+
+        pruned, count = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+
+        assert count == 1
+        assert pruned[1]["content"] == "[write_file] 'out.txt' not completed; no effect"
+        assert pruned[1]["effect_disposition"] == "none"
+
+
 class TestShouldCompress:
     def test_below_threshold(self, compressor):
         compressor.last_prompt_tokens = 50000
