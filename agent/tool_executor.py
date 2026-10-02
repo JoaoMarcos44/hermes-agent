@@ -1803,7 +1803,10 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     committed = _commit_tool_result(
         agent, messages, ref, function_result,
         budget=budget, tool_duration=tool_duration, is_error=_is_error_result, blocked=managed.blocked,
-        effect_disposition="unknown" if _execution_timed_out else None, observed=True,
+        effect_disposition=(
+            "unknown" if _execution_timed_out else "none" if managed.blocked else None
+        ),
+        observed=True,
         error_preview=lambda res: res[:200] if isinstance(res, str) and not agent.verbose_logging else res,
         success_log_chars=_result_len,
         verbose_text=_multimodal_text_summary,

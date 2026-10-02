@@ -1650,10 +1650,12 @@ def _str_arg(args: dict, key: str, default: str = "") -> str:
     return val if isinstance(val, str) else default if val is None else str(val)
 
 
-def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
-    """1-line summary of a tool call + result. Never raises: a malformed historical call must not crash-loop compression."""
+def _summarize_tool_result(
+    tool_name: str, tool_args: str, tool_content: str, effect_disposition: str | None = None,
+) -> str:
+    """1-line summary of a tool call + result. Never raises: malformed history must not crash-loop compression."""
     try:
-        return _summarize_tool_result_unguarded(tool_name, tool_args, tool_content)
+        return _summarize_tool_result_unguarded(tool_name, tool_args, tool_content, effect_disposition)
     except Exception as exc:  # noqa: BLE001 — a summary must never crash compression
         logger.debug("Tool-result summary failed for %s: %s", tool_name, exc)
         _len = len(tool_content) if isinstance(tool_content, str) else 0
@@ -1914,10 +1916,55 @@ def _json_dict(text: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_content: str) -> str:
+def _summarize_nonexecuted_tool_result(
+    tool_name: str, args: dict, content: str, effect_disposition: str | None,
+) -> str | None:
+    """Summarize calls known not to have taken effect before success-shaped templates run."""
+    payload = _json_dict(content)
+    status = str(payload.get("status") or "").strip().casefold()
+    error = payload.get("error") if isinstance(payload.get("error"), str) else ""
+    raw = content.strip()
+    guardrail = payload.get("guardrail") if isinstance(payload.get("guardrail"), dict) else {}
+    guardrail_action = str(guardrail.get("action") or "").strip().casefold()
+    error_folded = error.lstrip().casefold()
+    raw_folded = raw.lstrip().casefold()
+    pending = status == "pending_approval"
+    explicitly_blocked = (
+        status == "blocked"
+        or guardrail_action in {"block", "halt"}
+        or error_folded.startswith("blocked")
+        or raw_folded.startswith("blocked")
+        or error_folded.startswith("edit approval denied")
+    )
+    no_effect = effect_disposition == "none"
+    if not (pending or explicitly_blocked or no_effect):
+        return None
+    target = _str_arg(args, "command") or _str_arg(args, "path")
+    if target:
+        target = target if len(target) <= 60 else target[:57] + "..."
+        target = f" `{target}`"
+    if pending:
+        outcome = "awaiting the user's approval, not run"
+    elif explicitly_blocked:
+        outcome = "BLOCKED, not run"
+    else:
+        outcome = "did not take effect"
+    refusal_text = (error or raw).casefold()
+    if "not consented" in refusal_text:
+        outcome += "; the user did NOT consent; do not retry or reach the same outcome another way"
+    return f"[{tool_name}]{target} {outcome}"[:_PRUNE_MIN_CHARS - 1]
+
+
+def _summarize_tool_result_unguarded(
+    tool_name: str, tool_args: str, tool_content: str, effect_disposition: str | None = None,
+) -> str:
     """Build the summary line (unguarded; see ``_summarize_tool_result``)."""
     args = _json_dict(tool_args)
     content = tool_content or ""
+    if (nonexecuted := _summarize_nonexecuted_tool_result(
+        tool_name, args, content, effect_disposition,
+    )) is not None:
+        return nonexecuted
     content_len = len(content)
     line_count = content.count("\n") + 1 if content.strip() else 0
     summarizer = _TOOL_RESULT_SUMMARIZERS.get(tool_name)
@@ -3163,7 +3210,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             _skill = _json_dict(tool_args).get("name", "")
             if isinstance(_skill, str) and _skill.lower() in protected_skills:
                 return False
-        result[idx] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
+        result[idx] = {
+            **msg,
+            "content": _summarize_tool_result(
+                tool_name, tool_args, content, msg.get("effect_disposition"),
+            ),
+        }
         return True
 
     def _tail_soft_ceiling(self, token_budget: int) -> int:
@@ -3534,7 +3586,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                     assistant_actions.append(text)
             elif role == "tool":
                 tool_name, tool_args = call_id_to_tool.get(str(msg.get("tool_call_id") or ""), ("unknown", ""))
-                tool_actions.append(_summarize_tool_result(tool_name, tool_args, text or ""))
+                tool_actions.append(_summarize_tool_result(
+                    tool_name, tool_args, text or "", msg.get("effect_disposition"),
+                ))
                 if re.search(r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b", text, re.I):
                     blockers.append(text[:500])
         return {

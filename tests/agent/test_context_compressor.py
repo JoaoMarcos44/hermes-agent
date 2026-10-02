@@ -380,6 +380,109 @@ class TestSummarizeToolResultClarify:
         assert "Choice B" in summary
 
 
+class TestSummarizeToolResultNonExecution:
+    """Compression must trust durable no-effect provenance before success-shaped templates."""
+
+    def test_prune_uses_no_effect_metadata_when_policy_text_has_no_magic_prefix(self, compressor):
+        content = json.dumps({
+            "error": "Policy rejected this write before dispatch. " + "x" * 300,
+        })
+        messages = [
+            {"role": "assistant", "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "write_file", "arguments": json.dumps({
+                    "path": "artifact.txt", "content": "payload",
+                })},
+            }]},
+            {
+                "role": "tool", "tool_call_id": "t1", "tool_name": "write_file",
+                "effect_disposition": "none", "content": content,
+            },
+            {"role": "user", "content": "recent request"},
+            {"role": "assistant", "content": "recent response"},
+        ]
+
+        pruned, count = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        summary = pruned[1]["content"]
+
+        assert count == 1
+        assert summary == "[write_file] `artifact.txt` did not take effect"
+        assert "wrote to" not in summary
+
+    @pytest.mark.parametrize(
+        "content,expected",
+        [
+            (json.dumps({"error": "Blocked by policy"}), "BLOCKED, not run"),
+            (
+                json.dumps({"error": "Edit approval denied by ACP client; file was not modified."}),
+                "BLOCKED, not run",
+            ),
+            (
+                json.dumps({
+                    "error": "Stopped write_file: repeated failing path",
+                    "guardrail": {"action": "halt"},
+                }),
+                "BLOCKED, not run",
+            ),
+        ],
+    )
+    def test_real_predispatch_shapes_do_not_become_success_summaries(self, content, expected):
+        summary = _summarize_tool_result(
+            "write_file",
+            json.dumps({"path": "artifact.txt", "content": "payload"}),
+            content,
+            "none",
+        )
+
+        assert expected in summary
+        assert "wrote to" not in summary
+
+    def test_fallback_anchors_keep_short_acp_denial_as_not_run(self, compressor):
+        turns = [
+            {"role": "assistant", "tool_calls": [{
+                "id": "t1", "type": "function",
+                "function": {"name": "write_file", "arguments": '{"path":"artifact.txt"}'},
+            }]},
+            {
+                "role": "tool", "tool_call_id": "t1", "tool_name": "write_file",
+                "effect_disposition": "none",
+                "content": json.dumps({
+                    "error": "Edit approval denied by ACP client; file was not modified.",
+                }),
+            },
+        ]
+
+        completed = "\n".join(compressor._fallback_anchors(turns)["completed"])
+
+        assert "BLOCKED, not run" in completed
+        assert "wrote to" not in completed
+
+    def test_legacy_pending_approval_and_no_consent_remain_bounded(self):
+        pending = _summarize_tool_result(
+            "terminal",
+            '{"command":"dangerous-operation"}',
+            json.dumps({"status": "pending_approval", "error": ""}),
+        )
+        denied = _summarize_tool_result(
+            "terminal",
+            '{"command":"dangerous-operation"}',
+            json.dumps({
+                "status": "blocked",
+                "error": "BLOCKED: The user has NOT consented. Do NOT retry this operation.",
+            }),
+        )
+
+        assert "awaiting the user's approval, not run" in pending
+        assert "did NOT consent" in denied and "do not retry" in denied
+        assert len(pending) < _PRUNE_MIN_CHARS and len(denied) < _PRUNE_MIN_CHARS
+
+    def test_success_control_is_unchanged_without_no_effect_provenance(self):
+        content = json.dumps({"output": "BLOCKED by nothing", "exit_code": 0, "error": None})
+
+        assert _summarize_tool_result("terminal", '{"command":"make"}', content) == (
+            "[terminal] ran `make` -> exit 0, 1 lines output"
+        )
+
 class TestShouldCompress:
     def test_below_threshold(self, compressor):
         compressor.last_prompt_tokens = 50000
