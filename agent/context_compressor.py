@@ -853,11 +853,16 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 _SUMMARY_INPUT_MAX_CHARS = 160_000
 
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+_REFUSED_TOOL_SUMMARY_MARKER = " BLOCKED, not performed"
 
 
 def _is_summary_stub(content: str) -> bool:
-    """True for a tool result already replaced by a 1-line ``[tool] ... (N chars)`` summary."""
-    return content.startswith("[") and " chars)" in content and len(content) < 400
+    """True for a tool result already replaced by a bounded one-line summary."""
+    return (
+        content.startswith("[")
+        and len(content) < 400
+        and (" chars)" in content or _REFUSED_TOOL_SUMMARY_MARKER in content)
+    )
 
 
 # Shared floor; the clarify summary cap must stay strictly BELOW it so a preserved
@@ -1947,7 +1952,7 @@ def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> 
     if not refused:
         return None
 
-    summary = f"[{tool_name}]{_refusal_target(tool_name, args)} BLOCKED, not performed"
+    summary = f"[{tool_name}]{_refusal_target(tool_name, args)}{_REFUSED_TOOL_SUMMARY_MARKER}"
     lowered = error_text.casefold()
     if awaiting_approval:
         summary += "; approval pending"
@@ -3586,9 +3591,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                     assistant_actions.append(text)
             elif role == "tool":
                 tool_name, tool_args = call_id_to_tool.get(str(msg.get("tool_call_id") or ""), ("unknown", ""))
-                tool_actions.append(_summarize_tool_result(tool_name, tool_args, text or ""))
-                if re.search(r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b", text, re.I):
-                    blockers.append(text[:500])
+                tool_action = text if _is_summary_stub(text) else _summarize_tool_result(tool_name, tool_args, text or "")
+                if _REFUSED_TOOL_SUMMARY_MARKER in tool_action:
+                    blockers.append(tool_action)
+                else:
+                    tool_actions.append(tool_action)
+                    if re.search(r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b", text, re.I):
+                        blockers.append(text[:500])
         return {
             "user_asks": user_asks,
             "completed": [f"{idx}. {item}" for idx, item in enumerate((assistant_actions + tool_actions)[:12], start=1)],
