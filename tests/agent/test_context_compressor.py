@@ -191,6 +191,118 @@ class TestSummarizeToolResultWebExtract:
         assert summary == "[web_extract] https://example.com/h (500 chars)"
 
 
+class TestSummarizeToolResultRefusals:
+    def test_terminal_denial_preserves_refusal_and_no_retry(self):
+        from tools import approval
+        from tools.terminal_tool import _error_json
+
+        content = _error_json(
+            approval._COMMAND_GATE.cli_denied.format(description="", breaker=""),
+            status="blocked",
+        )
+        summary = _summarize_tool_result(
+            "terminal", json.dumps({"command": "rm -rf build"}), content,
+        )
+
+        assert summary.startswith("[terminal] `rm -rf build` BLOCKED, not performed")
+        assert "ran `" not in summary
+        assert "user has NOT consented" in summary
+        assert "do NOT retry" in summary
+        assert len(summary) < _PRUNE_MIN_CHARS
+
+    def test_pending_approval_keeps_wait_instruction_without_result_text(self):
+        content = json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "",
+            "status": "pending_approval",
+            "approval_pending": True,
+            "description": "dangerous command",
+        })
+        summary = _summarize_tool_result(
+            "terminal", json.dumps({"command": "rm -rf build"}), content,
+        )
+
+        assert "BLOCKED, not performed" in summary
+        assert "approval pending" in summary
+        assert "user has NOT consented" in summary
+        assert "do NOT retry" in summary
+        assert "ran `" not in summary
+        assert len(summary) < _PRUNE_MIN_CHARS
+
+    def test_blocked_write_never_becomes_a_success_stub(self):
+        content = json.dumps({
+            "error": (
+                "BLOCKED: write to protected instruction file. "
+                "The user has NOT consented to this action. Do NOT retry."
+            ),
+        })
+        summary = _summarize_tool_result(
+            "write_file",
+            json.dumps({"path": "AGENTS.md", "content": "new\ncontent"}),
+            content,
+        )
+
+        assert summary.startswith("[write_file] AGENTS.md BLOCKED, not performed")
+        assert "wrote to" not in summary
+        assert "user has NOT consented" in summary
+        assert "do NOT retry" in summary
+
+    def test_non_user_block_does_not_invent_a_denial(self):
+        summary = _summarize_tool_result(
+            "terminal",
+            json.dumps({"command": "pwd"}),
+            json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "Working directory is not allowed",
+                "status": "blocked",
+            }),
+        )
+
+        assert summary == "[terminal] `pwd` BLOCKED, not performed"
+        assert "consent" not in summary
+        assert "retry" not in summary
+
+    def test_blocked_text_in_success_output_is_not_a_refusal_signal(self):
+        summary = _summarize_tool_result(
+            "terminal",
+            json.dumps({"command": "printf BLOCKED:"}),
+            json.dumps({"output": "BLOCKED: child output", "exit_code": 0}),
+        )
+
+        assert summary.startswith("[terminal] ran `printf BLOCKED:` -> exit 0")
+
+    @pytest.mark.parametrize("tool_name,args", [
+        ("execute_code", {"code": "dangerous()"}),
+        ("browser_click", {"ref": "button-1"}),
+    ])
+    def test_approval_required_is_bounded_and_never_claims_completion(self, tool_name, args):
+        summary = _summarize_tool_result(
+            tool_name,
+            json.dumps(args),
+            json.dumps({"status": "approval_required", "error": ""}),
+        )
+
+        assert summary.startswith(f"[{tool_name}] BLOCKED, not performed")
+        assert "approval pending" in summary
+        assert "user has NOT consented" in summary
+        assert "do NOT retry" in summary
+        assert len(summary) < _PRUNE_MIN_CHARS
+
+    def test_refusal_target_is_one_line_and_bounded(self):
+        command = "first\n" + "x" * 500
+        summary = _summarize_tool_result(
+            "terminal",
+            json.dumps({"command": command}),
+            json.dumps({"status": "blocked", "error": "BLOCKED: policy"}),
+        )
+
+        assert "\n" not in summary
+        assert len(summary) < _PRUNE_MIN_CHARS
+        assert summary.endswith("BLOCKED, not performed")
+
+
 class TestSummarizeToolResultSkillTools:
     """`skill_manage` names live at ``operations[i].name`` and `skills_list` has no ``name`` arg at
     all, so the shared ``name=`` stub rendered ``name=?`` for both and dropped the outcome — a failed
