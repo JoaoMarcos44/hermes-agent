@@ -3597,7 +3597,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             elif role == "tool":
                 tool_name, tool_args = call_id_to_tool.get(str(msg.get("tool_call_id") or ""), ("unknown", ""))
                 already_summarized = _is_summary_stub(text) or _is_refusal_summary_stub(tool_name, text)
-                tool_action = text if already_summarized else _summarize_tool_result(tool_name, tool_args, text or "")
+                tool_action = (
+                    text if already_summarized
+                    else _summarize_tool_result(tool_name, tool_args, text or "")
+                )
                 if _REFUSED_TOOL_SUMMARY_MARKER in tool_action:
                     blockers.append(tool_action)
                 else:
