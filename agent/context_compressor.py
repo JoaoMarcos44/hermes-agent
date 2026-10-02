@@ -1914,12 +1914,74 @@ def _json_dict(text: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+_REFUSED_TOOL_RESULT_STATUSES = frozenset({"blocked", "pending_approval", "approval_required"})
+_REFUSAL_PATH_TOOLS = frozenset({"read_file", "write_file", "patch"})
+_REFUSED_TOOL_SUMMARY_MARKER = " BLOCKED, not performed"
+
+
+def _refusal_target(tool_name: str, args: dict) -> str:
+    """Bounded one-line target for a refused call; empty when the tool has no stable target arg."""
+    if tool_name == "terminal":
+        value = _str_arg(args, "command")
+    elif tool_name in _REFUSAL_PATH_TOOLS:
+        value = _str_arg(args, "path")
+    else:
+        return ""
+    value = " ".join(value.split())
+    value = value if len(value) <= 80 else value[:77] + "..."
+    if not value:
+        return ""
+    return f" `{value}`" if tool_name == "terminal" else f" {value}"
+
+
+def _is_refusal_summary_stub(tool_name: str, content: str) -> bool:
+    """True only for this tool's canonical bounded refusal stub."""
+    return (
+        len(content) < _PRUNE_MIN_CHARS
+        and content.startswith(f"[{tool_name}]")
+        and _REFUSED_TOOL_SUMMARY_MARKER in content
+    )
+
+
+def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> str | None:
+    """Preserve refusal semantics before success-shaped per-tool summarizers can erase them."""
+    payload = _json_dict(content)
+    status = payload.get("status")
+    error = payload.get("error")
+    error_text = error if isinstance(error, str) else ""
+    awaiting_approval = isinstance(status, str) and status in {"pending_approval", "approval_required"}
+    pending_with_stop = status == "pending_approval"
+    refused = (
+        isinstance(status, str) and status in _REFUSED_TOOL_RESULT_STATUSES
+    ) or error_text.lstrip().startswith("BLOCKED:")
+    if not refused:
+        return None
+
+    summary = f"[{tool_name}]{_refusal_target(tool_name, args)}{_REFUSED_TOOL_SUMMARY_MARKER}"
+    lowered = error_text.casefold()
+    if awaiting_approval:
+        summary += "; approval pending"
+    if pending_with_stop:
+        # The pending_approval producer explicitly tells the agent not to retry while waiting.
+        summary += "; user has NOT consented; do NOT retry"
+    else:
+        if "not consent" in lowered:
+            summary += "; user has NOT consented"
+        if "do not retry" in lowered:
+            summary += "; do NOT retry"
+    # Keep the refusal below the prune floor so a later pass cannot erase it.
+    return elide(summary, _PRUNE_MIN_CHARS - 1)
+
+
 def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Build the summary line (unguarded; see ``_summarize_tool_result``)."""
     args = _json_dict(tool_args)
     content = tool_content or ""
     content_len = len(content)
     line_count = content.count("\n") + 1 if content.strip() else 0
+    refusal = _summarize_refused_tool_result(tool_name, args, content)
+    if refusal is not None:
+        return refusal
     summarizer = _TOOL_RESULT_SUMMARIZERS.get(tool_name)
     if summarizer is not None:
         return summarizer(tool_name, args, content, content_len, line_count)
@@ -3534,9 +3596,14 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                     assistant_actions.append(text)
             elif role == "tool":
                 tool_name, tool_args = call_id_to_tool.get(str(msg.get("tool_call_id") or ""), ("unknown", ""))
-                tool_actions.append(_summarize_tool_result(tool_name, tool_args, text or ""))
-                if re.search(r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b", text, re.I):
-                    blockers.append(text[:500])
+                already_summarized = _is_summary_stub(text) or _is_refusal_summary_stub(tool_name, text)
+                tool_action = text if already_summarized else _summarize_tool_result(tool_name, tool_args, text or "")
+                if _REFUSED_TOOL_SUMMARY_MARKER in tool_action:
+                    blockers.append(tool_action)
+                else:
+                    tool_actions.append(tool_action)
+                    if re.search(r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b", text, re.I):
+                        blockers.append(text[:500])
         return {
             "user_asks": user_asks,
             "completed": [f"{idx}. {item}" for idx, item in enumerate((assistant_actions + tool_actions)[:12], start=1)],
