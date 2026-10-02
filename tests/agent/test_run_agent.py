@@ -2063,6 +2063,7 @@ class TestConcurrentToolExecution:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
+        assert messages[0]["effect_disposition"] == "none"
 
 
     @pytest.mark.parametrize("concurrent", [False, True])

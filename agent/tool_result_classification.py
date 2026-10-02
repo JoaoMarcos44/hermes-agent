@@ -27,34 +27,66 @@ REFUSAL_BLOCKED = "blocked"
 REFUSAL_PENDING_APPROVAL = "pending_approval"
 
 
-def classify_no_effect_refusal(tool_name: str, result: Any) -> str | None:
-    """Classify producer-owned refusal results that prove a call did not take effect.
+def _result_dict(result: Any) -> dict | None:
+    if isinstance(result, dict):
+        return result
+    if not isinstance(result, str):
+        return None
+    try:
+        data = json.loads(result.strip())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
-    A tool's domain payload may legitimately contain status="blocked" after
-    successful execution, so that field is execution evidence only for terminal,
-    whose result envelope owns the approval status contract. Other tools require
-    the explicit no-consent / do-not-retry contract emitted by write approvals.
+
+def _durable_wrapped_result_dict(
+    tool_name: str, result: Any, effect_disposition: str | None,
+) -> dict | None:
+    """Decode Hermes' untrusted wrapper only when durable metadata proves no effect."""
+    if effect_disposition != "none" or not isinstance(result, str):
+        return None
+    opener = f'<untrusted_tool_result source="{tool_name}">\n'
+    closer = "\n</untrusted_tool_result>"
+    if not result.startswith(opener) or not result.endswith(closer):
+        return None
+    wrapped = result[len(opener):-len(closer)]
+    _notice, separator, payload = wrapped.partition("\n\n")
+    if not separator:
+        return None
+    return _result_dict(payload)
+
+
+def classify_no_effect_refusal(
+    tool_name: str, result: Any, *, effect_disposition: str | None = None,
+) -> str | None:
+    """Classify producer-owned evidence that a tool call was refused before taking effect.
+
+    Durable effect_disposition="none" is the authority for current blocked calls. It is
+    also the only license to inspect inside browser/MCP untrusted-data wrappers. Without
+    that metadata, arbitrary plugin or remote-server payloads cannot forge execution state.
+    The narrow legacy fallback is limited to Hermes-owned approval result shapes.
     """
-    data = result
-    if isinstance(result, str):
-        try:
-            data = json.loads(result.strip())
-        except Exception:
-            data = None
+    data = _result_dict(result)
+    if data is None:
+        data = _durable_wrapped_result_dict(tool_name, result, effect_disposition)
 
-    if isinstance(data, dict) and tool_name == "terminal":
+    if isinstance(data, dict):
         status = data.get("status")
-        if status in {REFUSAL_BLOCKED, REFUSAL_PENDING_APPROVAL}:
-            return status
+        if tool_name == "terminal" or effect_disposition == "none":
+            if status == REFUSAL_BLOCKED:
+                return REFUSAL_BLOCKED
+            if status in {REFUSAL_PENDING_APPROVAL, "approval_required"}:
+                return REFUSAL_PENDING_APPROVAL
 
-    error = data.get("error") if isinstance(data, dict) else result
-    if (
-        tool_may_have_side_effect(tool_name)
-        and isinstance(error, str)
-        and "user has NOT consented" in error
-        and "Do NOT retry" in error
-    ):
-        return REFUSAL_BLOCKED
+        error = data.get("error")
+        legacy_consent_tool = tool_name in {"write_file", "patch", "execute_code"}
+        if (
+            (legacy_consent_tool or effect_disposition == "none")
+            and isinstance(error, str)
+            and "user has NOT consented" in error
+            and "Do NOT retry" in error
+        ):
+            return REFUSAL_BLOCKED
     return None
 
 

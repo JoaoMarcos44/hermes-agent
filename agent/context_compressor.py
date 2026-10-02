@@ -1927,7 +1927,9 @@ def _summarize_no_effect_tool_result(
     tool_name: str, args: dict, content: str, effect_disposition: str | None,
 ) -> str | None:
     """Summarize known-no-effect calls before success-shaped per-tool summaries."""
-    refusal = classify_no_effect_refusal(tool_name, content)
+    refusal = classify_no_effect_refusal(
+        tool_name, content, effect_disposition=effect_disposition,
+    )
     if effect_disposition != "none" and refusal is None:
         return None
 
