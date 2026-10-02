@@ -303,6 +303,44 @@ class TestSummarizeToolResultRefusals:
         assert summary.endswith("BLOCKED, not performed")
 
 
+    def test_deterministic_fallback_keeps_raw_and_pruned_refusal_blocked(self):
+        from tools import approval
+        from tools.terminal_tool import _error_json
+
+        args = json.dumps({"command": "rm -rf build"})
+        raw = _error_json(
+            approval._COMMAND_GATE.cli_denied.format(description="", breaker=""),
+            status="blocked",
+        )
+        stub = _summarize_tool_result("terminal", args, raw)
+        compressor = ContextCompressor(
+            model="test/model",
+            config_context_length=100_000,
+            protect_first_n=0,
+            protect_last_n=2,
+            quiet_mode=True,
+        )
+
+        for content in (raw, stub):
+            anchors = compressor._fallback_anchors([
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "t1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": args},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "t1", "content": content},
+            ])
+
+            assert all("BLOCKED" not in item for item in anchors["completed"])
+            assert all("ran `" not in item for item in anchors["completed"])
+            assert anchors["blockers"] == [stub]
+            assert "user has NOT consented" in anchors["blockers"][0]
+            assert "do NOT retry" in anchors["blockers"][0]
+
+
 class TestSummarizeToolResultSkillTools:
     """`skill_manage` names live at ``operations[i].name`` and `skills_list` has no ``name`` arg at
     all, so the shared ``name=`` stub rendered ``name=?`` for both and dropped the outcome — a failed
