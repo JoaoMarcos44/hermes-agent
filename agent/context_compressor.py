@@ -853,16 +853,11 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 _SUMMARY_INPUT_MAX_CHARS = 160_000
 
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
-_REFUSED_TOOL_SUMMARY_MARKER = " BLOCKED, not performed"
 
 
 def _is_summary_stub(content: str) -> bool:
-    """True for a tool result already replaced by a bounded one-line summary."""
-    return (
-        content.startswith("[")
-        and len(content) < 400
-        and (" chars)" in content or _REFUSED_TOOL_SUMMARY_MARKER in content)
-    )
+    """True for a tool result already replaced by a 1-line ``[tool] ... (N chars)`` summary."""
+    return content.startswith("[") and " chars)" in content and len(content) < 400
 
 
 # Shared floor; the clarify summary cap must stay strictly BELOW it so a preserved
@@ -1921,6 +1916,7 @@ def _json_dict(text: Any) -> dict:
 
 _REFUSED_TOOL_RESULT_STATUSES = frozenset({"blocked", "pending_approval", "approval_required"})
 _REFUSAL_PATH_TOOLS = frozenset({"read_file", "write_file", "patch"})
+_REFUSED_TOOL_SUMMARY_MARKER = " BLOCKED, not performed"
 
 
 def _refusal_target(tool_name: str, args: dict) -> str:
@@ -1936,6 +1932,15 @@ def _refusal_target(tool_name: str, args: dict) -> str:
     if not value:
         return ""
     return f" `{value}`" if tool_name == "terminal" else f" {value}"
+
+
+def _is_refusal_summary_stub(tool_name: str, content: str) -> bool:
+    """True only for this tool's canonical bounded refusal stub."""
+    return (
+        len(content) < _PRUNE_MIN_CHARS
+        and content.startswith(f"[{tool_name}]")
+        and _REFUSED_TOOL_SUMMARY_MARKER in content
+    )
 
 
 def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> str | None:
@@ -3591,7 +3596,8 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
                     assistant_actions.append(text)
             elif role == "tool":
                 tool_name, tool_args = call_id_to_tool.get(str(msg.get("tool_call_id") or ""), ("unknown", ""))
-                tool_action = text if _is_summary_stub(text) else _summarize_tool_result(tool_name, tool_args, text or "")
+                already_summarized = _is_summary_stub(text) or _is_refusal_summary_stub(tool_name, text)
+                tool_action = text if already_summarized else _summarize_tool_result(tool_name, tool_args, text or "")
                 if _REFUSED_TOOL_SUMMARY_MARKER in tool_action:
                     blockers.append(tool_action)
                 else:
