@@ -1939,7 +1939,8 @@ def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> 
     status = payload.get("status")
     error = payload.get("error")
     error_text = error if isinstance(error, str) else ""
-    pending = isinstance(status, str) and status in {"pending_approval", "approval_required"}
+    awaiting_approval = isinstance(status, str) and status in {"pending_approval", "approval_required"}
+    pending_with_stop = status == "pending_approval"
     refused = (
         isinstance(status, str) and status in _REFUSED_TOOL_RESULT_STATUSES
     ) or error_text.lstrip().startswith("BLOCKED:")
@@ -1948,8 +1949,11 @@ def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> 
 
     summary = f"[{tool_name}]{_refusal_target(tool_name, args)} BLOCKED, not performed"
     lowered = error_text.casefold()
-    if pending:
-        summary += "; approval pending; user has NOT consented; do NOT retry"
+    if awaiting_approval:
+        summary += "; approval pending"
+    if pending_with_stop:
+        # The pending_approval producer explicitly tells the agent not to retry while waiting.
+        summary += "; user has NOT consented; do NOT retry"
     else:
         if "not consent" in lowered:
             summary += "; user has NOT consented"
