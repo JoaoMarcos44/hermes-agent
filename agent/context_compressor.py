@@ -1914,12 +1914,60 @@ def _json_dict(text: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+_REFUSED_TOOL_RESULT_STATUSES = frozenset({"blocked", "pending_approval", "approval_required"})
+_REFUSAL_PATH_TOOLS = frozenset({"read_file", "write_file", "patch"})
+
+
+def _refusal_target(tool_name: str, args: dict) -> str:
+    """Bounded one-line target for a refused call; empty when the tool has no stable target arg."""
+    if tool_name == "terminal":
+        value = _str_arg(args, "command")
+    elif tool_name in _REFUSAL_PATH_TOOLS:
+        value = _str_arg(args, "path")
+    else:
+        return ""
+    value = " ".join(value.split())
+    value = value if len(value) <= 80 else value[:77] + "..."
+    if not value:
+        return ""
+    return f" `{value}`" if tool_name == "terminal" else f" {value}"
+
+
+def _summarize_refused_tool_result(tool_name: str, args: dict, content: str) -> str | None:
+    """Preserve refusal semantics before success-shaped per-tool summarizers can erase them."""
+    payload = _json_dict(content)
+    status = payload.get("status")
+    error = payload.get("error")
+    error_text = error if isinstance(error, str) else ""
+    pending = isinstance(status, str) and status in {"pending_approval", "approval_required"}
+    refused = (
+        isinstance(status, str) and status in _REFUSED_TOOL_RESULT_STATUSES
+    ) or error_text.lstrip().startswith("BLOCKED:")
+    if not refused:
+        return None
+
+    summary = f"[{tool_name}]{_refusal_target(tool_name, args)} BLOCKED, not performed"
+    lowered = error_text.casefold()
+    if pending:
+        summary += "; approval pending; user has NOT consented; do NOT retry"
+    else:
+        if "not consent" in lowered:
+            summary += "; user has NOT consented"
+        if "do not retry" in lowered:
+            summary += "; do NOT retry"
+    # Keep the refusal below the prune floor so a later pass cannot erase it.
+    return elide(summary, _PRUNE_MIN_CHARS - 1)
+
+
 def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_content: str) -> str:
     """Build the summary line (unguarded; see ``_summarize_tool_result``)."""
     args = _json_dict(tool_args)
     content = tool_content or ""
     content_len = len(content)
     line_count = content.count("\n") + 1 if content.strip() else 0
+    refusal = _summarize_refused_tool_result(tool_name, args, content)
+    if refusal is not None:
+        return refusal
     summarizer = _TOOL_RESULT_SUMMARIZERS.get(tool_name)
     if summarizer is not None:
         return summarizer(tool_name, args, content, content_len, line_count)
