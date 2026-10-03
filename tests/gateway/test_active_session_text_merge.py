@@ -323,6 +323,7 @@ async def test_sender_separated_debounce_spill_bypasses_photo_coalescing():
     from gateway.run import GatewayRunner
 
     adapter = _make_adapter()
+    adapter.config.extra["group_sessions_per_user"] = False
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._queued_events = {}
     runner._BUSY_QUEUE_MAX_PENDING = 32
@@ -347,8 +348,8 @@ async def test_sender_separated_debounce_spill_bypasses_photo_coalescing():
         "carol-third", chat_id="group-1", chat_type="group", user_id="103", user_name="carol",
     )
     carol.message_id = "203"
-    session_key = build_session_key(alice.source)
-    assert session_key == build_session_key(bob.source) == build_session_key(carol.source)
+    session_key = adapter._event_session_key(alice)
+    assert session_key == adapter._event_session_key(bob) == adapter._event_session_key(carol)
     adapter._pending_messages[session_key] = alice
 
     await adapter._queue_text_debounce(session_key, bob)
