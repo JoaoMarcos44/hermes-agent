@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from contextlib import nullcontext, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -638,7 +639,9 @@ class GatewayAgentCacheMixin:
         if pin is None:
             return
         conversation = self._session_state(session_key).conversation
-        conversation.ephemeral_pin = (pin["context_key"], pin["context_prompt"], pin["redact_pii"])
+        conversation.ephemeral_pin = (
+            pin["context_key"], pin["context_prompt"], pin["redact_pii"], pin.get("source"),
+        )
         conversation.channel_pin = (pin["channel_prompt"], pin["parent_chat_id"])
 
     async def _persist_prompt_pins(self, session_key: Optional[str], expected_session_id: Optional[str]) -> None:
@@ -655,6 +658,8 @@ class GatewayAgentCacheMixin:
             "context_prompt": ephemeral_pin[1], "redact_pii": ephemeral_pin[2],
             "channel_prompt": channel_pin[0], "parent_chat_id": channel_pin[1],
         }
+        if len(ephemeral_pin) > 3 and isinstance(ephemeral_pin[3], dict):
+            snapshot["source"] = dict(ephemeral_pin[3])
         try:
             await self.async_session_store.set_prompt_pin(
                 session_key, snapshot, expected_session_id=expected_session_id)
@@ -684,16 +689,41 @@ class GatewayAgentCacheMixin:
         setting it was rendered under; bytes from another privacy policy are never reused."""
         _pin_state = self._peek_session_state(session_key) if session_key else None
         _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
-        if _eph_pin is not None and _eph_pin[2] != redact_pii:
+        _pinned_source = (
+            _eph_pin[3]
+            if _eph_pin is not None and len(_eph_pin) > 3 and isinstance(_eph_pin[3], dict)
+            else None
+        )
+
+        # A preserving event has no authoritative source metadata of its own, but operational
+        # configuration (home channels, connected platforms, privacy) can still change. Re-key
+        # against the current configuration using the last authoritative source snapshot, so a
+        # legitimate config change re-renders once without reintroducing the synthetic A->B->A
+        # source flip. Legacy pins without a source snapshot keep the old reuse behavior.
+        effective_context = context
+        if preserve_pin and _pinned_source is not None:
+            try:
+                effective_context = replace(context, source=SessionSource.from_dict(_pinned_source))
+            except Exception:
+                _pinned_source = None
+        if preserve_pin and _eph_pin is not None and _pinned_source is None:
+            if _eph_pin[2] == redact_pii:
+                return _eph_pin[1]
             _eph_pin = None
-        if preserve_pin and _eph_pin is not None:
+
+        _eph_key = self._ephemeral_change_key(effective_context, redact_pii)
+        if _eph_pin is not None and _eph_pin[2] == redact_pii and _eph_pin[0] == _eph_key:
             return _eph_pin[1]
-        _eph_key = self._ephemeral_change_key(context, redact_pii)
-        if _eph_pin is not None and _eph_pin[0] == _eph_key:
-            return _eph_pin[1]
-        text = build_session_context_prompt(context, redact_pii=redact_pii)
+        text = build_session_context_prompt(effective_context, redact_pii=redact_pii)
         if session_key:
-            self._session_state(session_key).conversation.ephemeral_pin = (_eph_key, text, redact_pii)
+            source_snapshot = (
+                dict(_pinned_source)
+                if preserve_pin and _pinned_source is not None
+                else context.source.to_dict()
+            )
+            self._session_state(session_key).conversation.ephemeral_pin = (
+                _eph_key, text, redact_pii, source_snapshot,
+            )
         return text
 
     def _pinned_channel_inputs(

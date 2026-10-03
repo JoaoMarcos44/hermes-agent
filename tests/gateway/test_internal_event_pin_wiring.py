@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
+from gateway.config import ChannelOverride, GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.run_turn_runner import TurnRunner
 from gateway.session import SessionEntry, SessionSource
@@ -478,3 +478,71 @@ async def test_first_non_internal_synthetic_after_restart_rehydrates_prompt_pins
     assert first_synthetic["context_prompt"] == human["context_prompt"] == next_human["context_prompt"]
     assert _effective_ephemeral(after, first_synthetic) == _effective_ephemeral(before, human)
     assert _effective_ephemeral(after, next_human) == _effective_ephemeral(before, human)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart_before_synthetic", [False, True], ids=("live", "after-restart"))
+async def test_synthetic_turn_refreshes_home_config_without_losing_pinned_source(
+    monkeypatch, restart_before_synthetic
+):
+    """A pin-preserving continuation must observe /sethome without adopting synthetic source shape."""
+    import gateway.slash_commands as slash_commands
+    import hermes_cli.config as cli_config
+
+    monkeypatch.setattr(slash_commands, "persist_home_channel", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli_config, "save_env_value", lambda *_a, **_k: None)
+
+    old_home = HomeChannel(
+        platform=Platform.DISCORD,
+        chat_id="111111111111111111",
+        name="Old home",
+    )
+    config = GatewayConfig()
+    config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True, home_channel=old_home)
+    durable: dict = {}
+    source = _human_source()
+
+    before = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+    before_calls: list[dict] = []
+    _capture(before, before_calls)
+    await _drive(before, ((False, source),), channel_prompt="Channel hint.")
+
+    assert "111111111111111111" in before_calls[0]["context_prompt"]
+    assert "Guild / #general" in before_calls[0]["context_prompt"]
+    assert durable["value"]["source"]["message_id"] == source.message_id
+
+    runner = (
+        _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+        if restart_before_synthetic
+        else before
+    )
+    calls = [] if restart_before_synthetic else before_calls
+    if restart_before_synthetic:
+        _capture(runner, calls)
+
+    new_home_source = dataclasses.replace(
+        source,
+        chat_id="222222222222222222",
+        chat_name="New home",
+        message_id="1552671843494666399",
+    )
+    reply = await runner._handle_set_home_command(
+        MessageEvent(
+            text="/sethome",
+            source=new_home_source,
+            message_id=new_home_source.message_id,
+        )
+    )
+    assert reply
+    assert config.platforms[Platform.DISCORD].home_channel.chat_id == "222222222222222222"
+
+    synthetic = runner._synthetic_prompt_event(source, "[heartbeat] continue")
+    await runner._handle_message_with_agent(synthetic, synthetic.source, KEY, 1)
+    await _drive(runner, ((False, source),), channel_prompt="Channel hint.")
+
+    synthetic_call, next_human = calls[-2], calls[-1]
+    assert "222222222222222222" in synthetic_call["context_prompt"]
+    assert "New home" in synthetic_call["context_prompt"]
+    assert "111111111111111111" not in synthetic_call["context_prompt"]
+    assert "Guild / #general" in synthetic_call["context_prompt"]
+    assert synthetic_call["context_prompt"] == next_human["context_prompt"]
