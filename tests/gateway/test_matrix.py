@@ -1170,6 +1170,61 @@ class TestMatrixSyncLoop:
         assert called is True
 
     @pytest.mark.asyncio
+    async def test_swallowed_room_handler_failure_withholds_cursor_and_retries(self):
+        """mautrix catches handler errors; retry only the failed event before acknowledging."""
+        adapter = _make_adapter()
+        adapter._user_id = "@bot:example.org"
+        adapter._is_allowed_matrix_room_event = AsyncMock(return_value=True)
+
+        attempts = {"$retry-me": 0, "$sibling": 0}
+
+        async def handle_text(_room_id, _sender, event_id, *_args):
+            attempts[event_id] += 1
+            if event_id == "$retry-me" and attempts[event_id] == 1:
+                raise RuntimeError("transient room handler failure")
+
+        adapter._handle_text_message = handle_text
+
+        def event(event_id):
+            return types.SimpleNamespace(
+                sender="@alice:example.org",
+                event_id=event_id,
+                room_id="!room:example.org",
+                timestamp=0,
+                content={"msgtype": "m.text", "body": event_id},
+            )
+
+        retry_event = event("$retry-me")
+        sibling_event = event("$sibling")
+        store = types.SimpleNamespace(put_next_batch=AsyncMock())
+        client = types.SimpleNamespace(sync_store=store)
+
+        async def mautrix_catch_errors(item):
+            # Syncer._catch_errors has this observable contract: log the handler error and
+            # let the task itself complete successfully.
+            try:
+                await adapter._on_room_message_sync(item)
+            except Exception:
+                pass
+
+        client.handle_sync = lambda _data: [
+            asyncio.create_task(mautrix_catch_errors(retry_event)),
+            asyncio.create_task(mautrix_catch_errors(sibling_event)),
+        ]
+        adapter._client = client
+
+        with pytest.raises(RuntimeError, match="transient room handler failure"):
+            await adapter._absorb_sync(client, {"next_batch": "s1"})
+        store.put_next_batch.assert_not_awaited()
+        assert attempts == {"$retry-me": 1, "$sibling": 1}
+        assert "$retry-me" not in adapter._processed_events_set
+        assert "$sibling" in adapter._processed_events_set
+
+        assert await adapter._absorb_sync(client, {"next_batch": "s1"}) == "s1"
+        assert attempts == {"$retry-me": 2, "$sibling": 1}
+        store.put_next_batch.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
     async def test_sync_loop_dispatches_registered_room_message_handler(self):
         """Inbound sync data should flow through handle_sync into message handling."""
         adapter = _make_adapter()

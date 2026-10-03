@@ -876,6 +876,9 @@ class MatrixAdapter(BasePlatformAdapter):
         from collections import deque
         self._processed_events: deque = deque(maxlen=1000)  # event dedup, newest kept
         self._processed_events_set: set = set()
+        # mautrix catches ordinary handler exceptions inside _catch_errors(). Keep a batch-local
+        # side channel so _dispatch_sync can still refuse to commit a cursor after a room handler fails.
+        self._sync_dispatch_errors: Optional[list[BaseException]] = None
         self._threads = ThreadParticipationTracker("matrix")  # require_mention bypass
         self._parked_voices = ParkedVoices()  # unmentioned voice awaiting a bare @mention
         self._require_mention: bool = self._parse_require_mention(config)
@@ -937,6 +940,26 @@ class MatrixAdapter(BasePlatformAdapter):
         self._processed_events.append(event_id)
         self._processed_events_set.add(event_id)
         return False
+
+    def _forget_processed_event(self, event_id: str) -> None:
+        """Make a failed event retryable without disturbing successful sibling dedup."""
+        if not event_id:
+            return
+        self._processed_events_set.discard(event_id)
+        with suppress(ValueError):
+            self._processed_events.remove(event_id)
+
+    async def _on_room_message_sync(self, event: Any) -> None:
+        """Expose room-handler failures that mautrix's _catch_errors otherwise swallows."""
+        try:
+            await self._on_room_message(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            errors = self._sync_dispatch_errors
+            if errors is not None:
+                errors.append(exc)
+            raise
 
     @staticmethod
     def _extra_truthy(config, key: str, env_name: str, default: str) -> bool:
@@ -1357,7 +1380,7 @@ class MatrixAdapter(BasePlatformAdapter):
         from mautrix.client import InternalEventType as IntEvt
         from mautrix.client.dispatcher import MembershipEventDispatcher
         client.add_dispatcher(MembershipEventDispatcher)  # without this INVITE never fires
-        client.add_event_handler(EventType.ROOM_MESSAGE, self._on_room_message, wait_sync=True)
+        client.add_event_handler(EventType.ROOM_MESSAGE, self._on_room_message_sync, wait_sync=True)
         client.add_event_handler(EventType.REACTION, self._on_reaction, wait_sync=True)
         client.add_event_handler(IntEvt.INVITE, self._on_invite, wait_sync=True)
         self._startup_ts = time.time()
@@ -1892,8 +1915,6 @@ class MatrixAdapter(BasePlatformAdapter):
             self._joined_rooms.update(rooms_join.keys())
             self._invalidate_room_identities()
         nb = sync_data.get("next_batch")  # incremental syncs resume from here
-        if nb:
-            await client.sync_store.put_next_batch(nb)
         if initial:
             logger.info("Matrix: initial sync complete, joined %d rooms", len(self._joined_rooms))
             await self._refresh_dm_cache()
@@ -1901,23 +1922,42 @@ class MatrixAdapter(BasePlatformAdapter):
             await self._dispatch_sync(sync_data)
         except Exception as exc:
             logger.warning("Matrix: %s: %s", "initial sync event dispatch error" if initial else "sync event dispatch error", exc)
+            raise
         self._schedule_pending_invite_joins(sync_data)
+        # A Matrix cursor is an acknowledgement: publish it only after the room handlers completed.
+        # Otherwise mautrix can swallow a handler failure while Hermes permanently skips that event.
+        if nb:
+            await client.sync_store.put_next_batch(nb)
         return nb
 
     async def _dispatch_sync(self, sync_data: Dict[str, Any]) -> None:
-        """Dispatch a sync response through the mautrix event machinery."""
+        """Dispatch one sync batch and surface failures hidden by mautrix's handler wrapper."""
         client = self._client
         if not client or not hasattr(client, "handle_sync"):
             return
-        tasks = client.handle_sync(sync_data)
-        if inspect.isawaitable(tasks):
-            tasks = await tasks
-        if tasks:
-            # return_exceptions=True: one failing handler must not drop its SIBLING events.
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning("Matrix: event handler failed during sync dispatch: %s", result)
+        errors: list[BaseException] = []
+        previous_errors = self._sync_dispatch_errors
+        self._sync_dispatch_errors = errors
+        try:
+            tasks = client.handle_sync(sync_data)
+            if inspect.isawaitable(tasks):
+                tasks = await tasks
+            task_errors: list[BaseException] = []
+            if tasks:
+                # Let every sibling settle before deciding whether this batch may advance its cursor.
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        logger.warning("Matrix: event handler failed during sync dispatch: %s", result)
+                        task_errors.append(result)
+            # mautrix's _catch_errors logs and converts normal handler exceptions into successful
+            # task completion. _on_room_message_sync records those failures here before re-raising.
+            if errors:
+                raise errors[0]
+            if task_errors:
+                raise task_errors[0]
+        finally:
+            self._sync_dispatch_errors = previous_errors
 
     def _is_self_sender(self, sender: str) -> bool:
         """True if *sender* is the bot itself (case-insensitive: homeservers vary localpart case). With
@@ -2015,6 +2055,17 @@ class MatrixAdapter(BasePlatformAdapter):
         event_id = str(getattr(event, "event_id", ""))
         if self._is_duplicate_event(event_id):
             return
+        try:
+            await self._handle_room_message_once(event, room_id, sender, event_id)
+        except BaseException:
+            # The sync cursor stays put on failure, so the failed event must not stay claimed by
+            # the bounded in-memory dedup window when the same /sync batch is retried.
+            self._forget_processed_event(event_id)
+            raise
+
+    async def _handle_room_message_once(
+        self, event: Any, room_id: str, sender: str, event_id: str,
+    ) -> None:
         # Startup grace: ignore old messages replayed by the initial sync.
         event_ts = _matrix_event_timestamp_seconds(event)
         if event_ts and event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS:
