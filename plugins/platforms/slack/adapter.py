@@ -3341,44 +3341,51 @@ class SlackAdapter(BasePlatformAdapter):
         return self._lazy_attr("_conversation_kind_cache", dict).get((team_id, channel_id))
 
     def _session_key_conversation_classification(
-        self, session_key: str, channel_id: str, team_id: str, user_id: str,
-        thread_id: str = "",
+        self, session_key: str, channel_id: str, team_id: str,
     ) -> Optional[Tuple[bool, bool]]:
         """Recover an ambiguous G... class from a trusted session key without Slack I/O.
 
-        Session keys encode chat_type. Approval buttons carry the exact key that created the
-        prompt, and active-session controls can compare against the adapter's live key. We
-        reconstruct both candidates instead of parsing the key so profile/scope/user/thread
-        policy stays owned by build_session_key.
+        Approval button values and active-session keys are gateway-owned. Parse them through the
+        gateway's canonical same-chat slot helper instead of reconstructing a key from the current
+        caller: another authorized operator may click an approval created by the session owner.
         """
         cached = self._cached_conversation_classification(channel_id, team_id)
         if cached is not None:
             return cached
         channel_id = str(channel_id or "")
+        session_key = str(session_key or "")
         if not channel_id.startswith("G") or not session_key:
             return None
 
-        matches: List[Tuple[bool, bool]] = []
-        for chat_type, classification in (("dm", (True, False)), ("group", (False, False))):
-            try:
-                source = self.build_source(
-                    chat_id=channel_id,
-                    chat_type=chat_type,
-                    user_id=user_id,
-                    thread_id=thread_id or None,
-                    scope_id=team_id or None,
-                )
-                if self._source_session_key(source) == str(session_key):
-                    matches.append(classification)
-            except Exception:
-                logger.debug(
-                    "[Slack] Could not compare %s session-key classification for %s",
-                    chat_type, channel_id, exc_info=True,
-                )
-        return matches[0] if len(matches) == 1 else None
+        parts = session_key.split(":", 2)
+        if len(parts) < 3 or parts[0] != "agent":
+            return None
+        namespace = ":".join(parts[:2])
+        try:
+            from gateway.run_busy import _same_chat_key_slots
+            parsed = _same_chat_key_slots(
+                session_key,
+                prefix=f"{namespace}:{self.platform.value}:",
+                chat_id=channel_id,
+                scope_id=str(team_id or "") or None,
+            )
+        except Exception:
+            logger.debug(
+                "[Slack] Could not parse session-key classification for %s",
+                channel_id, exc_info=True,
+            )
+            return None
+        if parsed is None:
+            return None
+        chat_type = parsed[0]
+        if chat_type == "dm":
+            return True, False
+        if chat_type == "group":
+            return False, False
+        return None
 
     def _active_session_conversation_classification(
-        self, channel_id: str, team_id: str, user_id: str, thread_id: str = "",
+        self, channel_id: str, team_id: str,
     ) -> Optional[Tuple[bool, bool]]:
         """Resolve a control's G... class from the currently active session, without network I/O."""
         cached = self._cached_conversation_classification(channel_id, team_id)
@@ -3388,7 +3395,7 @@ class SlackAdapter(BasePlatformAdapter):
             classification
             for session_key in tuple(getattr(self, "_active_sessions", {}))
             if (classification := self._session_key_conversation_classification(
-                session_key, channel_id, team_id, user_id, thread_id
+                session_key, channel_id, team_id
             )) is not None
         }
         return next(iter(matches)) if len(matches) == 1 else None
@@ -5654,13 +5661,13 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _authorize_interaction_user(
         self, kind: str, user_id: str, user_name: str, channel_id: str, team_id: str, *,
-        team_scoped: bool = True, session_key_hint: str = "", thread_id: str = "",
+        team_scoped: bool = True, session_key_hint: str = "",
     ) -> bool:
         """Authorize a Block Kit caller under the same conversation policy as message ingress."""
         if self._is_ignored_channel(channel_id):
             return False
         classification = self._session_key_conversation_classification(
-            session_key_hint, channel_id, team_id, user_id, thread_id
+            session_key_hint, channel_id, team_id
         ) if session_key_hint else None
         if classification is None:
             classification = await self._classify_conversation(channel_id, team_id)
@@ -5712,7 +5719,6 @@ class SlackAdapter(BasePlatformAdapter):
         if not await self._authorize_interaction_user(
             kind, user_id, user_name, channel_id, team_id, team_scoped=team_scoped,
             session_key_hint=value if kind == "approval" else "",
-            thread_id=str(message.get("thread_ts") or ""),
         ):
             return None
         return team_id, action_id, value, message, msg_ts, channel_id, user_name, user_id
@@ -6246,9 +6252,7 @@ class SlackAdapter(BasePlatformAdapter):
         if self._is_ignored_channel(channel_id):
             return
         classification = (
-            self._active_session_conversation_classification(
-                channel_id, team_id, user_id, thread_id
-            )
+            self._active_session_conversation_classification(channel_id, team_id)
             if lookup_free_control else await self._classify_conversation(channel_id, team_id)
         )
         if classification is None:

@@ -291,7 +291,7 @@ class TestSlackApprovalAction:
             source = adapter.build_source(
                 chat_id="G_PRIVATE" if chat_type == "group" else "G_DM",
                 chat_type=chat_type,
-                user_id=user_id,
+                user_id="U_SESSION_OWNER",
                 scope_id="T1",
             )
             session_key = adapter._source_session_key(source)
