@@ -1,0 +1,37 @@
+name: PR 126167 isolated repair
+
+on:
+  push:
+    branches: [work/126167-review-repair-20261003]
+    paths:
+      - .github/workflows/pr126167-isolated-repair.yml
+      - .pr126167-repair/**
+
+permissions:
+  contents: read
+
+jobs:
+  source-snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 5dd5193b32c4fc0dbc3aa595df6c51b6f4341840
+          persist-credentials: false
+      - name: Export the exact reviewed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5dd5193b32c4fc0dbc3aa595df6c51b6f4341840
+          mkdir -p "$RUNNER_TEMP/pr126167-source"
+          git archive --format=tar.gz -o "$RUNNER_TEMP/pr126167-source/source.tar.gz" HEAD
+          git ls-tree -r HEAD > "$RUNNER_TEMP/pr126167-source/blobs.txt"
+          git show -s --format=fuller HEAD > "$RUNNER_TEMP/pr126167-source/revision.txt"
+          sha256sum "$RUNNER_TEMP/pr126167-source/source.tar.gz" > "$RUNNER_TEMP/pr126167-source/source.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr126167-reviewed-source
+          path: ${{ runner.temp }}/pr126167-source/
+          if-no-files-found: error
+          retention-days: 1
