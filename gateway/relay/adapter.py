@@ -1339,18 +1339,30 @@ class RelayAdapter(BasePlatformAdapter):
         """Bridge a connector-delivered /stop into the per-session interrupt path."""
         await self.interrupt_session_activity(session_key, chat_id)
 
+    async def _ack_passthrough_buffer(self, buffer_id: Optional[str]) -> None:
+        if not buffer_id:
+            return
+        ack = getattr(self._transport, "ack_inbound", None)
+        if not callable(ack):
+            logger.warning("relay passthrough buffer cannot be acked: transport has no ack_inbound")
+            return
+        await ack(str(buffer_id))
+
     async def _on_passthrough(self, forward, buffer_id: Optional[str] = None) -> None:
-        """Handle a connector-forwarded passthrough request. The connector answered the
-        provider's latency-critical ACK at the edge, verified the signature and vaulted
-        any shared-identity credential; the agent later acts via the token-less
-        ``send_follow_up`` path. A Discord interaction becomes a normalized
-        ``MessageEvent`` on the SAME agent path as chat; other forwards are logged and
-        dropped. NEVER raises: a malformed forward must not kill the read loop."""
+        """Handle a connector-forwarded passthrough request and settle its delivery buffer."""
+        dedupe_key = f"passthrough_buffer:{buffer_id}" if buffer_id else None
+        should_process, claim = await self._claim_inbound_dedupe(dedupe_key)
+        if not should_process:
+            await self._ack_passthrough_buffer(buffer_id)
+            return
         try:
             platform = getattr(forward, "platform", "") or ""
             if platform == "discord":
                 payload = self._discord_interaction_payload(forward)
                 if payload is None:
+                    self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
+                    claim = None
+                    await self._ack_passthrough_buffer(buffer_id)
                     return
                 member = payload.get("member") if isinstance(payload.get("member"), dict) else {}
                 user = (member.get("user") if isinstance(member, dict) else None) or payload.get("user") or {}
@@ -1365,19 +1377,30 @@ class RelayAdapter(BasePlatformAdapter):
                 if event is not None:
                     self._capture_scope(event)
                     await self._remember_discord_interaction_context(payload, event)
-                    # Reconstructed chat labels are consumers of text-lane observations; only
-                    # explicit raw interaction facts are allowed to update shared identity state.
-                    # A prompt-token component press is consumed (same gate as _on_inbound).
                     if await self._consume_prompt_response(event):
+                        self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
+                        claim = None
+                        await self._ack_passthrough_buffer(buffer_id)
                         return
+                    self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
+                    claim = None
                     await self.handle_message(event)
+                    await self._ack_passthrough_buffer(buffer_id)
                     return
             logger.info(
                 "relay passthrough_forward dropped (no handler): platform=%s method=%s path=%s",
                 platform, getattr(forward, "method", "?"), getattr(forward, "path", "?"),
             )
-        except Exception:  # noqa: BLE001 - a bad forward must never break the reader
+            self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
+            claim = None
+            await self._ack_passthrough_buffer(buffer_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
             logger.warning("relay passthrough_forward handling failed", exc_info=True)
+        finally:
+            if claim is not None:
+                self._finish_inbound_dedupe(dedupe_key, claim, admitted=False)
 
     @staticmethod
     def _discord_interaction_payload(forward) -> Optional[Dict[str, Any]]:

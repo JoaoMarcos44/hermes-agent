@@ -108,7 +108,77 @@ async def test_message_interaction_message_keeps_prompt_and_session_identity(thr
 
 
 
+
 @pytest.mark.asyncio
+async def test_buffered_passthrough_replay_is_admitted_once_and_acked_each_time():
+    adapter, stub = _adapter(platform="discord")
+    adapter.handle_message = AsyncMock()
+    forward = _forward(type=3, id="press-buffer-1", message={"id": "bot-buffer-1"},
+                       member={"user": {"id": "u1", "username": "ben"}},
+                       data={"custom_id": "inspect"})
+    await adapter._on_passthrough(forward, "buffer-1")
+    await adapter._on_passthrough(forward, "buffer-1")
+    assert adapter.handle_message.await_count == 1
+    assert stub.acked_buffer_ids == ["buffer-1", "buffer-1"]
+
+
+@pytest.mark.asyncio
+async def test_buffered_passthrough_cancel_before_admission_remains_retryable():
+    adapter, stub = _adapter(platform="discord")
+    adapter.handle_message = AsyncMock()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = adapter._discord_context_for
+
+    async def held(*args):
+        entered.set()
+        await release.wait()
+        return await original(*args)
+
+    adapter._discord_context_for = held
+    forward = _forward(type=3, id="press-buffer-cancel", message={"id": "bot-buffer-cancel"},
+                       member={"user": {"id": "u1", "username": "ben"}},
+                       data={"custom_id": "inspect"})
+    task = asyncio.create_task(adapter._on_passthrough(forward, "buffer-cancel"))
+    await asyncio.wait_for(entered.wait(), 3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert adapter.handle_message.await_count == 0
+    assert stub.acked_buffer_ids == []
+    assert "passthrough_buffer:buffer-cancel" not in adapter._seen_inbound
+
+    release.set()
+    adapter._discord_context_for = original
+    await adapter._on_passthrough(forward, "buffer-cancel")
+    assert adapter.handle_message.await_count == 1
+    assert stub.acked_buffer_ids == ["buffer-cancel"]
+
+
+@pytest.mark.asyncio
+async def test_buffered_passthrough_replay_finishes_ack_after_post_admission_failure():
+    adapter, stub = _adapter(platform="discord")
+    calls = 0
+
+    async def failing(_event):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("after admission")
+
+    adapter.handle_message = failing
+    forward = _forward(type=3, id="press-buffer-fail", message={"id": "bot-buffer-fail"},
+                       member={"user": {"id": "u1", "username": "ben"}},
+                       data={"custom_id": "inspect"})
+    await adapter._on_passthrough(forward, "buffer-fail")
+    assert calls == 1
+    assert stub.acked_buffer_ids == []
+    await adapter._on_passthrough(forward, "buffer-fail")
+    assert calls == 1
+    assert stub.acked_buffer_ids == ["buffer-fail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools_enabled", [False, True], ids=["tools-off", "tools-on"])
+async def test_model_reaching_slash_keeps_discord_prompt_presence_stable@pytest.mark.asyncio
 @pytest.mark.parametrize("tools_enabled", [False, True], ids=["tools-off", "tools-on"])
 async def test_model_reaching_slash_keeps_discord_prompt_presence_stable(monkeypatch, tools_enabled):
     """A truthful slash-without-message anchor must not flip cached Discord system guidance."""

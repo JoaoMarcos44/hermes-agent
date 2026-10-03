@@ -630,6 +630,10 @@ class WebSocketRelayTransport:
             logger.debug("relay go_dormant: ws.close() raised or timed out", exc_info=True)
         return acked
 
+    async def ack_inbound(self, buffer_id: str) -> None:
+        """Public RelayTransport ACK seam for handler-owned passthrough settlement."""
+        await self._send_inbound_ack(buffer_id)
+
     async def _send_inbound_ack(self, buffer_id: str) -> None:
         """Ack durable receipt of a replayed buffered inbound; the connector only
         advances its buffer cursor after this (drain-without-dup)."""
