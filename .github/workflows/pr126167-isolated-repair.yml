@@ -11,27 +11,60 @@ permissions:
   contents: read
 
 jobs:
-  source-snapshot:
+  reproduce:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 25
+    env:
+      HERMES_TEST_WORKERS: '1'
+      HERMES_TEST_FILE_RETRIES: '0'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 5dd5193b32c4fc0dbc3aa595df6c51b6f4341840
+          fetch-depth: 0
           persist-credentials: false
-      - name: Export the exact reviewed source
+      - name: Verify unchanged reviewed product sources
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 5dd5193b32c4fc0dbc3aa595df6c51b6f4341840
-          mkdir -p "$RUNNER_TEMP/pr126167-source"
-          git archive --format=tar.gz -o "$RUNNER_TEMP/pr126167-source/source.tar.gz" HEAD
-          git ls-tree -r HEAD > "$RUNNER_TEMP/pr126167-source/blobs.txt"
-          git show -s --format=fuller HEAD > "$RUNNER_TEMP/pr126167-source/revision.txt"
-          sha256sum "$RUNNER_TEMP/pr126167-source/source.tar.gz" > "$RUNNER_TEMP/pr126167-source/source.sha256"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+          mkdir -p "$RUNNER_TEMP/pr126167-evidence"
+          git diff --exit-code 5dd5193b32c4fc0dbc3aa595df6c51b6f4341840 HEAD -- gateway tests scripts pm pyproject.toml uv.lock
+          git show -s --format=fuller HEAD > "$RUNNER_TEMP/pr126167-evidence/runner-revision.txt"
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
         with:
-          name: pr126167-reviewed-source
-          path: ${{ runner.temp }}/pr126167-source/
+          extras: '["messaging"]'
+          test-environment: 'true'
+          prune-python-cache: true
+      - name: Reproduce reported failures on the unmodified head
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .pr126167-repair/test_reported_blockers.py tests/gateway/test_review_blockers_probe.py
+          "$HERMES_PYTHON" --version | tee "$RUNNER_TEMP/pr126167-evidence/python.txt"
+          set +e
+          scripts/run_tests.sh tests/gateway/test_review_blockers_probe.py -q -s --junitxml="$RUNNER_TEMP/pr126167-evidence/red.xml" 2>&1 | tee "$RUNNER_TEMP/pr126167-evidence/red.log"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "$code" > "$RUNNER_TEMP/pr126167-evidence/red.exit"
+          test "$code" -ne 0
+          "$HERMES_PYTHON" - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = ET.parse(Path(os.environ['RUNNER_TEMP']) / 'pr126167-evidence/red.xml').getroot()
+          cases = root.findall('.//testcase')
+          failed = [c.attrib['name'] for c in cases if c.find('failure') is not None]
+          assert len(cases) == 4, [c.attrib for c in cases]
+          assert len(failed) == 2, failed
+          assert any('synthetic-head' in name for name in failed), failed
+          assert any('home-reconfigured' in name for name in failed), failed
+          assert not root.findall('.//error')
+          print('Expected two failures reproduced:', failed)
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: pr126167-red-evidence
+          path: ${{ runner.temp }}/pr126167-evidence/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
