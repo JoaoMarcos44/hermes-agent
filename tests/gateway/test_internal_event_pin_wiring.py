@@ -546,3 +546,15 @@ async def test_synthetic_turn_refreshes_home_config_without_losing_pinned_source
     assert "111111111111111111" not in synthetic_call["context_prompt"]
     assert "Guild / #general" in synthetic_call["context_prompt"]
     assert synthetic_call["context_prompt"] == next_human["context_prompt"]
+
+    # The synthetic refresh itself is durable: a crash before another authoritative turn must not
+    # resurrect the old home destination on the next continuation.
+    assert durable["value"]["context_prompt"] == synthetic_call["context_prompt"]
+    restarted = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+    restarted_calls: list[dict] = []
+    _capture(restarted, restarted_calls)
+    resumed = restarted._synthetic_prompt_event(source, "[heartbeat] continue after restart")
+    await restarted._handle_message_with_agent(resumed, resumed.source, KEY, 1)
+    assert "222222222222222222" in restarted_calls[0]["context_prompt"]
+    assert "111111111111111111" not in restarted_calls[0]["context_prompt"]
+    assert restarted_calls[0]["context_prompt"] == synthetic_call["context_prompt"]
