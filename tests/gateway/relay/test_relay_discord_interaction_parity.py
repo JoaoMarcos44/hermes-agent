@@ -109,7 +109,49 @@ async def test_message_interaction_message_keeps_prompt_and_session_identity(thr
 
 
 
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("modern", [False, True], ids=["legacy-action-row", "label-component"])
+async def test_modal_submission_retains_unicode_and_empty_values(modern):
+    adapter, _ = _adapter(platform="discord")
+    adapter.handle_message = AsyncMock()
+    if modern:
+        components = [
+            {"type": 18, "id": 1, "component": {
+                "type": 4, "id": 2, "custom_id": "answer", "value": "café 東京",
+            }},
+            {"type": 18, "id": 3, "component": {
+                "type": 4, "id": 4, "custom_id": "optional", "value": "",
+            }},
+        ]
+    else:
+        components = [{
+            "type": 1,
+            "components": [
+                {"type": 4, "custom_id": "answer", "value": "café 東京"},
+                {"type": 4, "custom_id": "optional", "value": ""},
+            ],
+        }]
+    forward = _forward(
+        type=5,
+        id=f"modal-{\'modern\' if modern else \'legacy\'}",
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"custom_id": "profile-form", "components": components},
+    )
+
+    await adapter._on_passthrough(forward)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "answer=café 東京\noptional="
+    assert event.metadata["discord_modal_fields"] == [
+        {"custom_id": "answer", "value": "café 東京"},
+        {"custom_id": "optional", "value": ""},
+    ]
+    assert event.raw_message["data"]["components"] == components
+    assert event.message_id.startswith("modal-")
+
+@pytest.mark.asyncio
+async def test_buffered_passthrough_replay_is_admitted_once_and_acked_each_time@pytest.mark.asyncio
 async def test_buffered_passthrough_replay_is_admitted_once_and_acked_each_time():
     adapter, stub = _adapter(platform="discord")
     adapter.handle_message = AsyncMock()

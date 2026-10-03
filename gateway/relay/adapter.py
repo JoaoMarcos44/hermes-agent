@@ -1437,6 +1437,11 @@ class RelayAdapter(BasePlatformAdapter):
                 message_type = MessageType.COMMAND
         elif itype == 3:
             text = str(data.get("custom_id") or "")
+        elif itype == 5:
+            modal_fields = self._discord_modal_fields(data.get("components"))
+            text = "\n".join(
+                f"{field[\'custom_id\']}={field[\'value\']}" for field in modal_fields
+            )
         else:
             text = ""
         member = payload.get("member") or {}
@@ -1496,18 +1501,22 @@ class RelayAdapter(BasePlatformAdapter):
             # connector resolved a specific profile for it.
             profile=getattr(forward, "profile", None),
         )
+        metadata = {"discord_interaction_id": interaction_id} if interaction_id else {}
+        if itype == 5:
+            # Preserve exact submitted identity/value pairs separately from the human-readable
+            # text rendering. Empty optional values are meaningful and must not disappear.
+            metadata["discord_modal_fields"] = modal_fields
         event = MessageEvent(
             text=text,
             message_type=message_type,
             source=source,
+            raw_message=payload if itype == 5 else None,
             # The attached bot message is a reply/prompt anchor, not the inbound action.
             # Every Discord interaction has its own platform identity; keep that on the
             # MessageEvent so owner, dedupe, transcript and delivery-ledger consumers do
             # not collapse two presses of the same component message into one turn.
             message_id=interaction_id,
-            metadata={
-                "discord_interaction_id": interaction_id
-            } if interaction_id else {},
+            metadata=metadata,
         )
         if itype == 3:
             # A component press whose custom_id is a Hermes prompt token
@@ -1525,6 +1534,35 @@ class RelayAdapter(BasePlatformAdapter):
                 event.text = f"/{option_id}"
                 event.message_type = MessageType.COMMAND
         return event
+
+    @staticmethod
+    def _discord_modal_fields(components) -> list[dict[str, str]]:
+        """Flatten supported Discord modal trees without losing empty values.
+
+        Legacy action rows nest under components; current Label (type 18) wraps one child
+        under component. Preserve each leaf custom_id and submitted value exactly as text.
+        """
+        fields: list[dict[str, str]] = []
+
+        def walk(node) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+                return
+            if not isinstance(node, dict):
+                return
+            custom_id = node.get("custom_id")
+            if custom_id is not None and "value" in node:
+                value = node.get("value")
+                fields.append({
+                    "custom_id": str(custom_id),
+                    "value": "" if value is None else str(value),
+                })
+            walk(node.get("components"))
+            walk(node.get("component"))
+
+        walk(components)
+        return fields
 
     @staticmethod
     def _decode_prompt_token(token: str):
