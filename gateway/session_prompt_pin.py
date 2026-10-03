@@ -14,10 +14,12 @@ PROMPT_PIN_VERSION = 1
 
 
 def sanitize_prompt_pin(pin: Any) -> Optional[Dict[str, Any]]:
-    """Validated durable snapshot of the exact ephemeral inputs reused by internal turns.
+    """Validate prompt bytes and the detached source used to render them.
 
-    ``redact_pii`` is the ``privacy.redact_pii`` the context bytes were rendered under; a pin
-    without it cannot prove which privacy policy produced them and is refused."""
+    Older version-1 snapshots lack source metadata. Their channel pin remains
+    usable, but the context owner must render current configuration instead of
+    trusting context bytes it cannot independently invalidate.
+    """
     if not isinstance(pin, dict) or pin.get("version") != PROMPT_PIN_VERSION:
         return None
     context_key = pin.get("context_key")
@@ -33,7 +35,7 @@ def sanitize_prompt_pin(pin: Any) -> Optional[Dict[str, Any]]:
         return None
     if parent_chat_id is not None and not isinstance(parent_chat_id, str):
         return None
-    return {
+    cleaned = {
         "version": PROMPT_PIN_VERSION,
         "context_key": context_key,
         "context_prompt": context_prompt,
@@ -41,6 +43,27 @@ def sanitize_prompt_pin(pin: Any) -> Optional[Dict[str, Any]]:
         "channel_prompt": channel_prompt,
         "parent_chat_id": parent_chat_id,
     }
+    if "context_source" in pin:
+        from gateway.session import SessionSource
+
+        source = pin["context_source"]
+        shared = pin.get("shared_multi_user_session")
+        if not isinstance(source, dict) or not isinstance(shared, bool):
+            return None
+        if not isinstance(source.get("platform"), str) or not isinstance(source.get("chat_id"), str):
+            return None
+        if "auto_thread_created" in source and not isinstance(source["auto_thread_created"], bool):
+            return None
+        try:
+            source = SessionSource.from_dict(source).to_dict()
+        except (KeyError, TypeError, ValueError):
+            return None
+        if any(value is not None and not isinstance(value, str)
+               for name, value in source.items() if name != "auto_thread_created"):
+            return None
+        cleaned["context_source"] = source
+        cleaned["shared_multi_user_session"] = shared
+    return cleaned
 
 
 class SessionPromptPinMixin:
@@ -78,4 +101,4 @@ class SessionPromptPinMixin:
                 return None
             if expected_session_id is not None and entry.session_id != expected_session_id:
                 return None
-            return dict(entry.prompt_pin) if entry.prompt_pin else None
+            return sanitize_prompt_pin(entry.prompt_pin)

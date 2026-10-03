@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 from contextlib import nullcontext, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -638,7 +639,13 @@ class GatewayAgentCacheMixin:
         if pin is None:
             return
         conversation = self._session_state(session_key).conversation
-        conversation.ephemeral_pin = (pin["context_key"], pin["context_prompt"], pin["redact_pii"])
+        # Legacy snapshots can preserve the channel, but cannot prove source/config
+        # independence. Warm their context once rather than replaying stale homes.
+        if "context_source" in pin:
+            conversation.ephemeral_pin = (
+                pin["context_key"], pin["context_prompt"], pin["redact_pii"],
+                pin["context_source"], pin["shared_multi_user_session"],
+            )
         conversation.channel_pin = (pin["channel_prompt"], pin["parent_chat_id"])
 
     async def _persist_prompt_pins(self, session_key: Optional[str], expected_session_id: Optional[str]) -> None:
@@ -654,6 +661,7 @@ class GatewayAgentCacheMixin:
             "version": PROMPT_PIN_VERSION, "context_key": ephemeral_pin[0],
             "context_prompt": ephemeral_pin[1], "redact_pii": ephemeral_pin[2],
             "channel_prompt": channel_pin[0], "parent_chat_id": channel_pin[1],
+            "context_source": ephemeral_pin[3], "shared_multi_user_session": ephemeral_pin[4],
         }
         try:
             await self.async_session_store.set_prompt_pin(
@@ -673,27 +681,30 @@ class GatewayAgentCacheMixin:
     def _pinned_session_context_prompt(
         self, context, redact_pii: bool, session_key: Optional[str], *, preserve_pin: bool = False,
     ) -> str:
-        """Session-context prompt pinned per session: key hit → pinned bytes reused VERBATIM (immune
-        to renderer nondeterminism); key miss → re-render and re-pin (rename, topic edit, /sethome).
+        """Preserve source identity, not stale configuration, across synthetic turns.
 
-        Pin-preserving events include internal wakes plus synthetic goal/heartbeat continuations
-        that intentionally carry no fresh prompt identity. Rendering either synthetic shape can
-        re-key the pin and make the next human turn re-key it back (A→B→A), so an established pin is
-        reused verbatim (and may be restored by ``_rehydrate_prompt_pins`` after a restart). With no
-        pin yet the prompt renders and pins as usual. The pin records the ``privacy.redact_pii``
-        setting it was rendered under; bytes from another privacy policy are never reused."""
+        The snapshot contains the display source and shared-session policy that
+        produced the pinned bytes. Only those inputs are reused: current homes,
+        connected platforms, tool capabilities and privacy still participate in
+        the normal change key. The detached display copy never changes routing
+        or authorization on the live event. Unchanged keys reuse exact bytes.
+        """
         _pin_state = self._peek_session_state(session_key) if session_key else None
         _eph_pin = _pin_state.conversation.ephemeral_pin if _pin_state else None
-        if _eph_pin is not None and _eph_pin[2] != redact_pii:
-            _eph_pin = None
         if preserve_pin and _eph_pin is not None:
-            return _eph_pin[1]
+            context = replace(
+                context, source=SessionSource.from_dict(_eph_pin[3]),
+                shared_multi_user_session=_eph_pin[4],
+            )
         _eph_key = self._ephemeral_change_key(context, redact_pii)
-        if _eph_pin is not None and _eph_pin[0] == _eph_key:
+        if _eph_pin is not None and _eph_pin[2] == redact_pii and _eph_pin[0] == _eph_key:
             return _eph_pin[1]
         text = build_session_context_prompt(context, redact_pii=redact_pii)
         if session_key:
-            self._session_state(session_key).conversation.ephemeral_pin = (_eph_key, text, redact_pii)
+            self._session_state(session_key).conversation.ephemeral_pin = (
+                _eph_key, text, redact_pii, context.source.to_dict(),
+                bool(context.shared_multi_user_session),
+            )
         return text
 
     def _pinned_channel_inputs(

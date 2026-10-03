@@ -4751,11 +4751,20 @@ class BasePlatformAdapter(ABC):
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
                 break
+        for state in self._text_debounce_store().values():
+            state.cancel_timer()
         with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
             from gateway.shutdown_flush import flush_pending_to_file
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
-        for state in self._text_debounce_store().values():
-            state.cancel_timer()
+        # An accepted debounce event may be incompatible with the pending head.
+        # Persist it independently: shutdown cannot depend on another arrival or
+        # free capacity in the live FIFO. Keep the two stores' failure scopes separate.
+        with contextlib.suppress(Exception):
+            from gateway.shutdown_flush import flush_pending_to_file
+            flush_pending_to_file(
+                {key: state.event for key, state in self._text_debounce_store().items()},
+                reason="adapter_shutdown_debounce",
+            )
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
                        self._pending_messages, self._active_sessions, self._requeue_counts,
                        self._text_debounce_store()):
