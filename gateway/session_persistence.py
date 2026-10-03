@@ -313,7 +313,10 @@ class SessionPersistenceMixin:
         if not updates:
             return False
 
-        setter = self._routing_db_method("set_meta")
+        setter = (
+            self._routing_db_method("set_observation_meta")
+            or self._routing_db_method("set_meta")
+        )
         if setter is None:
             # Publish only values that are known durable. Otherwise an identical later
             # observation would hit the cache and permanently suppress the persistence retry.
@@ -361,7 +364,10 @@ class SessionPersistenceMixin:
         if not updates:
             return False
 
-        setter = self._routing_db_method("set_meta")
+        setter = (
+            self._routing_db_method("set_observation_meta")
+            or self._routing_db_method("set_meta")
+        )
         if setter is None:
             return False
         changed = False

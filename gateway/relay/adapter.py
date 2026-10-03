@@ -999,6 +999,18 @@ class RelayAdapter(BasePlatformAdapter):
             self._discord_user_fallback[(scope, user_id)] = str(user_name)
             self._evict_oldest(self._discord_user_fallback, self._DISCORD_CONTEXT_MAX)
 
+    async def _offload_discord_context_io(self, func, *args):
+        """Run context storage on the gateway-owned executor when attached to a live runner.
+
+        The shutdown close gate quiesces that executor before SessionDB.close(). asyncio.to_thread
+        is retained only for isolated adapters/tests that have no runner lifecycle to coordinate.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        offload = getattr(runner, "_run_in_executor_with_context", None) if runner is not None else None
+        if callable(offload):
+            return await offload(func, *args)
+        return await asyncio.to_thread(func, *args)
+
     async def _remember_discord_context(self, source) -> None:
         """Publish normalized Discord context into the shared SessionStore off the event loop."""
         platform = getattr(source, "platform", None)
@@ -1024,7 +1036,7 @@ class RelayAdapter(BasePlatformAdapter):
         if expected and all(cached.get(key) == value for key, value in expected.items()):
             return
         try:
-            await asyncio.to_thread(observe, source)
+            await self._offload_discord_context_io(observe, source)
         except Exception:
             logger.debug("relay: failed to persist Discord interaction context", exc_info=True)
 
@@ -1049,7 +1061,7 @@ class RelayAdapter(BasePlatformAdapter):
         if not callable(loader):
             return self._cached_discord_context(scope, chat_id, user_id)
         try:
-            return dict(await asyncio.to_thread(loader, scope, chat_id, user_id) or {})
+            return dict(await self._offload_discord_context_io(loader, scope, chat_id, user_id) or {})
         except Exception:
             logger.debug("relay: persisted Discord interaction context unavailable", exc_info=True)
             return {}
@@ -1095,7 +1107,7 @@ class RelayAdapter(BasePlatformAdapter):
         if not user_is_authoritative and not parent:
             return
         try:
-            await asyncio.to_thread(
+            await self._offload_discord_context_io(
                 observe,
                 str(payload.get("guild_id") or ""),
                 str(payload.get("channel_id") or ""),

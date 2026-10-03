@@ -653,6 +653,73 @@ def test_unavailable_context_db_stays_retryable(tmp_path, monkeypatch):
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_context_writer_runs_in_gateway_owned_executor_and_is_visible_to_shutdown(tmp_path):
+    """A cancelled metadata await may outlive its coroutine, but not the gateway executor close gate."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _ = _adapter(platform="discord")
+    adapter.set_session_store(store)
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._executor_lock = threading.Lock()
+    runner._executor_closing = False
+    runner._executor = None
+    runner._housekeeping_executor = None
+    adapter.gateway_runner = runner
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original = store.observe_relay_discord_context
+
+    def held(source):
+        entered.set()
+        try:
+            assert release.wait(5)
+            return original(source)
+        finally:
+            finished.set()
+
+    store.observe_relay_discord_context = held
+    task = asyncio.create_task(adapter._remember_discord_context(_message().source))
+    assert await asyncio.to_thread(entered.wait, 3)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The coroutine is gone, but the lifecycle-owned worker is still visible to the exact
+    # quiesce primitive used before SessionDB.close().
+    assert gateway_run.GatewayRunner._shutdown_executor(runner, drain_timeout=0) == 1
+
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 3)
+    store.close_all_db_handles()
+
+
+def test_relay_context_uses_short_observation_write_budget(tmp_path):
+    """Discord label observations use the existing 0.5s activity/label patience, not generic 20s."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    db = store._routing_db
+    assert db is not None
+
+    observed = []
+    original = db._write_sql
+
+    def recording_write(sql, params=(), *, many=False, patience_s=None):
+        observed.append(patience_s)
+        return original(sql, params, many=many, patience_s=patience_s)
+
+    db._write_sql = recording_write
+    assert store.observe_relay_discord_context(_message().source) is True
+    assert observed
+    assert all(value == db._ACTIVITY_WRITE_PATIENCE_S for value in observed)
+    store.close_all_db_handles()
+
 @pytest.mark.asyncio
 async def test_cancelled_context_write_keeps_inbound_replay_retryable(tmp_path):
     """Cancellation before admission must not turn a durable relay frame into a seen replay."""
