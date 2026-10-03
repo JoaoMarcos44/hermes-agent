@@ -31,7 +31,6 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
-from agent.tool_result_classification import classify_no_effect_refusal
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
@@ -1105,12 +1104,10 @@ def _commit_tool_result(
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
-    # Execution truth belongs at the executor boundary, not in result prose. Persist
-    # a known-no-effect disposition before spill/wrapping so every later consumer sees
-    # the same fact, including sequential pre-tool blocks and producer-owned approvals.
-    if effect_disposition is None and (
-        blocked or classify_no_effect_refusal(function_name, function_result) is not None
-    ):
+    # Execution truth belongs at the executor boundary, not in result prose. Only the
+    # executor's own pre-dispatch block bit is authoritative here: result text may already
+    # have passed through transform_tool_result / guardrail presentation logic.
+    if effect_disposition is None and blocked:
         effect_disposition = "none"
 
     persisted_result = function_result

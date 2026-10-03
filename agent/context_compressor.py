@@ -1934,7 +1934,7 @@ def _refusal_target(args: dict) -> str:
     if not value:
         return ""
     value = value if len(value) <= 60 else value[:57] + "..."
-    return f" \x60{value}\x60"
+    return " `" + value + "`"
 
 
 def _summarize_no_effect_tool_result(
