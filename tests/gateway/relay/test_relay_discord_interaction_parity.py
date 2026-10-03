@@ -651,6 +651,86 @@ def test_unavailable_context_db_stays_retryable(tmp_path, monkeypatch):
     assert restored["user_name"] == source.user_name
 
 
+
+
+@pytest.mark.asyncio
+async def test_cancelled_context_write_keeps_inbound_replay_retryable(tmp_path):
+    """Cancellation before admission must not turn a durable relay frame into a seen replay."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _ = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original = store.observe_relay_discord_context
+
+    def held(source):
+        entered.set()
+        try:
+            assert release.wait(5)
+            return original(source)
+        finally:
+            finished.set()
+
+    store.observe_relay_discord_context = held
+    first = _message()
+    task = asyncio.create_task(adapter._on_inbound(first))
+    assert await asyncio.to_thread(entered.wait, 3)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert adapter.handle_message.await_count == 0
+
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 3)
+    await adapter._on_inbound(_message())
+
+    assert adapter.handle_message.await_count == 1
+    key = adapter._inbound_dedupe_key(_message())
+    assert key in adapter._seen_inbound
+    assert key not in adapter._inflight_inbound
+    store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_inbound_replays_share_one_admission_owner(tmp_path):
+    """Concurrent duplicates wait on pre-admission work and only one reaches handle_message."""
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter, _ = _adapter(platform="discord")
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+
+    entered = threading.Event()
+    release = threading.Event()
+    original = store.observe_relay_discord_context
+
+    def held(source):
+        entered.set()
+        assert release.wait(5)
+        return original(source)
+
+    store.observe_relay_discord_context = held
+    first = asyncio.create_task(adapter._on_inbound(_message()))
+    assert await asyncio.to_thread(entered.wait, 3)
+    duplicate = asyncio.create_task(adapter._on_inbound(_message()))
+    await asyncio.sleep(0)
+    assert not duplicate.done()
+
+    release.set()
+    await asyncio.gather(first, duplicate)
+    assert adapter.handle_message.await_count == 1
+
+    # A later replay is a normal seen hit and also stays suppressed.
+    await adapter._on_inbound(_message())
+    assert adapter.handle_message.await_count == 1
+    assert not adapter._inflight_inbound
+    store.close_all_db_handles()
+
 @pytest.mark.asyncio
 async def test_dm_interaction_uses_current_payload_identity(tmp_path):
     """A DM user object is current; cached text identity must not overwrite it."""
