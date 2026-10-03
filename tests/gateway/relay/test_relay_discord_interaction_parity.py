@@ -9,6 +9,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import ProcessingOutcome
 from gateway.relay.ws_transport import _event_from_wire
 from gateway.session import SessionStore, build_session_context, build_session_key
 from tests.gateway.relay.test_relay_interactive import _adapter
@@ -104,6 +105,131 @@ async def test_message_interaction_message_keeps_prompt_and_session_identity(thr
     )
     assert len(set(_prompt_sequence(message.source, slash.source, message.source))) == 1
 
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools_enabled", [False, True], ids=["tools-off", "tools-on"])
+async def test_model_reaching_slash_keeps_discord_prompt_presence_stable(monkeypatch, tools_enabled):
+    """A truthful slash-without-message anchor must not flip cached Discord system guidance."""
+    import gateway.session as gateway_session
+
+    adapter, _ = _adapter(platform="discord")
+    adapter.handle_message = AsyncMock()
+    message = _message()
+    await adapter._on_inbound(message)
+
+    member = {
+        "nick": "Ben D",
+        "user": {"id": "u1", "username": "ben", "global_name": "Ben D"},
+    }
+    slash = adapter._discord_interaction_to_event(_forward(
+        type=2,
+        id="slash-steer-1",
+        member=member,
+        data={"name": "steer", "options": [{"name": "text", "type": 3, "value": "inspect"}]},
+    ))
+    component = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="press-prompt-1",
+        message={"id": "bot-message-prompt-1"},
+        member=member,
+        data={"custom_id": "inspect"},
+    ))
+    assert slash is not None and component is not None
+    assert slash.source.message_id is None
+    assert component.source.message_id == "bot-message-prompt-1"
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    runner.adapters = {}
+    dispatched = await runner._hm_cmd_steer(
+        slash, slash.source, build_session_key(slash.source)
+    )
+    assert dispatched == (False, None)
+    assert slash.text == "inspect"
+
+    monkeypatch.setattr(gateway_session, "_discord_tools_loaded", lambda: tools_enabled)
+    prompts = _prompt_sequence(message.source, slash.source, component.source, message.source)
+    assert len(set(prompts)) == 1
+
+
+@pytest.mark.asyncio
+async def test_discord_interaction_processing_reactions_use_message_anchor():
+    """Processing reactions target the attached message, never the unique action id."""
+    adapter, stub = _adapter(platform="discord")
+    member = {"user": {"id": "u1", "username": "ben"}}
+
+    component = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="press-react-1",
+        message={"id": "bot-message-react-1"},
+        member=member,
+        data={"custom_id": "inspect"},
+    ))
+    assert component is not None
+    await adapter.on_processing_start(component)
+    await adapter.on_processing_complete(component, ProcessingOutcome.SUCCESS)
+    assert component.message_id == "press-react-1"
+    assert [
+        item.get("message_id") for item in stub.sent if item.get("op") == "react"
+    ] == ["bot-message-react-1"] * 3
+
+    stub.sent.clear()
+    slash = adapter._discord_interaction_to_event(_forward(
+        type=2,
+        id="slash-react-1",
+        member=member,
+        data={"name": "status"},
+    ))
+    assert slash is not None and slash.source.message_id is None
+    await adapter.on_processing_start(slash)
+    await adapter.on_processing_complete(slash, ProcessingOutcome.SUCCESS)
+    assert slash.message_id == "slash-react-1"
+    assert not [item for item in stub.sent if item.get("op") == "react"]
+
+
+@pytest.mark.asyncio
+async def test_interaction_triggering_note_round_trip_persists_authored_text(tmp_path, monkeypatch):
+    """Producer and inverse share the attached-message anchor; action id remains persistence identity."""
+    import gateway.session as gateway_session
+
+    monkeypatch.setattr(gateway_session, "_discord_tools_loaded", lambda: True)
+    adapter, _ = _adapter(platform="discord")
+    event = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="press-note-1",
+        message={"id": "bot-message-note-1"},
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"custom_id": "please summarize"},
+    ))
+    assert event is not None
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    runner.adapters = {}
+    runner._model = "test-model"
+    runner._base_url = ""
+
+    model_text = await runner._prepare_inbound_message_text(
+        event=event, source=event.source, history=[]
+    )
+    message_text, persisted, _ = runner._hmwa_apply_message_timestamp(event, model_text)
+    assert "Triggering message id: `bot-message-note-1`" in message_text
+    assert "press-note-1" not in message_text
+    assert persisted == "please summarize"
+
+    store = SessionStore(tmp_path, runner.config)
+    entry = store.get_or_create_session(event.source)
+    store.append_to_transcript(entry.session_id, {
+        "role": "user",
+        "content": persisted,
+        "platform_message_id": event.message_id,
+    })
+    row = store.load_transcript(entry.session_id)[0]
+    assert row["content"] == "please summarize"
+    assert row["platform_message_id"] == "press-note-1"
+    store.close_all_db_handles()
 
 @pytest.mark.asyncio
 async def test_channel_rename_survives_restart_with_latest_text_lane_labels(tmp_path):

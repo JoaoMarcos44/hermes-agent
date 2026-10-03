@@ -95,6 +95,24 @@ def _event_ids(event) -> Tuple[Optional[str], Optional[str]]:
     return message_id, getattr(event.source, "chat_id", None)
 
 
+def _processing_event_ids(event) -> Tuple[Optional[str], Optional[str]]:
+    """Reaction target for the processing lifecycle.
+
+    Forwarded Discord interactions deliberately keep the action id on event.message_id for
+    dedupe/persistence. Reactions can target only the attached Discord message, so use the
+    centralized reply anchor for that interaction shape. An unattached slash command therefore
+    has no reaction target.
+    """
+    source = getattr(event, "source", None)
+    raw_platform = getattr(source, "platform", None)
+    platform = getattr(raw_platform, "value", raw_platform)
+    metadata = getattr(event, "metadata", None)
+    if platform == Platform.DISCORD.value and isinstance(metadata, dict) and metadata.get("discord_interaction_id"):
+        from gateway.platforms.base import _reply_anchor_for_event
+        return _reply_anchor_for_event(event), getattr(source, "chat_id", None)
+    return _event_ids(event)
+
+
 def _profile_from_session_key(session_key: str) -> Optional[str]:
     """Named profile encoded in an ``agent:<ns>:...`` session key; None for the legacy ``agent:main``
     namespace (single-profile gateway) so the wire frame stays byte-identical there."""
@@ -2518,7 +2536,7 @@ class RelayAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event) -> None:
         """Add the in-progress reaction (op-gated; silent no-op otherwise)."""
-        message_id, chat_id = _event_ids(event)
+        message_id, chat_id = _processing_event_ids(event)
         if message_id and chat_id:
             eyes, _ok, _fail = self._ack_emoji(event, chat_id)
             await self._react(str(chat_id), str(message_id), eyes)
@@ -2526,7 +2544,7 @@ class RelayAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event, outcome) -> None:
         """Swap the in-progress reaction for the outcome one (op-gated; silent
         no-op otherwise)."""
-        message_id, chat_id = _event_ids(event)
+        message_id, chat_id = _processing_event_ids(event)
         if not (message_id and chat_id):
             return
         eyes, ok_emoji, fail_emoji = self._ack_emoji(event, chat_id)

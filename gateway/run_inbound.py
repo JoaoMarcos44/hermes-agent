@@ -98,7 +98,8 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     model instruction, not something the user wrote — persisted as ``content`` it renders
     verbatim in every transcript surface and pollutes FTS/memory (#71304, #114719). It
     keeps riding ``message_text`` (and the replay-only ``api_content`` sidecar)."""
-    message_id = getattr(event, "message_id", None)
+    from gateway.platforms.base import _reply_anchor_for_event
+    message_id = _reply_anchor_for_event(event)
     if not message_id or not isinstance(message_text, str):
         return message_text
     prefix = f"{discord_triggering_note(message_id)}\n\n"
