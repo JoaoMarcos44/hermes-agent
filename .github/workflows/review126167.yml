@@ -1,0 +1,61 @@
+name: PR 126167 isolated review validation
+on:
+  push:
+    branches: [work/126167-review-fixes]
+    paths:
+      - .github/workflows/review126167.yml
+      - .review126167/**
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.repository == 'JoaoMarcos44/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 2
+      - name: Record execution receipt on the auxiliary branch
+        run: |
+          git config user.name 'JoaoMarcos44'
+          git config user.email 'joaomarcosdias444@gmail.com'
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path('review126167-status.json').write_text(json.dumps({'run_id': os.environ['GITHUB_RUN_ID'], 'workflow_sha': os.environ['GITHUB_SHA'], 'status': 'running'}, indent=2) + '\n')
+          PY
+          git add review126167-status.json
+          git commit -m 'chore: record isolated review run'
+          git push origin HEAD:refs/heads/work/126167-review-fixes
+      - name: Prepare locked test runtime
+        if: hashFiles('.review126167/repair.py') != ''
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["messaging"]'
+          test-environment: 'true'
+      - name: Execute the bounded review repair
+        if: hashFiles('.review126167/repair.py') != ''
+        run: '"$HERMES_PYTHON" .review126167/repair.py'
+        env:
+          HERMES_TEST_WORKERS: '2'
+          HERMES_TEST_FILE_RETRIES: '0'
+          OPENAI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NOUS_API_KEY: ''
+      - name: Record final execution status
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path('review126167-status.json')
+          data = json.loads(path.read_text())
+          data['status'] = os.environ['JOB_STATUS']
+          path.write_text(json.dumps(data, indent=2) + '\n')
+          PY
+          git add review126167-status.json
+          git commit -m 'chore: record isolated review result'
+          git push origin HEAD:refs/heads/work/126167-review-fixes
