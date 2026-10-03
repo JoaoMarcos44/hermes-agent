@@ -1438,9 +1438,19 @@ class _CodexCompletionsAdapter:
         wire_model = _wire_model_identity(model)
         host = str(getattr(self._client, "base_url", "") or "")
         is_copilot = base_url_host_matches(host, "githubcopilot.com")
-        # Same route classifier as the main transport. Bind the issuer once and carry that
-        # exact identity through response normalization; the adapter is shared across aux calls.
-        route = classify_responses_route(SimpleNamespace(provider=None, base_url=host))
+        # The physical auxiliary route is already bound in a ContextVar by _prepare_aux_request.
+        # Use that provider as well as the host: XAI_BASE_URL / Codex relays can legitimately move
+        # a provider off its canonical hostname, and host-only classification loses provider-specific
+        # reasoning semantics. ContextVar ownership also keeps overlapping auxiliary calls isolated.
+        relay_context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+        route_provider = str(
+            relay_context.get("provider")
+            or getattr(self._client, "_hermes_aux_effective_provider", "")
+            or ""
+        ).strip().lower()
+        route = classify_responses_route(
+            SimpleNamespace(provider=route_provider or None, base_url=host)
+        )
         issuer_kind = _classify_responses_issuer(base_url=host, **route._asdict())
         is_xai = route.is_xai_responses
         is_github = route.is_github_responses
@@ -1467,7 +1477,7 @@ class _CodexCompletionsAdapter:
         # (``_wire_aliases``, popped in ``create()``), never on the instance — aux adapters are shared.
         wire_tools, wire_aliases = _alias_wire_tools(
             _responses_tools(tools),
-            {"provider": getattr(self._client, "_hermes_aux_effective_provider", "") or None, "base_url": host},
+            {"provider": route_provider or None, "base_url": host},
             is_xai,
         )
         renamed = {original: alias for alias, original in wire_aliases.items()}

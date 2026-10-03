@@ -4,7 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.auxiliary_client import _CodexCompletionsAdapter
+from agent.auxiliary_client import (
+    _CodexCompletionsAdapter,
+    _relay_aux_call_scope,
+    _set_relay_auxiliary_route,
+)
 
 
 def _message(text, *, phase="final_answer", status="completed"):
@@ -44,7 +48,7 @@ class _Events:
         pass
 
 
-def _run(base_url, final, *, streamed):
+def _run(base_url, final, *, streamed, provider=None):
     sent = {}
 
     class _Responses:
@@ -53,9 +57,13 @@ def _run(base_url, final, *, streamed):
             return _Events(final) if streamed else final
 
     client = SimpleNamespace(base_url=base_url, responses=_Responses())
-    response = _CodexCompletionsAdapter(client, "gpt-5.6-sol").create(
-        messages=[{"role": "user", "content": "Summarize."}],
-    )
+    adapter = _CodexCompletionsAdapter(client, "gpt-5.6-sol")
+    with _relay_aux_call_scope(("compression",), {}):
+        if provider:
+            _set_relay_auxiliary_route(provider, "gpt-5.6-sol", "codex_responses")
+        response = adapter.create(
+            messages=[{"role": "user", "content": "Summarize."}],
+        )
     assert "_response_issuer_kind" not in sent
     assert "_response_issuer_model" not in sent
     return response
@@ -63,35 +71,45 @@ def _run(base_url, final, *, streamed):
 
 @pytest.mark.parametrize("streamed", [False, True], ids=["object", "sse"])
 @pytest.mark.parametrize(
-    "base_url, final, expected_content, expected_finish, expected_tool",
+    "base_url, provider, final, expected_content, expected_finish, expected_tool",
     [
         pytest.param(
-            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex", None,
             _final(status="incomplete", output=[_message("PARTIAL")], reason="max_output_tokens"),
             "PARTIAL", "length", None, id="native-incomplete",
         ),
         pytest.param(
-            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex", None,
             _final(output=[_message("working", phase="commentary")]),
             None, "length", None, id="commentary-only",
         ),
         pytest.param(
-            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex", None,
             _final(output=[_reasoning("still thinking")]),
             None, "length", None, id="codex-reasoning-only",
         ),
         pytest.param(
-            "https://api.x.ai/v1",
+            "https://api.x.ai/v1", None,
             _final(output=[_reasoning("scratch\n<response>FINAL ANSWER</response>")]),
             "FINAL ANSWER", "stop", None, id="xai-reasoning-answer",
         ),
         pytest.param(
-            "https://chatgpt.com/backend-api/codex",
+            "https://relay.example/v1", "xai",
+            _final(output=[_reasoning("scratch\n<response>RELAY FINAL</response>")]),
+            "RELAY FINAL", "stop", None, id="xai-provider-on-custom-host",
+        ),
+        pytest.param(
+            "https://relay.example/v1", "openai-codex",
+            _final(output=[_reasoning("still thinking")]),
+            None, "length", None, id="codex-provider-on-custom-host",
+        ),
+        pytest.param(
+            "https://chatgpt.com/backend-api/codex", None,
             _final(output=[_message("DONE")]),
             "DONE", "stop", None, id="completed-final",
         ),
         pytest.param(
-            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex", None,
             _final(
                 status="incomplete", reason="max_output_tokens",
                 output=[SimpleNamespace(
@@ -102,7 +120,7 @@ def _run(base_url, final, *, streamed):
             None, "length", "inspect", id="partial-tool-call",
         ),
         pytest.param(
-            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex", None,
             _final(output=[SimpleNamespace(
                 type="function_call", status="completed", call_id="call_1",
                 name="inspect", arguments='{"path":"x"}',
@@ -110,21 +128,21 @@ def _run(base_url, final, *, streamed):
             None, "tool_calls", "inspect", id="completed-tool-call",
         ),
         pytest.param(
-            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex", None,
             _final(status="incomplete", reason="content_filter"),
             None, "content_filter", None, id="content-filter",
         ),
         pytest.param(
-            "https://chatgpt.com/backend-api/codex",
+            "https://chatgpt.com/backend-api/codex", None,
             _final(output_text="DELTA FINAL"),
             "DELTA FINAL", "stop", None, id="output-text-fallback",
         ),
     ],
 )
 def test_route_aware_auxiliary_completion_contract(
-    streamed, base_url, final, expected_content, expected_finish, expected_tool,
+    streamed, base_url, provider, final, expected_content, expected_finish, expected_tool,
 ):
-    response = _run(base_url, final, streamed=streamed)
+    response = _run(base_url, final, streamed=streamed, provider=provider)
     choice = response.choices[0]
 
     assert choice.message.content == expected_content
