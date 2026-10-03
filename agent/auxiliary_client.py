@@ -1128,38 +1128,6 @@ def _scoped_key_env(name: str) -> str:
         return (os.getenv(name) or "").strip()
 
 
-# Codex Responses → chat.completions adapter, so aux consumers need no changes.
-def _parse_codex_final_response(final: Any) -> Tuple[List[str], List[Any], Any]:
-    """Split a completed Responses object into (text_parts, tool_calls, usage) in chat.completions shape."""
-    text_parts: List[str] = []
-    tool_calls_raw: List[Any] = []
-    for item in (getattr(final, "output", None) or []):
-        item_type = _field(item, "type")
-        if item_type == "message":
-            for part in (_field(item, "content") or []):
-                part_type = _field(part, "type")
-                if part_type in {"output_text", "text"}:
-                    text_parts.append(_field(part, "text", ""))
-                elif part_type == "refusal":
-                    # A refusal part carries the model's explanation; dropping it turns a
-                    # refusal-only turn into an empty response that gets retried.
-                    text_parts.append(_field(part, "refusal", ""))
-        elif item_type == "function_call":
-            tool_calls_raw.append(SimpleNamespace(
-                id=_field(item, "call_id", ""), type="function",
-                function=SimpleNamespace(
-                    name=_field(item, "name", ""), arguments=_field(item, "arguments", "{}"))))
-    usage = None
-    resp_usage = getattr(final, "usage", None)
-    if resp_usage:
-        def _u(key: str) -> int:
-            return getattr(resp_usage, key, 0) or (resp_usage.get(key, 0) if isinstance(resp_usage, dict) else 0)
-        usage = SimpleNamespace(
-            prompt_tokens=_u("input_tokens"), completion_tokens=_u("output_tokens"),
-            total_tokens=_u("total_tokens"))
-    return text_parts, tool_calls_raw, usage
-
-
 def _close_quietly(target: Any, failure_note: Optional[str]) -> None:
     """Call ``target.close()`` if present; a failure is debug-logged under ``failure_note`` (silent when None)."""
     close = getattr(target, "close", None)
@@ -1413,21 +1381,18 @@ class _CodexCompletionsAdapter:
         # includes assistant tool_calls + role="tool" results). The shared converter encodes assistant tool
         # calls as `function_call` items and tool results as `function_call_output` items with a valid
         # call_id, so every Responses path normalizes tool history identically and cannot drift.
+        from agent.auxiliary_codex_response import resolve_auxiliary_codex_route
         from agent.codex_responses_adapter import (
             _chat_messages_to_responses_input,
-            _classify_responses_issuer,
             _responses_tools,
             _role_message_item,
-            _wire_model_identity,
-            classify_responses_route,
         )
         from agent.transports.codex import _alias_wire_tools
         model = kwargs.get("model", self._model)
-        wire_model = _wire_model_identity(model)
-        host = str(getattr(self._client, "base_url", "") or "")
+        route = resolve_auxiliary_codex_route(self._client, model)
+        wire_model = route.wire_model
+        host = route.host
         is_copilot = base_url_host_matches(host, "githubcopilot.com")
-        # Same route classifier as the main transport, so the issuer stamp matches what it minted.
-        route = classify_responses_route(SimpleNamespace(provider=None, base_url=host))
         is_xai = route.is_xai_responses
         is_github = route.is_github_responses
         tools = kwargs.get("tools")
@@ -1484,7 +1449,7 @@ class _CodexCompletionsAdapter:
         # Aux requests run their own model; stamp/filter reasoning provenance against it, not the main agent's.
         input_items = _chat_messages_to_responses_input(
             replay_messages, is_github_responses=is_copilot,
-            current_issuer_kind=_classify_responses_issuer(base_url=host, **route._asdict()),
+            current_issuer_kind=route.issuer_kind,
             current_issuer_model=wire_model, native_compaction_eligible=False,
         )
         resp_kwargs: Dict[str, Any] = {
@@ -1598,11 +1563,10 @@ class _CodexCompletionsAdapter:
                 guard.release_stream(event_stream)
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
-            text_parts, tool_calls_raw, usage = _parse_codex_final_response(final)
-            # Undo only the aliases THIS request emitted, before the call reaches Hermes dispatch.
-            for tc in tool_calls_raw or ():
-                if tc.function.name in wire_aliases:
-                    tc.function.name = wire_aliases[tc.function.name]
+            from agent.auxiliary_codex_response import project_auxiliary_codex_response
+            response = project_auxiliary_codex_response(
+                final, client=self._client, model=model, wire_aliases=wire_aliases,
+            )
         except Exception as exc:
             if guard.timed_out.is_set():
                 raise TimeoutError(guard.timeout_message()) from exc
@@ -1610,15 +1574,7 @@ class _CodexCompletionsAdapter:
             raise
         finally:
             guard.finish()
-        # Shape the result like chat.completions.
-        message = SimpleNamespace(
-            role="assistant", content="".join(text_parts).strip() or None,
-            tool_calls=tool_calls_raw or None,
-        )
-        choice = SimpleNamespace(
-            index=0, message=message, finish_reason="stop" if not tool_calls_raw else "tool_calls"
-        )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        return response
 
 
 class _ChatShim:
