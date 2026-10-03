@@ -457,6 +457,106 @@ class TestSlashCommandSessionIsolation:
         adapter._app.client.conversations_info.assert_not_awaited()
         adapter._app.client.users_info.assert_not_awaited()
 
+
+    @pytest.mark.asyncio
+    async def test_approve_dispatches_active_g_private_without_metadata_io(self, adapter):
+        """Approval controls recover a legacy G... private-channel class from the active key."""
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.platforms.event import MessageEvent, MessageType
+
+        adapter.set_authorization_check(
+            lambda user, chat_type, _chat: user == "U_GROUP" and chat_type == "group"
+        )
+        adapter._app.client.conversations_info = AsyncMock(
+            side_effect=AssertionError("/approve performed channel metadata I/O")
+        )
+        adapter._app.client.users_info = AsyncMock(
+            side_effect=AssertionError("/approve performed user metadata I/O")
+        )
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = BasePlatformAdapter.handle_message.__get__(
+            adapter, type(adapter)
+        )
+        adapter._dispatch_inline_reply = AsyncMock(return_value=None)
+
+        source = adapter.build_source(
+            chat_id="G_PRIVATE",
+            chat_type="group",
+            user_id="U_GROUP",
+            scope_id="T123",
+        )
+        seed = MessageEvent(text="working", message_type=MessageType.TEXT, source=source)
+        session_key = adapter._event_session_key(seed)
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter._handle_slash_command({
+            "command": "/approve",
+            "text": "session",
+            "user_id": "U_GROUP",
+            "channel_id": "G_PRIVATE",
+            "team_id": "T123",
+        })
+
+        adapter._dispatch_inline_reply.assert_awaited_once()
+        dispatched = adapter._dispatch_inline_reply.await_args.args[0]
+        assert dispatched.source.chat_type == "group"
+        adapter._app.client.conversations_info.assert_not_awaited()
+        adapter._app.client.users_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stop_uses_active_mpim_session_class_without_metadata_io(self, adapter):
+        """A G... MPIM /stop stays lookup-free while retaining DM authorization."""
+        from gateway.platforms.base import BasePlatformAdapter
+        from gateway.platforms.event import MessageEvent, MessageType
+
+        adapter.set_authorization_check(
+            lambda user, chat_type, _chat: user == "U_DM" and chat_type == "dm"
+        )
+        adapter._app.client.conversations_info = AsyncMock(
+            side_effect=AssertionError("/stop performed conversations.info")
+        )
+        adapter._app.client.users_info = AsyncMock(
+            side_effect=AssertionError("/stop performed users.info")
+        )
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = BasePlatformAdapter.handle_message.__get__(
+            adapter, type(adapter)
+        )
+        adapter._dispatch_inline_reply = AsyncMock(return_value=None)
+
+        source = adapter.build_source(
+            chat_id="G_DM",
+            chat_type="dm",
+            user_id="U_DM",
+            scope_id="T123",
+        )
+        seed = MessageEvent(text="working", message_type=MessageType.TEXT, source=source)
+        session_key = adapter._event_session_key(seed)
+        blocker = asyncio.Event()
+
+        async def running_work():
+            await blocker.wait()
+
+        task = asyncio.create_task(running_work())
+        await asyncio.sleep(0)
+        adapter._active_sessions[session_key] = asyncio.Event()
+        adapter._session_tasks[session_key] = task
+
+        await adapter._handle_slash_command({
+            "command": "/stop",
+            "text": "",
+            "user_id": "U_DM",
+            "channel_id": "G_DM",
+            "team_id": "T123",
+        })
+
+        assert task.done() and task.cancelled()
+        adapter._dispatch_inline_reply.assert_awaited_once()
+        dispatched = adapter._dispatch_inline_reply.await_args.args[0]
+        assert dispatched.source.chat_type == "dm"
+        adapter._app.client.conversations_info.assert_not_awaited()
+        adapter._app.client.users_info.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_native_slash_enforces_allowed_channels_before_enrichment(self, adapter):
         adapter.config.extra["allowed_channels"] = ["C_ALLOWED"]

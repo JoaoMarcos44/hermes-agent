@@ -3326,6 +3326,73 @@ class SlackAdapter(BasePlatformAdapter):
         self._trim_oldest_dict_entries(self._user_name_cache, self._USER_NAME_CACHE_MAX)
         return name
 
+    def _cached_conversation_classification(
+        self, channel_id: str, team_id: str = "",
+    ) -> Optional[Tuple[bool, bool]]:
+        """Lookup-free conversation class: direct prefixes or a prior successful G... resolution."""
+        channel_id = str(channel_id or "")
+        if channel_id.startswith("D"):
+            return True, True
+        if not channel_id.startswith("G"):
+            return False, False
+        team_id = str(team_id or getattr(self, "_channel_team", {}).get(channel_id, ""))
+        if not team_id:
+            return None
+        return self._lazy_attr("_conversation_kind_cache", dict).get((team_id, channel_id))
+
+    def _session_key_conversation_classification(
+        self, session_key: str, channel_id: str, team_id: str, user_id: str,
+        thread_id: str = "",
+    ) -> Optional[Tuple[bool, bool]]:
+        """Recover an ambiguous G... class from a trusted session key without Slack I/O.
+
+        Session keys encode chat_type. Approval buttons carry the exact key that created the
+        prompt, and active-session controls can compare against the adapter's live key. We
+        reconstruct both candidates instead of parsing the key so profile/scope/user/thread
+        policy stays owned by build_session_key.
+        """
+        cached = self._cached_conversation_classification(channel_id, team_id)
+        if cached is not None:
+            return cached
+        channel_id = str(channel_id or "")
+        if not channel_id.startswith("G") or not session_key:
+            return None
+
+        matches: List[Tuple[bool, bool]] = []
+        for chat_type, classification in (("dm", (True, False)), ("group", (False, False))):
+            try:
+                source = self.build_source(
+                    chat_id=channel_id,
+                    chat_type=chat_type,
+                    user_id=user_id,
+                    thread_id=thread_id or None,
+                    scope_id=team_id or None,
+                )
+                if self._source_session_key(source) == str(session_key):
+                    matches.append(classification)
+            except Exception:
+                logger.debug(
+                    "[Slack] Could not compare %s session-key classification for %s",
+                    chat_type, channel_id, exc_info=True,
+                )
+        return matches[0] if len(matches) == 1 else None
+
+    def _active_session_conversation_classification(
+        self, channel_id: str, team_id: str, user_id: str, thread_id: str = "",
+    ) -> Optional[Tuple[bool, bool]]:
+        """Resolve a control's G... class from the currently active session, without network I/O."""
+        cached = self._cached_conversation_classification(channel_id, team_id)
+        if cached is not None:
+            return cached
+        matches = {
+            classification
+            for session_key in tuple(getattr(self, "_active_sessions", {}))
+            if (classification := self._session_key_conversation_classification(
+                session_key, channel_id, team_id, user_id, thread_id
+            )) is not None
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
     async def _classify_conversation(
         self, channel_id: str, team_id: str = "",
     ) -> Optional[Tuple[bool, bool]]:
@@ -3333,15 +3400,14 @@ class SlackAdapter(BasePlatformAdapter):
 
         D... is unambiguously a 1:1 IM. G... is ambiguous (MPIM or legacy private channel), so
         resolve it with conversations.info and cache only a successful answer. Returning None
-        is deliberate fail-closed behavior: an unresolved G id must not silently select the
-        broader of the configured DM/channel authorization policies.
+        is deliberate fail-closed behavior for ordinary ingress; control paths first consult
+        trusted session state so a metadata outage cannot deadlock an active session.
         """
+        cached = self._cached_conversation_classification(channel_id, team_id)
+        if cached is not None:
+            return cached
         channel_id = str(channel_id or "")
-        if channel_id.startswith("D"):
-            return True, True
-        if not channel_id.startswith("G"):
-            return False, False
-        if not self._app:
+        if not channel_id.startswith("G") or not self._app:
             return None
 
         team_id = str(team_id or getattr(self, "_channel_team", {}).get(channel_id, ""))
@@ -3349,9 +3415,6 @@ class SlackAdapter(BasePlatformAdapter):
             return None
         cache_key = (team_id, channel_id)
         cache = self._lazy_attr("_conversation_kind_cache", dict)
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
 
         try:
             response = await self._get_client(
@@ -5591,12 +5654,16 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _authorize_interaction_user(
         self, kind: str, user_id: str, user_name: str, channel_id: str, team_id: str, *,
-        team_scoped: bool = True,
+        team_scoped: bool = True, session_key_hint: str = "", thread_id: str = "",
     ) -> bool:
         """Authorize a Block Kit caller under the same conversation policy as message ingress."""
         if self._is_ignored_channel(channel_id):
             return False
-        classification = await self._classify_conversation(channel_id, team_id)
+        classification = self._session_key_conversation_classification(
+            session_key_hint, channel_id, team_id, user_id, thread_id
+        ) if session_key_hint else None
+        if classification is None:
+            classification = await self._classify_conversation(channel_id, team_id)
         if classification is None:
             logger.warning(
                 "[Slack] Refusing %s interaction because conversation %s could not be classified",
@@ -5643,7 +5710,9 @@ class SlackAdapter(BasePlatformAdapter):
         action_id, value, message, msg_ts, channel_id, user_name, user_id = (
             self._interaction_fields(body, action))
         if not await self._authorize_interaction_user(
-            kind, user_id, user_name, channel_id, team_id, team_scoped=team_scoped
+            kind, user_id, user_name, channel_id, team_id, team_scoped=team_scoped,
+            session_key_hint=value if kind == "approval" else "",
+            thread_id=str(message.get("thread_ts") or ""),
         ):
             return None
         return team_id, action_id, value, message, msg_ts, channel_id, user_name, user_id
@@ -6163,15 +6232,30 @@ class SlackAdapter(BasePlatformAdapter):
             self._remember_channel_team(channel_id, team_id)
         text = self._slash_command_text(command)
         thread_id = self._slash_thread_id(command)
+        command_name = text[1:].split(None, 1)[0] if text.startswith("/") else None
+        from hermes_cli.commands import is_interrupt_then_dispatch, resolve_command
+        command_def = resolve_command(command_name) if command_name else None
+        urgent_control = bool(command_name and is_interrupt_then_dispatch(command_name))
+        lookup_free_control = urgent_control or bool(
+            command_def and command_def.name in {"approve", "deny"}
+        )
 
-        # Slash payloads omit channel_type. Apply conversation policy before cosmetic enrichment.
+        # Slash payloads omit channel_type. Ordinary ingress may resolve G... via Slack, but
+        # active-session escape hatches must not depend on metadata I/O: recover their exact
+        # class from the live session key (or an already successful cached resolution).
         if self._is_ignored_channel(channel_id):
             return
-        classification = await self._classify_conversation(channel_id, team_id)
+        classification = (
+            self._active_session_conversation_classification(
+                channel_id, team_id, user_id, thread_id
+            )
+            if lookup_free_control else await self._classify_conversation(channel_id, team_id)
+        )
         if classification is None:
             logger.warning(
-                "[Slack] Ignoring slash command because conversation %s could not be classified",
+                "[Slack] Ignoring slash command because conversation %s could not be classified%s",
                 channel_id,
+                " from trusted active/cached state" if lookup_free_control else "",
             )
             return
         is_dm, is_one_to_one_dm = classification
@@ -6191,10 +6275,7 @@ class SlackAdapter(BasePlatformAdapter):
         if denied and not is_dm:
             return
 
-        command_name = text[1:].split(None, 1)[0] if text.startswith("/") else None
-        from hermes_cli.commands import is_interrupt_then_dispatch
-        urgent_control = bool(command_name and is_interrupt_then_dispatch(command_name))
-        if denied or urgent_control:
+        if denied or lookup_free_control:
             channel_name, user_name, channel_prompt, auto_skill = (
                 self._cached_turn_prompt_inputs(channel_id, team_id, user_id)
             )
