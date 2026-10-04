@@ -431,6 +431,7 @@ async def test_non_internal_synthetic_event_preserves_all_prompt_pins(monkeypatc
     runner = _make_runner(monkeypatch, config)
     calls: list[dict] = []
     _capture(runner, calls)
+    _capture(runner, calls)
 
     source = _human_thread_source()
     await _drive(runner, ((False, source),), channel_prompt="Channel hint.")
@@ -498,7 +499,10 @@ async def test_synthetic_turn_refreshes_home_config_without_losing_pinned_source
         name="Old home",
     )
     config = GatewayConfig()
-    config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True, home_channel=old_home)
+    # Home channels are rendered only for enabled, configured platforms.
+    config.platforms[Platform.DISCORD] = PlatformConfig(
+        enabled=True, token="fixture-discord-token", home_channel=old_home,
+    )
     durable: dict = {}
     source = _human_source()
 
@@ -538,18 +542,17 @@ async def test_synthetic_turn_refreshes_home_config_without_losing_pinned_source
 
     synthetic = runner._synthetic_prompt_event(source, "[heartbeat] continue")
     await runner._handle_message_with_agent(synthetic, synthetic.source, KEY, 1)
-    await _drive(runner, ((False, source),), channel_prompt="Channel hint.")
 
-    synthetic_call, next_human = calls[-2], calls[-1]
+    synthetic_call = calls[-1]
     assert "222222222222222222" in synthetic_call["context_prompt"]
     assert "New home" in synthetic_call["context_prompt"]
     assert "111111111111111111" not in synthetic_call["context_prompt"]
     assert "Guild / #general" in synthetic_call["context_prompt"]
-    assert synthetic_call["context_prompt"] == next_human["context_prompt"]
 
-    # The synthetic refresh itself is durable: a crash before another authoritative turn must not
-    # resurrect the old home destination on the next continuation.
+    # Check the synthetic write and restart BEFORE a human turn can repair the snapshot.
     assert durable["value"]["context_prompt"] == synthetic_call["context_prompt"]
+    assert durable["value"]["channel_prompt"] == "Channel hint."
+    assert durable["value"]["source"]["message_id"] == source.message_id
     restarted = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
     restarted_calls: list[dict] = []
     _capture(restarted, restarted_calls)
@@ -558,3 +561,9 @@ async def test_synthetic_turn_refreshes_home_config_without_losing_pinned_source
     assert "222222222222222222" in restarted_calls[0]["context_prompt"]
     assert "111111111111111111" not in restarted_calls[0]["context_prompt"]
     assert restarted_calls[0]["context_prompt"] == synthetic_call["context_prompt"]
+    assert restarted_calls[0]["channel_prompt"] == synthetic_call["channel_prompt"]
+
+    await _drive(runner, ((False, source),), channel_prompt="Channel hint.")
+    next_human = calls[-1]
+    assert synthetic_call["context_prompt"] == next_human["context_prompt"]
+    assert synthetic_call["channel_prompt"] == next_human["channel_prompt"]
