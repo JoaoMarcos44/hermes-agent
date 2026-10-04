@@ -202,3 +202,69 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
+
+
+@pytest.mark.asyncio
+async def test_goal_continuation_stays_behind_older_debounced_human(hermes_home):
+    """A human accepted while the goal judge runs keeps priority over the synthetic continuation."""
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
+    )
+    runner._queued_events = {}
+    session_entry = SessionEntry(
+        session_key=key,
+        session_id=f"goal-order-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=src,
+        platform=Platform.SLACK,
+        chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = key
+
+    adapter = _DrainProbeAdapter()
+    adapter.gateway_runner = runner
+    runner.adapters = {Platform.SLACK: adapter}
+
+    human = MessageEvent(
+        text="older human direction",
+        message_type=MessageType.TEXT,
+        source=src,
+        message_id="human-1",
+    )
+    await adapter._queue_text_debounce(key, human)
+    assert adapter._text_debounce_store().get(key) is not None
+    assert key not in adapter._pending_messages
+
+    GoalManager(session_entry.session_id).set("ship it")
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "still needs work", False, None, False),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="partial progress",
+        )
+
+    assert adapter._text_debounce_store().get(key) is None
+    assert adapter._pending_messages[key] is human
+    overflow = runner._overflow_queue(key)
+    assert len(overflow) == 1
+    assert overflow[0].text == CONTINUATION_TEXT
+    assert overflow[0].preserve_prompt_pins is True
+

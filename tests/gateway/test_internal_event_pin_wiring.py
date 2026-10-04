@@ -19,6 +19,7 @@ from gateway.config import ChannelOverride, GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.run_turn_runner import TurnRunner
 from gateway.session import SessionEntry, SessionSource
+from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
 
 KEY = "agent:main:discord:group:1513247605675790346:117431298246705156"
@@ -81,7 +82,7 @@ def _make_runner(
     r._turn_leases = None
 
     store = MagicMock()
-    store.get_or_create_session.return_value = SessionEntry(
+    entry = SessionEntry(
         session_key=KEY,
         session_id="sess-wiring",
         created_at=datetime(2026, 1, 1),
@@ -89,6 +90,8 @@ def _make_runner(
         platform=Platform.DISCORD,
         chat_type="group",
     )
+    store.get_or_create_session.return_value = entry
+    store.lookup_by_session_key.return_value = entry
     store.load_transcript.return_value = []
     store.has_platform_message_id.return_value = False
     if durable_prompt_pin is not None:
@@ -283,8 +286,9 @@ async def test_eventless_followup_keeps_effective_prompt_through_next_human(
 
 
 @pytest.mark.asyncio
-async def test_event_backed_followup_overrides_inherited_channel_prompt(monkeypatch):
-    runner = _make_runner(monkeypatch)
+async def test_event_backed_followup_publishes_its_own_coherent_prompt_pair(monkeypatch):
+    durable: dict = {}
+    runner = _make_runner(monkeypatch, durable_prompt_pin=durable)
     calls: list[dict] = []
     _capture(runner, calls)
     runner._run_agent_deliver_first_response = AsyncMock()
@@ -292,19 +296,28 @@ async def test_event_backed_followup_overrides_inherited_channel_prompt(monkeypa
     runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="queued")
     runner._session_key_for_source = lambda source: KEY
 
-    source = _human_source()
+    original = _human_source()
+    runner.session_store.get_or_create_session.return_value.origin = original
+    runner.session_store.lookup_by_session_key.return_value.origin = original
+    await _drive(runner, ((False, original),), channel_prompt="Inherited prompt.")
+    first = calls[-1]
+    calls.clear()
+
+    updated = dataclasses.replace(
+        original, chat_name="Guild / #renamed", message_id="queued-message-1",
+    )
     adapter = MagicMock()
     adapter._active_sessions = {}
     pending_event = MessageEvent(
         text="queued",
-        source=source,
-        message_id="queued-message-1",
+        source=updated,
+        message_id=updated.message_id,
         channel_prompt="Queued event prompt.",
     )
     turn_ctx = TurnContext(
-        source=source,
-        context_prompt="ctx",
-        channel_prompt="Inherited prompt.",
+        source=original,
+        context_prompt=first["context_prompt"],
+        channel_prompt=first["channel_prompt"],
         session_key=KEY,
         session_id="sess-wiring",
         run_generation=1,
@@ -317,7 +330,174 @@ async def test_event_backed_followup_overrides_inherited_channel_prompt(monkeypa
     )
 
     assert len(calls) == 1
-    assert calls[0]["channel_prompt"] == "Queued event prompt.", "event prompt must win over the inherited one"
+    queued = calls[0]
+    assert queued["channel_prompt"] == "Queued event prompt."
+    assert "Guild / #renamed" in queued["context_prompt"]
+    assert "Guild / #general" not in queued["context_prompt"]
+    assert durable["value"]["context_prompt"] == queued["context_prompt"]
+    assert durable["value"]["channel_prompt"] == queued["channel_prompt"]
+    assert durable["value"]["source"]["chat_name"] == "Guild / #renamed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True], ids=("live", "after-restart"))
+async def test_cold_preserving_turn_publishes_complete_prompt_snapshot(monkeypatch, restart):
+    config = GatewayConfig()
+    config.platforms[Platform.DISCORD] = PlatformConfig(
+        enabled=True,
+        token="offline-fixture",
+        channel_overrides={PARENT_ID: ChannelOverride(system_prompt="Parent persona.")},
+    )
+    durable: dict = {}
+    source = _human_thread_source()
+    before = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+    before.session_store.get_or_create_session.return_value.origin = source
+    before.session_store.lookup_by_session_key.return_value.origin = source
+    first_calls: list[dict] = []
+    _capture(before, first_calls)
+
+    first_event = before._synthetic_prompt_event(source, "[heartbeat] first activity")
+    await before._handle_message_with_agent(first_event, first_event.source, KEY, 1)
+    first = first_calls[-1]
+    snapshot = durable.get("value")
+    assert isinstance(snapshot, dict)
+    assert snapshot["parent_chat_id"] == PARENT_ID
+    assert snapshot["channel_prompt"] == first["channel_prompt"]
+    assert snapshot["context_prompt"] == first["context_prompt"]
+    assert snapshot["source"]["chat_name"] == source.chat_name
+
+    runner = _make_runner(monkeypatch, config, durable_prompt_pin=durable) if restart else before
+    runner.session_store.get_or_create_session.return_value.origin = source
+    runner.session_store.lookup_by_session_key.return_value.origin = source
+    calls: list[dict] = []
+    _capture(runner, calls)
+    await _drive(runner, ((True, _wake_thread_source()),))
+
+    assert calls[-1]["context_prompt"] == first["context_prompt"]
+    assert calls[-1]["source"].parent_chat_id == PARENT_ID
+    assert durable["value"]["context_prompt"] == first["context_prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("human_cache_hit", [False, True], ids=("no-human", "human-hit"))
+async def test_source_less_legacy_pin_migrates_without_freezing_config(
+    monkeypatch, human_cache_hit,
+):
+    old_home = HomeChannel(
+        platform=Platform.DISCORD, chat_id="111111111111111111", name="Old home",
+    )
+    new_home = HomeChannel(
+        platform=Platform.DISCORD, chat_id="222222222222222222", name="New home",
+    )
+    config = GatewayConfig()
+    config.platforms[Platform.DISCORD] = PlatformConfig(
+        enabled=True, token="offline-fixture", home_channel=old_home,
+    )
+    durable: dict = {}
+    source = _human_source()
+
+    first = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+    first.session_store.get_or_create_session.return_value.origin = source
+    first.session_store.lookup_by_session_key.return_value.origin = source
+    seed_calls: list[dict] = []
+    _capture(first, seed_calls)
+    await _drive(first, ((False, source),), channel_prompt="Channel A")
+    durable["value"].pop("source", None)
+
+    after = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+    after.session_store.get_or_create_session.return_value.origin = source
+    after.session_store.lookup_by_session_key.return_value.origin = source
+    calls: list[dict] = []
+    _capture(after, calls)
+    if human_cache_hit:
+        await _drive(after, ((False, source),), channel_prompt="Channel A")
+        assert durable["value"]["source"]["chat_name"] == source.chat_name
+
+    config.platforms[Platform.DISCORD].home_channel = new_home
+    await _drive(after, ((True, _wake_source()),))
+    observed = calls[-1]["context_prompt"]
+
+    assert "222222222222222222" in observed
+    assert "111111111111111111" not in observed
+    assert durable["value"]["context_prompt"] == observed
+    assert durable["value"]["source"]["chat_name"] == source.chat_name
+
+
+@pytest.mark.asyncio
+async def test_agent_eviction_rehydrates_authoritative_source_before_synthetic_wake(monkeypatch):
+    config = GatewayConfig()
+    config.platforms[Platform.DISCORD] = PlatformConfig(
+        enabled=True,
+        token="offline-fixture",
+        home_channel=HomeChannel(
+            platform=Platform.DISCORD, chat_id="111111111111111111", name="Old home",
+        ),
+    )
+    durable: dict = {}
+    source = _human_source()
+    runner = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+    runner.session_store.get_or_create_session.return_value.origin = source
+    runner.session_store.lookup_by_session_key.return_value.origin = source
+    calls: list[dict] = []
+    _capture(runner, calls)
+    await _drive(runner, ((False, source),), channel_prompt="Channel A")
+
+    runner._evict_cached_agent(KEY)
+    state = runner._peek_session_state(KEY).conversation
+    assert state.ephemeral_pin is None
+    assert state.channel_pin is not None
+
+    config.platforms[Platform.DISCORD].home_channel = HomeChannel(
+        platform=Platform.DISCORD, chat_id="222222222222222222", name="New home",
+    )
+    await _drive(runner, ((True, _wake_source()),))
+    observed = calls[-1]["context_prompt"]
+
+    assert "222222222222222222" in observed
+    assert "111111111111111111" not in observed
+    assert durable["value"]["context_prompt"] == observed
+    assert durable["value"]["source"]["chat_name"] == source.chat_name
+
+
+@pytest.mark.asyncio
+async def test_failed_preparation_does_not_publish_half_prompt_snapshot(monkeypatch):
+    durable: dict = {}
+    runner = _make_runner(monkeypatch, durable_prompt_pin=durable)
+    calls: list[dict] = []
+    _capture(runner, calls)
+    original = _human_source()
+    runner.session_store.get_or_create_session.return_value.origin = original
+    runner.session_store.lookup_by_session_key.return_value.origin = original
+
+    await _drive(runner, ((False, original),), channel_prompt="Channel A")
+    before = dict(durable["value"])
+    assert len(calls) == 1
+
+    updated = dataclasses.replace(
+        original, chat_name="Guild / #renamed", message_id="failed-human",
+    )
+    runner.session_store.load_transcript.side_effect = TranscriptReadError(
+        "transient transcript read failure"
+    )
+    failed = MessageEvent(
+        text="hello",
+        source=updated,
+        message_id=updated.message_id,
+        channel_prompt="Channel B",
+    )
+    reply = await runner._handle_message_with_agent(failed, updated, KEY, 1)
+    assert isinstance(reply, str) and reply
+    assert len(calls) == 1
+    assert durable["value"] == before
+
+    runner.session_store.load_transcript.side_effect = None
+    runner.session_store.load_transcript.return_value = []
+    await _drive(runner, ((True, _wake_source()),))
+    wake = calls[-1]
+    assert wake["context_prompt"] == before["context_prompt"]
+    assert wake["channel_prompt"] == before["channel_prompt"]
+    assert durable["value"] == before
+
 
 @pytest.mark.asyncio
 async def test_first_internal_event_after_restart_rehydrates_durable_prompt_pins(monkeypatch):
