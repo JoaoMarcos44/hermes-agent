@@ -431,7 +431,6 @@ async def test_non_internal_synthetic_event_preserves_all_prompt_pins(monkeypatc
     runner = _make_runner(monkeypatch, config)
     calls: list[dict] = []
     _capture(runner, calls)
-    _capture(runner, calls)
 
     source = _human_thread_source()
     await _drive(runner, ((False, source),), channel_prompt="Channel hint.")
