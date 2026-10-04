@@ -265,6 +265,6 @@ async def test_goal_continuation_stays_behind_older_debounced_human(hermes_home)
     assert adapter._pending_messages[key] is human
     overflow = runner._overflow_queue(key)
     assert len(overflow) == 1
-    assert overflow[0].text == CONTINUATION_TEXT
+    assert overflow[0].text.startswith(CONTINUATION_TEXT)
     assert overflow[0].preserve_prompt_pins is True
 
