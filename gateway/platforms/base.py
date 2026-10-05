@@ -3821,6 +3821,8 @@ class BasePlatformAdapter(ABC):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                    # The receipt describes retained work, not an admission attempt.
+                    event._gateway_accepted = True
                 return
         now = time.monotonic()
         if state is None:
@@ -3837,6 +3839,8 @@ class BasePlatformAdapter(ABC):
             if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
                 state.event.reply_to_message_id = str(latest_anchor)
             state.last_ts = now
+        # Both a new buffer and an existing-buffer merge retain this event.
+        event._gateway_accepted = True
         state.cancel_timer()
         delay = self._text_debounce_delay(session_key)
         state.task = asyncio.create_task(self._flush_text_debounce(session_key, delay))

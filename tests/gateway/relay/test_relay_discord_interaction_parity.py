@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+from contextlib import contextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -37,7 +38,15 @@ def _forward(**payload):
 def _message(
     *, chat_name="Hermes / #ops", chat_topic="triage", thread=False,
     user_id="u1", user_name="ben", user_display_name="Ben D",
+    message_id="m1",
 ):
+    """One relayed text frame.
+
+    ``message_id`` is the ROOT wire identity, which is what ``MessageEvent.message_id`` and the
+    adapter's dedupe key read; the same value is mirrored onto ``source``. The stable default lets a
+    caller deliver the SAME frame twice to exercise replay dedupe; pass a distinct id for a
+    genuinely distinct observation, or every observation collapses onto one key.
+    """
     chat = (
         {"chat_id": "th1", "chat_type": "thread", "thread_id": "th1", "parent_chat_id": "ch1"}
         if thread else {"chat_id": "ch1", "chat_type": "group"}
@@ -45,6 +54,7 @@ def _message(
     return _event_from_wire({
         "text": "hello",
         "message_type": "text",
+        "message_id": message_id,
         "source": {
             "platform": "discord",
             **chat,
@@ -54,7 +64,7 @@ def _message(
             "user_display_name": user_display_name,
             "chat_name": chat_name,
             "chat_topic": chat_topic,
-            "message_id": "m1",
+            "message_id": message_id,
         },
     })
 
@@ -134,7 +144,7 @@ async def test_modal_submission_retains_unicode_and_empty_values(modern):
         }]
     forward = _forward(
         type=5,
-        id=f"modal-{\'modern\' if modern else \'legacy\'}",
+        id=f"modal-{'modern' if modern else 'legacy'}",
         member={"user": {"id": "u1", "username": "ben"}},
         data={"custom_id": "profile-form", "components": components},
     )
@@ -150,8 +160,8 @@ async def test_modal_submission_retains_unicode_and_empty_values(modern):
     assert event.raw_message["data"]["components"] == components
     assert event.message_id.startswith("modal-")
 
+
 @pytest.mark.asyncio
-async def test_buffered_passthrough_replay_is_admitted_once_and_acked_each_time@pytest.mark.asyncio
 async def test_buffered_passthrough_replay_is_admitted_once_and_acked_each_time():
     adapter, stub = _adapter(platform="discord")
     adapter.handle_message = AsyncMock()
@@ -201,9 +211,13 @@ async def test_buffered_passthrough_replay_finishes_ack_after_post_admission_fai
     adapter, stub = _adapter(platform="discord")
     calls = 0
 
-    async def failing(_event):
+    async def failing(event):
         nonlocal calls
         calls += 1
+        # The work really WAS retained before the failure, so mark the established admission
+        # receipt explicitly. Invocation is not admission: the relay publishes "seen" only for
+        # retained work, and a frame the gateway did keep must not be replayed.
+        event._gateway_accepted = True
         raise RuntimeError("after admission")
 
     adapter.handle_message = failing
@@ -219,8 +233,6 @@ async def test_buffered_passthrough_replay_finishes_ack_after_post_admission_fai
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tools_enabled", [False, True], ids=["tools-off", "tools-on"])
-async def test_model_reaching_slash_keeps_discord_prompt_presence_stable@pytest.mark.asyncio
 @pytest.mark.parametrize("tools_enabled", [False, True], ids=["tools-off", "tools-on"])
 async def test_model_reaching_slash_keeps_discord_prompt_presence_stable(monkeypatch, tools_enabled):
     """A truthful slash-without-message anchor must not flip cached Discord system guidance."""
@@ -340,7 +352,12 @@ async def test_interaction_triggering_note_round_trip_persists_authored_text(tmp
     })
     row = store.load_transcript(entry.session_id)[0]
     assert row["content"] == "please summarize"
-    assert row["platform_message_id"] == "press-note-1"
+    # load_transcript is the MODEL projection and deliberately omits platform_message_id, so the
+    # authored TEXT round trip is asserted above and the persisted platform identity is asserted at
+    # the store boundary that owns it (same check gateway/run_turn.py makes for its own dedupe).
+    assert "platform_message_id" not in row
+    assert store.has_platform_message_id(entry.session_id, event.message_id) is True
+    assert store.has_platform_message_id(entry.session_id, "bot-message-note-1") is False
     store.close_all_db_handles()
 
 @pytest.mark.asyncio
@@ -356,7 +373,9 @@ async def test_channel_rename_survives_restart_with_latest_text_lane_labels(tmp_
     adapter.handle_message = AsyncMock()
     await adapter._on_inbound(old)
 
-    renamed = _message(chat_name="Hermes / #ops", chat_topic="new topic")
+    renamed = _message(
+        chat_name="Hermes / #ops", chat_topic="new topic", message_id="m2",
+    )
     await adapter._on_inbound(renamed)
     store.close_all_db_handles()
 
@@ -395,8 +414,13 @@ async def test_latest_channel_labels_win_across_per_user_sessions_after_restart(
     """One user's rename observation must supersede another user's older session origin."""
     config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
     store = SessionStore(tmp_path, config)
-    alice = _message(chat_name="Hermes / #before", user_id="u1", user_display_name="Alice")
-    bob = _message(chat_name="Hermes / #before", user_id="u2", user_name="bob", user_display_name="Bob")
+    alice = _message(
+        chat_name="Hermes / #before", user_id="u1", user_display_name="Alice", message_id="m1",
+    )
+    bob = _message(
+        chat_name="Hermes / #before", user_id="u2", user_name="bob",
+        user_display_name="Bob", message_id="m2",
+    )
     store.get_or_create_session(alice.source)
     store.get_or_create_session(bob.source)
 
@@ -408,7 +432,7 @@ async def test_latest_channel_labels_win_across_per_user_sessions_after_restart(
 
     renamed = _message(
         chat_name="Hermes / #after", chat_topic="renamed",
-        user_id="u1", user_display_name="Alice",
+        user_id="u1", user_display_name="Alice", message_id="m3",
     )
     await adapter._on_inbound(renamed)
     store.close_all_db_handles()
@@ -449,13 +473,19 @@ async def test_peer_reset_cannot_outvote_newer_channel_observation(tmp_path):
     adapter.set_session_store(store)
     adapter.handle_message = AsyncMock()
 
-    alice = _message(chat_name="A", user_id="u1", user_display_name="Alice")
-    bob = _message(chat_name="A", user_id="u2", user_name="bob", user_display_name="Bob")
+    alice = _message(
+        chat_name="A", user_id="u1", user_display_name="Alice", message_id="m1",
+    )
+    bob = _message(
+        chat_name="A", user_id="u2", user_name="bob", user_display_name="Bob", message_id="m2",
+    )
     for event in (alice, bob):
         store.get_or_create_session(event.source)
         await adapter._on_inbound(event)
 
-    renamed = _message(chat_name="B", user_id="u1", user_display_name="Alice")
+    renamed = _message(
+        chat_name="B", user_id="u1", user_display_name="Alice", message_id="m3",
+    )
     await adapter._on_inbound(renamed)
     store.reset_session(build_session_key(bob.source))
     store.close_all_db_handles()
@@ -478,12 +508,18 @@ async def test_latest_equal_peer_value_survives_restart(tmp_path):
     adapter.set_session_store(store)
     adapter.handle_message = AsyncMock()
 
-    for uid in ("u1", "u2"):
-        event = _message(chat_name="A", user_id=uid, user_display_name=uid)
+    for index, uid in enumerate(("u1", "u2"), start=1):
+        event = _message(
+            chat_name="A", user_id=uid, user_display_name=uid, message_id=f"m{index}",
+        )
         store.get_or_create_session(event.source)
         await adapter._on_inbound(event)
-    await adapter._on_inbound(_message(chat_name="B", user_id="u1", user_display_name="u1"))
-    await adapter._on_inbound(_message(chat_name="A", user_id="u2", user_display_name="u2"))
+    await adapter._on_inbound(
+        _message(chat_name="B", user_id="u1", user_display_name="u1", message_id="m3"),
+    )
+    await adapter._on_inbound(
+        _message(chat_name="A", user_id="u2", user_display_name="u2", message_id="m4"),
+    )
     store.close_all_db_handles()
 
     restarted_store = SessionStore(tmp_path, config)
@@ -568,13 +604,13 @@ async def test_shared_store_invalidates_peer_adapter_context_cache(tmp_path):
     ))
     assert first.source.chat_name is None
 
-    await writer._on_inbound(_message(chat_name="A"))
+    await writer._on_inbound(_message(chat_name="A", message_id="m1"))
     second = await _passthrough_event(reader, _forward(
         member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
     ))
     assert second.source.chat_name == "A"
 
-    await writer._on_inbound(_message(chat_name="B"))
+    await writer._on_inbound(_message(chat_name="B", message_id="m2"))
     third = await _passthrough_event(reader, _forward(
         member={"user": {"id": "u1", "username": "ben", "global_name": "Ben D"}},
     ))
@@ -588,7 +624,7 @@ async def test_cold_context_read_runs_off_event_loop(tmp_path):
     seed, _ = _adapter(platform="discord")
     seed.set_session_store(store)
     seed.handle_message = AsyncMock()
-    await seed._on_inbound(_message(chat_name="A"))
+    await seed._on_inbound(_message(chat_name="A", message_id="m1"))
     store.close_all_db_handles()
 
     cold_store = SessionStore(tmp_path, config)
@@ -617,7 +653,7 @@ async def test_partial_thread_channel_recovers_known_parent(tmp_path):
     adapter, _ = _adapter(platform="discord")
     adapter.set_session_store(store)
     adapter.handle_message = AsyncMock()
-    message = _message(thread=True)
+    message = _message(thread=True, message_id="m2")
     await adapter._on_inbound(message)
 
     interaction = await _passthrough_event(adapter, _forward(
@@ -682,8 +718,8 @@ async def test_topic_removal_is_an_authoritative_observation(tmp_path):
     adapter.set_session_store(store)
     adapter.handle_message = AsyncMock()
 
-    await adapter._on_inbound(_message(chat_topic="old topic"))
-    await adapter._on_inbound(_message(chat_topic=None))
+    await adapter._on_inbound(_message(chat_topic="old topic", message_id="m1"))
+    await adapter._on_inbound(_message(chat_topic=None, message_id="m2"))
     store.close_all_db_handles()
 
     restarted_store = SessionStore(tmp_path, config)
@@ -732,7 +768,11 @@ def test_unavailable_context_db_stays_retryable(tmp_path, monkeypatch):
     blocked = {"set": True, "get": False}
 
     def routed_method(name):
-        if name == "set_meta" and blocked["set"]:
+        # Both write spellings the store prefers: the observation writer it actually reaches for
+        # first (set_observation_meta) AND the legacy fallback it ORs in. Blocking only set_meta
+        # left set_observation_meta live, so this "outage" never happened and the assertions below
+        # were asserting against a store that could still publish.
+        if name in ("set_observation_meta", "set_meta") and blocked["set"]:
             return None
         if name == "get_meta" and blocked["get"]:
             return None
@@ -1144,3 +1184,167 @@ def test_discord_interaction_busy_reply_uses_attached_message_anchor():
     assert gateway_run.GatewayRunner._busy_reply_to(
         slash, _reply_anchor_for_event(slash),
     ) is None
+
+
+# ── the REAL Discord capability gate, and the prompt-key contract that depends on it ──
+
+# A synthetic placeholder, never a credential: it exists only inside an isolated scratch home's
+# secret scope, so no real .env or user config is read or written.
+_SYNTHETIC_TOKEN = "synthetic-not-a-credential"
+
+_TOOLSETS_OFF = "platform_toolsets:\n  discord:\n    - messaging\n"
+_TOOLSETS_ON = "platform_toolsets:\n  discord:\n    - discord\n    - discord_admin\n"
+
+_POSITIVE_DISCORD_NOTE = "**Discord IDs (for the `discord`"
+_NEGATIVE_DISCORD_NOTE = "You do NOT have access to Discord-specific APIs"
+
+
+@contextmanager
+def _real_discord_gate(home, monkeypatch, *, tools_config: str, token: str | None):
+    """Install a real profile scope whose REAL ``_discord_tools_loaded`` gate resolves.
+
+    Nothing is stubbed: the gate reads the token through an installed profile secret scope and the
+    enabled toolsets through the real config loader over a real ``config.yaml`` in ``home``. The
+    scope is torn down on exit, so no test can leak one into another.
+    """
+    import gateway.session as gateway_session
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home.mkdir(parents=True, exist_ok=True)
+    # One home per state: the config loader caches per path, so a shared path would serve the
+    # first state and make the OFF half of these tests pass for the wrong reason.
+    (home / "config.yaml").write_text(tools_config, encoding="utf-8")
+
+    home_token = set_hermes_home_override(home)
+    scope_token = set_secret_scope(
+        {} if token is None else {"DISCORD_BOT_TOKEN": token}, profile_home=str(home),
+    )
+    # Never let an ambient real credential answer the gate.
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    try:
+        yield gateway_session
+    finally:
+        reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
+
+
+def _runner() -> gateway_run.GatewayRunner:
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    return runner
+
+
+@pytest.mark.parametrize(
+    "tools_config, token, expected_gate",
+    [
+        (_TOOLSETS_OFF, None, False),
+        (_TOOLSETS_OFF, _SYNTHETIC_TOKEN, False),
+        (_TOOLSETS_ON, None, False),
+        (_TOOLSETS_ON, _SYNTHETIC_TOKEN, True),
+    ],
+    ids=["neither", "token-only", "toolset-only", "both"],
+)
+def test_real_discord_tools_gate_is_a_conjunction(tmp_path, monkeypatch,
+                                                   tools_config, token, expected_gate):
+    """The REAL gate needs BOTH a scoped token and a resolved discord toolset.
+
+    ``_discord_tools_loaded`` is what decides whether the agent is told it can use the Discord
+    tools, so either half alone must not enable it. Driven through the real config loader and the
+    real profile secret scope, over a temp ``config.yaml`` only.
+    """
+    with _real_discord_gate(tmp_path, monkeypatch, tools_config=tools_config, token=token) as session:
+        context = build_session_context(_message().source, _runner().config)
+        assert session._discord_tools_loaded() is expected_gate
+        rendered = session.build_session_context_prompt(context, redact_pii=False)
+        assert (_POSITIVE_DISCORD_NOTE in rendered) is expected_gate
+        assert (_NEGATIVE_DISCORD_NOTE in rendered) is not expected_gate
+
+
+def test_real_discord_gate_flip_rekeys_the_cached_prompt(tmp_path, monkeypatch):
+    """A gate flip must re-key AND re-render: key<->render may not disagree.
+
+    The pin is cached for the life of a conversation, so a config or scope flip that changed the
+    rendered guidance without changing ``_ephemeral_change_key`` would serve a stale system prompt
+    for the rest of the session.
+    """
+    states = {}
+    for label, tools_config in (("off", _TOOLSETS_OFF), ("on", _TOOLSETS_ON)):
+        with _real_discord_gate(tmp_path / label, monkeypatch,
+                                 tools_config=tools_config, token=_SYNTHETIC_TOKEN) as session:
+            context = build_session_context(_message().source, _runner().config)
+            states[label] = (
+                session._discord_tools_loaded(),
+                _runner()._ephemeral_change_key(context, False),
+                session.build_session_context_prompt(context, redact_pii=False),
+            )
+    off_gate, off_key, off_prompt = states["off"]
+    on_gate, on_key, on_prompt = states["on"]
+    assert (off_gate, on_gate) == (False, True)
+    assert off_key != on_key
+    assert off_prompt != on_prompt
+    assert _POSITIVE_DISCORD_NOTE in on_prompt
+    assert _POSITIVE_DISCORD_NOTE not in off_prompt
+
+
+@pytest.mark.asyncio
+async def test_discord_identity_churn_keeps_prompt_bytes_and_key_stable(tmp_path, monkeypatch):
+    """A model-reaching /steer and a component press must not churn cached Discord guidance.
+
+    The slash carries no message anchor at all and the press carries the bot's own message id;
+    neither is rendered identity, so both the bytes and the pin key stay put — while a REAL
+    metadata change (here the channel name) must still invalidate the pin. The gate is the real one,
+    held ON for the whole comparison, so only identity churn is under test.
+    """
+    adapter, _ = _adapter(platform="discord")
+    adapter.handle_message = AsyncMock()
+    message = _message()
+    await adapter._on_inbound(message)
+
+    member = {"nick": "Ben D", "user": {"id": "u1", "username": "ben", "global_name": "Ben D"}}
+    slash = adapter._discord_interaction_to_event(_forward(
+        type=2,
+        id="slash-steer-1",
+        member=member,
+        data={"name": "steer", "options": [{"name": "text", "type": 3, "value": "inspect"}]},
+    ))
+    component = adapter._discord_interaction_to_event(_forward(
+        type=3,
+        id="press-prompt-1",
+        message={"id": "bot-message-prompt-1"},
+        member=member,
+        data={"custom_id": "inspect"},
+    ))
+    assert slash is not None and component is not None
+    assert slash.source.message_id is None
+    assert component.source.message_id == "bot-message-prompt-1"
+
+    runner = _runner()
+
+    dispatched = await runner._hm_cmd_steer(
+        slash, slash.source, build_session_key(slash.source),
+    )
+    assert dispatched == (False, None)
+    assert slash.text == "inspect"
+
+    def key_and_prompt(source):
+        context = build_session_context(source, runner.config)
+        return (
+            runner._ephemeral_change_key(context, False),
+            runner._pinned_session_context_prompt(context, False, "same-session"),
+        )
+
+    with _real_discord_gate(tmp_path, monkeypatch,
+                            tools_config=_TOOLSETS_ON, token=_SYNTHETIC_TOKEN):
+        base_key, base_prompt = key_and_prompt(message.source)
+        slash_key, slash_prompt = key_and_prompt(slash.source)
+        press_key, press_prompt = key_and_prompt(component.source)
+        renamed_key, renamed_prompt = key_and_prompt(_message(chat_name="Hermes / #renamed").source)
+
+    assert _POSITIVE_DISCORD_NOTE in base_prompt
+    assert slash_key == base_key and press_key == base_key
+    assert slash_prompt == base_prompt and press_prompt == base_prompt
+    # Control: a genuine metadata change must still invalidate the pin.
+    assert renamed_key != base_key
+    assert renamed_prompt != base_prompt
+    assert "Hermes / #renamed" in renamed_prompt

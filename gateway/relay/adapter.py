@@ -18,6 +18,7 @@ import re
 import secrets
 import time
 from collections import OrderedDict
+from functools import partial
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 from gateway.config import Platform, PlatformConfig
@@ -76,6 +77,15 @@ _SLASH_CONFIRM_LABELS = {"once": "✅ Approved once", "always": "🔒 Always app
 def _utf16_len(text: str) -> int:
     """Count UTF-16 code units (Telegram's length unit)."""
     return len(text.encode("utf-16-le")) // 2
+
+
+def _gateway_admitted(event) -> bool:
+    """Whether ``handle_message``'s admission receipt proves the work was kept.
+
+    Invocation is not admission: a handoff cancelled before that boundary retained nothing, and
+    publishing its dedupe key as "seen" would silently drop the connector's durable replay.
+    """
+    return bool(event is not None and getattr(event, "_gateway_accepted", False) is True)
 
 
 _LEN_FNS: Dict[str, Callable[[str], int]] = {"chars": len, "utf16": _utf16_len}
@@ -942,7 +952,7 @@ class RelayAdapter(BasePlatformAdapter):
         # Inbound replay dedupe is two-phase. The old code inserted into _seen_inbound before the
         # new off-loop Discord metadata await; cancellation there could ACK a later replay without
         # ever admitting the message. Keep concurrent duplicates serialized, but publish "seen"
-        # only once a prompt consumed the event or immediately before handle_message.
+        # only once a prompt consumed the event or once the normal handle_message return settles.
         dedupe_key = self._inbound_dedupe_key(event)
         should_process, claim = await self._claim_inbound_dedupe(dedupe_key)
         if not should_process:
@@ -958,16 +968,19 @@ class RelayAdapter(BasePlatformAdapter):
                 claim = None
                 return
             await self._localize_inbound_media(event)
-            # Admission ownership transfers here. If handle_message later fails or is cancelled,
-            # replay suppression matches the historical behavior: the event did reach admission.
+            # The claim is held ACROSS the handle_message await so a cancelled/raised handoff
+            # cannot publish "seen" on invocation alone. A normal return keeps the historical
+            # terminal-consumption contract (policy drops settled, nothing replayed).
+            await self.handle_message(event)
             self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
             claim = None
-            await self.handle_message(event)
         finally:
-            # Any exit before admission (including cancellation while asyncio.to_thread is still
-            # running) leaves the durable frame retryable and wakes one waiting duplicate.
+            # Any non-normal exit leaves the durable frame retryable UNLESS the base adapter
+            # proved it kept the work. Wakes one waiting duplicate either way.
             if claim is not None:
-                self._finish_inbound_dedupe(dedupe_key, claim, admitted=False)
+                self._finish_inbound_dedupe(
+                    dedupe_key, claim, admitted=_gateway_admitted(event),
+                )
 
     _SEEN_INBOUND_MAX = 512
     _DISCORD_CONTEXT_MAX = 2048
@@ -1004,6 +1017,9 @@ class RelayAdapter(BasePlatformAdapter):
 
         The shutdown close gate quiesces that executor before SessionDB.close(). asyncio.to_thread
         is retained only for isolated adapters/tests that have no runner lifecycle to coordinate.
+
+        The gateway executor forwards positional arguments. Bind target keyword arguments with
+        ``functools.partial`` before handing the callable over.
         """
         runner = getattr(self, "gateway_runner", None)
         offload = getattr(runner, "_run_in_executor_with_context", None) if runner is not None else None
@@ -1107,13 +1123,17 @@ class RelayAdapter(BasePlatformAdapter):
         if not user_is_authoritative and not parent:
             return
         try:
+            # Passing target keywords to the wrapper raises before storage runs. Bind them first
+            # so the same callable works with either executor.
             await self._offload_discord_context_io(
-                observe,
-                str(payload.get("guild_id") or ""),
-                str(payload.get("channel_id") or ""),
-                str(event.source.user_id or ""),
-                user_name=event.source.user_name if user_is_authoritative else None,
-                parent_chat_id=str(parent) if parent else None,
+                partial(
+                    observe,
+                    str(payload.get("guild_id") or ""),
+                    str(payload.get("channel_id") or ""),
+                    str(event.source.user_id or ""),
+                    user_name=event.source.user_name if user_is_authoritative else None,
+                    parent_chat_id=str(parent) if parent else None,
+                )
             )
         except Exception:
             logger.debug("relay: failed to persist Discord interaction identity", exc_info=True)
@@ -1355,6 +1375,7 @@ class RelayAdapter(BasePlatformAdapter):
         if not should_process:
             await self._ack_passthrough_buffer(buffer_id)
             return
+        handoff: Optional[MessageEvent] = None
         try:
             platform = getattr(forward, "platform", "") or ""
             if platform == "discord":
@@ -1382,9 +1403,10 @@ class RelayAdapter(BasePlatformAdapter):
                         claim = None
                         await self._ack_passthrough_buffer(buffer_id)
                         return
+                    handoff = event
+                    await self.handle_message(event)
                     self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
                     claim = None
-                    await self.handle_message(event)
                     await self._ack_passthrough_buffer(buffer_id)
                     return
             logger.info(
@@ -1400,7 +1422,9 @@ class RelayAdapter(BasePlatformAdapter):
             logger.warning("relay passthrough_forward handling failed", exc_info=True)
         finally:
             if claim is not None:
-                self._finish_inbound_dedupe(dedupe_key, claim, admitted=False)
+                self._finish_inbound_dedupe(
+                    dedupe_key, claim, admitted=_gateway_admitted(handoff),
+                )
 
     @staticmethod
     def _discord_interaction_payload(forward) -> Optional[Dict[str, Any]]:
@@ -1440,7 +1464,7 @@ class RelayAdapter(BasePlatformAdapter):
         elif itype == 5:
             modal_fields = self._discord_modal_fields(data.get("components"))
             text = "\n".join(
-                f"{field[\'custom_id\']}={field[\'value\']}" for field in modal_fields
+                f"{field['custom_id']}={field['value']}" for field in modal_fields
             )
         else:
             text = ""
