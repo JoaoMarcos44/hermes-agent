@@ -1139,7 +1139,8 @@ class RelayAdapter(BasePlatformAdapter):
         is_guild = bool(payload.get("guild_id"))
         user_is_authoritative = (not is_guild) or ("nick" in member)
         parent = channel.get("parent_id") if channel.get("type") in (10, 11, 12) else None
-        if not user_is_authoritative and not parent:
+        channel_name = str(channel["name"]).strip() if channel.get("name") else None
+        if not user_is_authoritative and not parent and not channel_name:
             return
         try:
             # Passing target keywords to the wrapper raises before storage runs. Bind them first
@@ -1152,6 +1153,7 @@ class RelayAdapter(BasePlatformAdapter):
                     str(event.source.user_id or ""),
                     user_name=event.source.user_name if user_is_authoritative else None,
                     parent_chat_id=str(parent) if parent else None,
+                    chat_name=channel_name,
                 )
             )
         except Exception:
@@ -1515,9 +1517,9 @@ class RelayAdapter(BasePlatformAdapter):
             context.get("user_name"),
             is_guild=bool(guild_id),
         )
-        chat_name = context.get("chat_name")
-        chat_topic = context.get("chat_topic")
         channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+        chat_name = (str(channel["name"]).strip() if channel.get("name") else None) or context.get("chat_name")
+        chat_topic = (str(channel["topic"]).strip() if channel.get("topic") else None) or context.get("chat_topic")
         is_thread = bool(guild_id) and channel.get("type") in (10, 11, 12)
         parent_chat_id = None
         if is_thread:

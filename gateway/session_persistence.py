@@ -380,6 +380,7 @@ class SessionPersistenceMixin:
     def observe_relay_discord_interaction_context(
         self, scope_id: str, chat_id: str, user_id: str, *,
         user_name: Optional[str] = None, parent_chat_id: Optional[str] = None,
+        chat_name: Optional[str] = None,
     ) -> bool:
         """Publish only context fields a raw Discord interaction proves.
 
@@ -389,8 +390,13 @@ class SessionPersistenceMixin:
         """
         scope_id, chat_id, user_id = str(scope_id or ""), str(chat_id or ""), str(user_id or "")
         updates: list[tuple[str, str, Dict[str, Optional[str]]]] = []
-        if chat_id and parent_chat_id:
-            updates.append(("chat", chat_id, {"parent_chat_id": str(parent_chat_id)}))
+        incoming_chat: Dict[str, Optional[str]] = {}
+        if parent_chat_id:
+            incoming_chat["parent_chat_id"] = str(parent_chat_id)
+        if chat_name:
+            incoming_chat["chat_name"] = str(chat_name)
+        if chat_id and incoming_chat:
+            updates.append(("chat", chat_id, incoming_chat))
         if user_id and user_name:
             updates.append(("user", user_id, {"user_name": str(user_name)}))
         if not updates:

@@ -648,6 +648,31 @@ async def test_shared_store_invalidates_peer_adapter_context_cache(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_interaction_payload_channel_name_sets_chat_name(tmp_path):
+    adapter, _ = _adapter(platform="discord")
+    config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    store = SessionStore(tmp_path, config)
+    adapter.set_session_store(store)
+    adapter.handle_message = AsyncMock()
+
+    forward = _forward(
+        id="slash-channel-1",
+        guild_id="g1",
+        channel_id="c100",
+        channel={"id": "c100", "name": "announcements", "type": 0},
+        member={"user": {"id": "u1", "username": "ben"}},
+    )
+    await adapter._on_passthrough(forward)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_name == "announcements"
+
+    cached = store.cached_relay_discord_context("g1", "c100", "u1")
+    assert cached["chat_name"] == "announcements"
+    store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 async def test_cold_context_read_runs_off_event_loop(tmp_path):
     config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
     store = SessionStore(tmp_path, config)
