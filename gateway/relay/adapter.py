@@ -1613,12 +1613,24 @@ class RelayAdapter(BasePlatformAdapter):
             if not isinstance(node, dict):
                 return
             custom_id = node.get("custom_id")
-            if custom_id is not None and "value" in node:
-                value = node.get("value")
-                fields.append({
-                    "custom_id": str(custom_id),
-                    "value": "" if value is None else str(value),
-                })
+            if custom_id is not None:
+                if "value" in node:
+                    value = node.get("value")
+                    fields.append({
+                        "custom_id": str(custom_id),
+                        "value": "" if value is None else str(value),
+                    })
+                elif "values" in node:
+                    raw_vals = node.get("values")
+                    val_str = (
+                        ",".join(str(v) for v in raw_vals if v is not None)
+                        if isinstance(raw_vals, list)
+                        else ("" if raw_vals is None else str(raw_vals))
+                    )
+                    fields.append({
+                        "custom_id": str(custom_id),
+                        "value": val_str,
+                    })
             walk(node.get("components"))
             walk(node.get("component"))
 

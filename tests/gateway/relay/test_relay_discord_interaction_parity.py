@@ -162,6 +162,36 @@ async def test_modal_submission_retains_unicode_and_empty_values(modern):
 
 
 @pytest.mark.asyncio
+async def test_modal_submission_retains_select_menu_values():
+    adapter, _ = _adapter(platform="discord")
+    adapter.handle_message = AsyncMock()
+    components = [
+        {
+            "type": 1,
+            "components": [
+                {"type": 4, "custom_id": "title", "value": "My Report"},
+                {"type": 3, "custom_id": "tags", "values": ["bug", "ui"]},
+            ],
+        }
+    ]
+    forward = _forward(
+        type=5,
+        id="modal-select-1",
+        member={"user": {"id": "u1", "username": "ben"}},
+        data={"custom_id": "report-form", "components": components},
+    )
+
+    await adapter._on_passthrough(forward)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "title=My Report\ntags=bug,ui"
+    assert event.metadata["discord_modal_fields"] == [
+        {"custom_id": "title", "value": "My Report"},
+        {"custom_id": "tags", "value": "bug,ui"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_buffered_passthrough_replay_is_admitted_once_and_acked_each_time():
     adapter, stub = _adapter(platform="discord")
     adapter.handle_message = AsyncMock()
