@@ -1800,6 +1800,21 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+def prompt_identity_conflict(existing: Any, event: MessageEvent) -> bool:
+    """True when *event* may NOT coalesce into *existing*: their prompt identities differ.
+
+    A non-internal synthetic carries the session's PINNED prompt identity, so absorbing a human
+    turn into it would run that turn under the synthetic's pins and ``message_id=None`` reply
+    anchor instead of recording its own (#126167). ``preserve_prompt_pins`` is read on its own,
+    never through ``event_preserves_prompt_pins``: ``internal`` must not change what a merge
+    refusal decides, because it alone gates authorization and the emergency stop.
+    """
+    if existing is None:
+        return False
+    return bool(getattr(existing, "preserve_prompt_pins", False)) != bool(
+        getattr(event, "preserve_prompt_pins", False))
+
+
 def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
                                 event: MessageEvent, *, merge_text: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
@@ -3824,8 +3839,8 @@ class BasePlatformAdapter(ABC):
         return result
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
-
+        """Return True when two text debounce events came from the same sender AND carry the same
+        prompt identity (see :func:`prompt_identity_conflict`)."""
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
             if source is None:
@@ -3838,7 +3853,10 @@ class BasePlatformAdapter(ABC):
                 return (platform, "dm", str(source.chat_id))
             return None
         existing_sender = _identity(existing)
-        return existing_sender is not None and existing_sender == _identity(event)
+        if existing_sender is None or existing_sender != _identity(event):
+            return False
+        return bool(getattr(existing, "preserve_prompt_pins", False)) == bool(
+            getattr(event, "preserve_prompt_pins", False))
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""
@@ -3848,6 +3866,26 @@ class BasePlatformAdapter(ABC):
         deadline = min(state.last_ts + self._busy_text_debounce_seconds,
                        state.first_ts + self._busy_text_hard_cap_seconds)
         return max(0.0, deadline - time.monotonic())
+
+    def _route_preserved_debounce_event(self, session_key: str, event: MessageEvent) -> bool:
+        """Hand a buffered turn whose PROMPT IDENTITY differs from the turn it would coalesce with
+        to the runner's bounded FIFO admission, so it runs as its own turn.
+
+        Returns True only when that admission ACCEPTED the event (it now owns a queued slot);
+        False means nothing was claimed, so the caller keeps its own buffer intact for a later
+        flush. Acceptance is read from the admission helper's return value, never from
+        ``_gateway_accepted``, which may be left over from an earlier merge onto a different
+        event. Without a runner FIFO the merge is refused outright: there is no admission owner.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        admit = getattr(runner, "_queue_or_replace_pending_event", None)
+        if not callable(admit):
+            logger.debug(
+                "[%s] Refusing to coalesce a differing-identity follow-up for session %s — "
+                "no runner FIFO to admit it", self.name, session_key,
+            )
+            return False
+        return bool(admit(session_key, event))
 
     async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
         """Buffer normal queue-mode busy text and schedule a bounded flush."""
@@ -3862,6 +3900,21 @@ class BasePlatformAdapter(ABC):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                elif prompt_identity_conflict(state.event, event):
+                    # Buffering onto, or dropping, a differing-identity turn would run this
+                    # human turn under the other turn's pinned prompt identity. Give it its own.
+                    if not self._route_preserved_debounce_event(session_key, event):
+                        # Refused admission (queue at cap, no runner FIFO). This is a FRESH
+                        # arrival that owns no slot yet, so the fresh-input cap may legitimately
+                        # leave it unaccepted; the buffered head keeps its place and is admitted
+                        # at the next flush. Say so at WARNING rather than dropping a human turn
+                        # on a debug line.
+                        logger.warning(
+                            "[%s] Dropped a differing-identity follow-up for session %s — "
+                            "admission refused (queue at cap or no runner FIFO); it was never "
+                            "queued, so nothing will retry it",
+                            self.name, session_key,
+                        )
                 return
         now = time.monotonic()
         if state is None:
@@ -3905,7 +3958,16 @@ class BasePlatformAdapter(ABC):
         state.task = None
         pending = self._pending_messages.get(session_key)
         if pending is not None and not self._can_merge_text_debounce_events(pending, state.event):
-            return False
+            if not prompt_identity_conflict(pending, state.event):
+                return False
+            # The occupant keeps the slot and holds a DIFFERENT prompt identity, so this
+            # buffered turn may not run under its pins. Admit it as its own turn; if that
+            # admission refuses (queue at cap, no runner FIFO) the buffer is RETAINED for a
+            # later flush — never dropped, never merged into the occupant.
+            if not self._route_preserved_debounce_event(session_key, state.event):
+                return False
+            store.pop(session_key, None)
+            return True
         store.pop(session_key, None)
         merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
         return True
@@ -3915,6 +3977,32 @@ class BasePlatformAdapter(ABC):
         state = self._text_debounce_store().pop(session_key, None)
         if state is not None:
             state.cancel_timer()
+
+    def _spool_on_shutdown(self, kind: str, turns: Dict[str, Any]) -> int:
+        """Spool *turns* to the existing shutdown spool on the way out; return turns written.
+
+        A spool failure must not abort teardown (the remaining buckets still have to be cleared),
+        but a silent drop is indistinguishable from success, so it is reported at WARNING. Only
+        the exception CLASS is logged: the message can carry a filesystem path or event text. A
+        short write is reported the same way, because ``flush_pending_to_file`` degrades a
+        per-value serialisation error to a skip and a turn with no durable copy is lost.
+        """
+        if not turns:
+            return 0
+        from gateway.shutdown_flush import flush_pending_to_file
+        expected = sum(1 for value in turns.values() if value is not None)
+        try:
+            written = flush_pending_to_file(turns, reason="adapter_shutdown")
+        except Exception as exc:
+            logger.warning(
+                "[%s] Shutdown spool of %d %s turn(s) failed (%s) — those turns are lost; "
+                "memory was their only copy", self.name, expected, kind, type(exc).__name__)
+            return 0
+        if written < expected:
+            logger.warning(
+                "[%s] Shutdown spool wrote %d of %d %s turn(s) — the rest are lost; memory was "
+                "their only copy", self.name, written, expected, kind)
+        return written
 
     # ── Session task + guard ownership helpers: paired with the _session_tasks owner map so
     # reconciliation is deterministic across completion, /stop /new /reset, and stale-lock heal.
@@ -4173,8 +4261,8 @@ class BasePlatformAdapter(ABC):
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event)
-            event._gateway_accepted = True
+            if not self._merge_or_refuse_fallback_pending(session_key, event, merge_text=False):
+                self._report_refused_fallback_pending(session_key, event)
             return
         if self._is_queue_text_debounce_candidate(event):
             logger.debug("[%s] New text message while session %s is active — "
@@ -4184,9 +4272,46 @@ class BasePlatformAdapter(ABC):
         else:
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event,
-                                        merge_text=event.message_type == MessageType.TEXT)
-            event._gateway_accepted = True
+            if not self._merge_or_refuse_fallback_pending(
+                    session_key, event, merge_text=event.message_type == MessageType.TEXT):
+                self._report_refused_fallback_pending(session_key, event)
+
+    def _report_refused_fallback_pending(self, session_key: str, event: MessageEvent) -> None:
+        """Breadcrumb for a follow-up refused at the adapter fallback merge.
+
+        With no runner FIFO there is no admission owner, so a differing-identity turn is
+        left unaccepted and nothing retries it. This is the same at-cap drop policy the busy
+        queue already applies to a fresh arrival, so log it at the same level rather than
+        letting a human turn disappear on a debug line.
+        """
+        logger.warning(
+            "[%s] Dropped a differing-identity follow-up for session %s — it cannot join the "
+            "pending turn's pinned prompt identity and no runner FIFO will admit it separately",
+            self.name, session_key,
+        )
+
+    def _merge_or_refuse_fallback_pending(self, session_key: str, event: MessageEvent, *,
+                                          merge_text: bool) -> bool:
+        """Adapter-only (no runner FIFO) merge into the pending slot, REFUSING a merge across
+        differing prompt identities.
+
+        This path bypasses ``_can_merge_text_debounce_events``, so without the explicit refusal a
+        same-sender human turn would be silently coalesced into a ``preserve_prompt_pins`` synthetic
+        head and run under its pins. With no runner FIFO there is no admission owner and no caller
+        retries: a refusal is a drop, reported by the caller's warning. Returns True when the event
+        was merged into the slot, False when it was refused.
+        """
+        existing = self._pending_messages.get(session_key)
+        if existing is not None and prompt_identity_conflict(existing, event):
+            logger.debug(
+                "[%s] Refusing to coalesce a differing-identity follow-up into the pending slot for "
+                "session %s — no runner FIFO to admit it as its own turn",
+                self.name, session_key,
+            )
+            return False
+        merge_pending_message_event(self._pending_messages, session_key, event, merge_text=merge_text)
+        event._gateway_accepted = True
+        return True
 
     def _get_human_delay(self) -> float:
         """Random human-like pacing delay (s) from this adapter's ``human_delay`` config range
@@ -4793,11 +4918,19 @@ class BasePlatformAdapter(ABC):
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
                 break
-        with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+        # Freeze the debounce timers FIRST: a buffered turn and the pending slot must not migrate
+        # into each other across the awaits below, or one turn can be spooled twice (pending +
+        # debounce) or lost between the two spools. A refused merge leaves its turn buffered here
+        # rather than dropping it, so this buffer is accepted work and is spooled in the pending
+        # payload shape ``recover_pending_to_db`` already replays.
         for state in self._text_debounce_store().values():
             state.cancel_timer()
+        buffered = {session_key: state.event for session_key, state in self._text_debounce_store().items()
+                    if state is not None and state.event is not None}
+        # Bounded cleanup: a spool failure is reported, never raised, so the buckets below are
+        # still cleared instead of stranding every turn in memory for the life of the process.
+        self._spool_on_shutdown("pending", dict(self._pending_messages))
+        self._spool_on_shutdown("debounced", buffered)
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
                        self._pending_messages, self._active_sessions, self._requeue_counts,
                        self._text_debounce_store()):

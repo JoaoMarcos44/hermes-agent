@@ -581,12 +581,29 @@ class GatewayInboundMixin:
 
     def _hm_merge_pending_for_source(
         self, source: SessionSource, _quick_key: str, event: "MessageEvent", *, merge_text: bool = False
-    ) -> None:
-        """Merge *event* into the source adapter's pending slot (no-op without an adapter)."""
-        from gateway.platforms.base import merge_pending_message_event
+    ) -> bool:
+        """Merge *event* into the source adapter's pending slot, refusing a merge across differing
+        prompt identities (no-op without an adapter). Returns True when the event was merged or
+        admitted as its own turn, False when neither owner claimed it.
+
+        The refusal re-routes through the bounded FIFO admission, so the turn still gets its own
+        turn. When that admission also refuses, the event is left unaccepted: the caller reports
+        it, because ``handled=True`` suppresses the fallback and nothing re-submits it.
+        """
+        from gateway.platforms.base import merge_pending_message_event, prompt_identity_conflict
         adapter = self._delivery_adapter_for(source)
-        if adapter:
-            merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+        if not adapter:
+            return False
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        existing = pending_slot.get(_quick_key) if isinstance(pending_slot, dict) else None
+        if prompt_identity_conflict(existing, event):
+            logger.debug(
+                "Refusing to coalesce a differing-identity follow-up into the pending slot for "
+                "session %s — admitting it as its own turn", _quick_key,
+            )
+            return self._queue_or_replace_pending_event(_quick_key, event)
+        merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+        return True
 
     async def _hm_busy_slash_or_photo(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -616,7 +633,12 @@ class GatewayInboundMixin:
         # photo-only follow-up; adapter-level batching absorbs them.
         if event.message_type == MessageType.PHOTO:
             logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-            self._hm_merge_pending_for_source(source, _quick_key, event)
+            if not self._hm_merge_pending_for_source(source, _quick_key, event):
+                logger.warning(
+                    "Dropped a differing-identity photo follow-up for session %s — admission "
+                    "refused (queue at cap or no delivery adapter); it was never queued",
+                    _quick_key,
+                )
             return True, None
         return False, None
 
@@ -637,7 +659,12 @@ class GatewayInboundMixin:
             time.time() - _started_at, _quick_key,
         )
         if effective_busy_input_mode != "queue":
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)
+            if not self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True):
+                logger.warning(
+                    "Dropped a differing-identity Telegram grace follow-up for session %s — "
+                    "admission refused (queue at cap or no delivery adapter); it was never queued",
+                    _quick_key,
+                )
         else:
             adapter = self._delivery_adapter_for(source)
             if adapter:
@@ -710,7 +737,12 @@ class GatewayInboundMixin:
                 self._release_running_agent_state(_quick_key)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
+            if not self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True):
+                logger.warning(
+                    "Dropped a differing-identity follow-up for session %s — admission refused "
+                    "(queue at cap or no delivery adapter); it was never queued",
+                    _quick_key,
+                )  # picked up after start
             return None
         if self._draining:
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
