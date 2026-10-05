@@ -1559,6 +1559,7 @@ class RelayAdapter(BasePlatformAdapter):
             # MessageEvent so owner, dedupe, transcript and delivery-ledger consumers do
             # not collapse two presses of the same component message into one turn.
             message_id=interaction_id,
+            reply_to_message_id=actual_message_id,
             metadata=metadata,
         )
         if itype == 3:

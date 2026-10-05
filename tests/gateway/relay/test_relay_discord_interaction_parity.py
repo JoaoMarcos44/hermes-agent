@@ -1008,6 +1008,7 @@ async def test_two_component_presses_keep_distinct_durable_turn_identity(tmp_pat
     ))
     assert first is not None and second is not None
     assert first.source.message_id == second.source.message_id == "bot-message-77"
+    assert first.reply_to_message_id == second.reply_to_message_id == "bot-message-77"
     assert first.message_id == "press-1"
     assert second.message_id == "press-2"
 
