@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from agent.interrupt_compat import _accepts_keyword
 from gateway.config import Platform
+from gateway.platforms.inbound_receipt import discard_inbound
 from gateway.session import SessionSource, build_session_context_prompt
 from gateway.session_prompt_pin import PROMPT_PIN_VERSION, sanitize_prompt_pin
 from gateway.run_shutdown import _log_suppressed
@@ -367,6 +368,8 @@ class GatewayAgentCacheMixin:
             return
         state = self._peek_session_state(session_key)
         if state is not None:
+            for queued_event in state.conversation.queued_events:
+                discard_inbound(queued_event)
             state.conversation.clear()
         # Legacy plain-dict stores still in _CONVERSATION_SCOPED_STATE (not yet folded into
         # SessionState), e.g. _pending_model_notes. SessionState-backed names resolve to MutableMapping
@@ -536,6 +539,8 @@ class GatewayAgentCacheMixin:
             # (_resolve_async_delegation_session fails closed), not here.
             parked = adapter.get_pending_message(session_key)
             wake = parked if getattr(parked, "internal", False) else None
+            if parked is not None and wake is None:
+                discard_inbound(parked)
             if wake is None:
                 overflow = self._overflow_queue(session_key) or []
                 wake = next((e for e in overflow if getattr(e, "internal", False)), None)

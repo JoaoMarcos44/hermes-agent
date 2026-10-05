@@ -35,6 +35,9 @@ from gateway.relay.egress import (
     log_decline,
 )
 from gateway.relay.media import RelayMediaClient
+from gateway.relay.inbound_delivery import RelayInboundDeliveryMixin
+from gateway.relay.durable_input import RelayDurableInputMixin
+from gateway.platforms.inbound_receipt import discard_inbound
 from gateway.relay.transport import RelayTransport
 from gateway.session import SessionSource
 
@@ -134,7 +137,7 @@ def _profile_from_session_key(session_key: str) -> Optional[str]:
     return None if profile == "default" else profile
 
 
-class RelayAdapter(BasePlatformAdapter):
+class RelayAdapter(RelayDurableInputMixin, RelayInboundDeliveryMixin, BasePlatformAdapter):
     """Generic relay adapter advertising a connector-negotiated capability profile."""
 
     def __init__(
@@ -175,7 +178,7 @@ class RelayAdapter(BasePlatformAdapter):
         # chat_id -> event fired when the entry above lands (wait_for_auto_thread_info).
         self._auto_thread_waiters: Dict[str, asyncio.Event] = {}
         # Bounded FIFO seen-set for inbound replay dedupe (insertion-ordered dict).
-        self._seen_inbound: Dict[str, None] = {}
+        self._seen_inbound: Dict[str, float] = {}
         # key -> admission future while pre-admission work is in flight. A duplicate waits for the
         # owner; if that owner is cancelled before admission, the waiter can retry instead of
         # treating unfinished metadata work as proof that the message was handled.
@@ -859,6 +862,7 @@ class RelayAdapter(BasePlatformAdapter):
             logger.warning("relay handshake failed: %s", exc)
             return False
         self._apply_descriptor(descriptor)
+        await self._start_delivery_recovery()
         # Only the production WebSocket transport exposes `auth_revoked`.
         if hasattr(self._transport, "auth_revoked"):
             self._start_revocation_monitor()
@@ -904,102 +908,6 @@ class RelayAdapter(BasePlatformAdapter):
         # Cron in_channel continuable surface (D6 gate in cron/scheduler.py);
         # class default is False, so only an explicit descriptor bit turns it on.
         self.supports_inchannel_continuable = bool(getattr(descriptor, "supports_inchannel_continuable", False))
-
-    def _is_delivery_seen(self, dedupe_key: str) -> bool:
-        if dedupe_key in self._seen_inbound:
-            return True
-        store = getattr(self, "_session_store", None) or getattr(self, "session_store", None)
-        if store is not None:
-            checker = getattr(store, "is_relay_delivery_settled", None)
-            if callable(checker) and checker(dedupe_key):
-                self._seen_inbound[dedupe_key] = None
-                return True
-        return False
-
-    async def _claim_inbound_dedupe(
-        self, dedupe_key: Optional[str],
-    ) -> Tuple[bool, Optional[asyncio.Future[bool]]]:
-        """Claim pre-admission ownership for one at-least-once relay event.
-
-        Seen means the event reached a consuming prompt or handle_message. In-flight means only
-        that pre-admission work is running. Followers wait for that decision; if the owner is
-        cancelled before admission, one follower loops and becomes the new owner.
-        """
-        if dedupe_key is None:
-            return True, None
-        inflight = self.__dict__.setdefault("_inflight_inbound", {})
-        while True:
-            if self._is_delivery_seen(dedupe_key):
-                logger.info("relay inbound dropped as replay (dedupe key=%s)", dedupe_key)
-                return False, None
-            pending = inflight.get(dedupe_key)
-            if pending is None:
-                claim = asyncio.get_running_loop().create_future()
-                inflight[dedupe_key] = claim
-                return True, claim
-            admitted = await asyncio.shield(pending)
-            if admitted:
-                logger.info("relay inbound dropped as replay (dedupe key=%s)", dedupe_key)
-                return False, None
-            # The previous owner exited before admission. Re-check seen/inflight atomically on
-            # this event loop turn and claim the retry if nobody else already did.
-
-    def _finish_inbound_dedupe(
-        self, dedupe_key: Optional[str], claim: Optional[asyncio.Future[bool]], *, admitted: bool,
-    ) -> None:
-        if dedupe_key is None or claim is None:
-            return
-        inflight = self.__dict__.setdefault("_inflight_inbound", {})
-        if admitted:
-            self._seen_inbound[dedupe_key] = None
-            self._evict_oldest(self._seen_inbound, self._SEEN_INBOUND_MAX)
-            store = getattr(self, "_session_store", None) or getattr(self, "session_store", None)
-            if store is not None:
-                marker = getattr(store, "mark_relay_delivery_settled", None)
-                if callable(marker):
-                    try:
-                        marker(dedupe_key)
-                    except Exception:
-                        logger.debug("failed to persist relay delivery settlement for %s", dedupe_key, exc_info=True)
-        if inflight.get(dedupe_key) is claim:
-            inflight.pop(dedupe_key, None)
-        if not claim.done():
-            claim.set_result(admitted)
-
-    async def _on_inbound(self, event) -> None:
-        """Bridge a connector-delivered MessageEvent into the normal adapter path."""
-        # Inbound replay dedupe is two-phase. The old code inserted into _seen_inbound before the
-        # new off-loop Discord metadata await; cancellation there could ACK a later replay without
-        # ever admitting the message. Keep concurrent duplicates serialized, but publish "seen"
-        # only once a prompt consumed the event or once the normal handle_message return settles.
-        dedupe_key = self._inbound_dedupe_key(event)
-        should_process, claim = await self._claim_inbound_dedupe(dedupe_key)
-        if not should_process:
-            return
-        try:
-            self._capture_scope(event)
-            await self._remember_discord_context(event.source)
-            self._stamp_slack_session_thread(event)
-            # A structured prompt answer resolves its waiting primitive and is CONSUMED —
-            # never also dispatched as chat.
-            if await self._consume_prompt_response(event):
-                self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
-                claim = None
-                return
-            await self._localize_inbound_media(event)
-            # The claim is held ACROSS the handle_message await so a cancelled/raised handoff
-            # cannot publish "seen" on invocation alone. A normal return keeps the historical
-            # terminal-consumption contract (policy drops settled, nothing replayed).
-            await self.handle_message(event)
-            self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
-            claim = None
-        finally:
-            # Any non-normal exit leaves the durable frame retryable UNLESS the base adapter
-            # proved it kept the work. Wakes one waiting duplicate either way.
-            if claim is not None:
-                self._finish_inbound_dedupe(
-                    dedupe_key, claim, admitted=_gateway_admitted(event),
-                )
 
     _SEEN_INBOUND_MAX = 512
     _DISCORD_CONTEXT_MAX = 2048
@@ -1393,64 +1301,72 @@ class RelayAdapter(BasePlatformAdapter):
         await ack(str(buffer_id))
 
     async def _on_passthrough(self, forward, buffer_id: Optional[str] = None) -> None:
-        """Handle a connector-forwarded passthrough request and settle its delivery buffer."""
+        """Admit passthrough work without acknowledging RAM-only custody."""
         dedupe_key = f"passthrough_buffer:{buffer_id}" if buffer_id else None
         should_process, claim = await self._claim_inbound_dedupe(dedupe_key)
         if not should_process:
-            await self._ack_passthrough_buffer(buffer_id)
+            await self._ack_completed_replay(dedupe_key, buffer_id)
             return
-        handoff: Optional[MessageEvent] = None
+        handoff = None
+        receipt = None
         try:
             platform = getattr(forward, "platform", "") or ""
             if platform == "discord":
                 payload = self._discord_interaction_payload(forward)
-                if payload is None:
-                    self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
-                    claim = None
-                    await self._ack_passthrough_buffer(buffer_id)
-                    return
-                member = payload.get("member") if isinstance(payload.get("member"), dict) else {}
-                user = (member.get("user") if isinstance(member, dict) else None) or payload.get("user") or {}
-                if not isinstance(user, dict):
-                    user = {}
-                channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
-                interaction_channel_id = str(payload.get("channel_id") or channel.get("id") or "")
-                context = await self._discord_context_for(
-                    str(payload.get("guild_id") or ""),
-                    interaction_channel_id,
-                    str(user.get("id") or ""),
-                )
-                event = self._discord_interaction_to_event(forward, payload=payload, context=context)
-                if event is not None:
-                    self._capture_scope(event)
-                    await self._remember_discord_interaction_context(payload, event)
-                    if await self._consume_prompt_response(event):
-                        self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
+                if payload is not None:
+                    member = payload.get("member") if isinstance(payload.get("member"), dict) else {}
+                    user = member.get("user") or payload.get("user") or {}
+                    if not isinstance(user, dict):
+                        user = {}
+                    channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+                    context = await self._discord_context_for(
+                        str(payload.get("guild_id") or ""),
+                        str(payload.get("channel_id") or channel.get("id") or ""),
+                        str(user.get("id") or ""),
+                    )
+                    handoff = self._discord_interaction_to_event(forward, payload=payload, context=context)
+                    if handoff is not None:
+                        self._capture_scope(handoff)
+                        await self._remember_discord_interaction_context(payload, handoff)
+                        if await self._consume_prompt_response(handoff):
+                            await self._settle_consumed_delivery(dedupe_key, buffer_id)
+                            self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
+                            claim = None
+                            return
+                        durable = bool(buffer_id) and await self._stage_durable_delivery(
+                            handoff, dedupe_key, buffer_id,
+                        )
+                        if getattr(handoff, "_relay_delivery_already_consumed", False):
+                            await self._ack_passthrough_buffer(buffer_id)
+                            self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
+                            claim = None
+                            return
+                        receipt = self._attach_delivery_receipt(
+                            handoff, dedupe_key, claim, None if durable else buffer_id,
+                        )
+                        if durable:
+                            await self._ack_passthrough_buffer(buffer_id)
+                        await self.handle_message(handoff)
+                        admitted = _gateway_admitted(handoff)
+                        if not admitted and not receipt.done():
+                            discard_inbound(handoff)
+                        self._finish_inbound_dedupe(dedupe_key, claim, admitted=admitted)
                         claim = None
-                        await self._ack_passthrough_buffer(buffer_id)
                         return
-                    handoff = event
-                    await self.handle_message(event)
-                    self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
-                    claim = None
-                    await self._ack_passthrough_buffer(buffer_id)
-                    return
-            logger.info(
-                "relay passthrough_forward dropped (no handler): platform=%s method=%s path=%s",
-                platform, getattr(forward, "method", "?"), getattr(forward, "path", "?"),
-            )
+            # Unsupported or invalid input is terminally consumed by policy.
+            await self._settle_consumed_delivery(dedupe_key, buffer_id)
             self._finish_inbound_dedupe(dedupe_key, claim, admitted=True)
             claim = None
-            await self._ack_passthrough_buffer(buffer_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("relay passthrough_forward handling failed", exc_info=True)
         finally:
             if claim is not None:
-                self._finish_inbound_dedupe(
-                    dedupe_key, claim, admitted=_gateway_admitted(handoff),
-                )
+                admitted = _gateway_admitted(handoff)
+                if receipt is not None and not admitted:
+                    discard_inbound(handoff)
+                self._finish_inbound_dedupe(dedupe_key, claim, admitted=admitted)
 
     @staticmethod
     def _discord_interaction_payload(forward) -> Optional[Dict[str, Any]]:
@@ -1705,6 +1621,7 @@ class RelayAdapter(BasePlatformAdapter):
         from gateway.relay.ws_transport import _env_disconnect_budget_s
         _started = time.monotonic()
         _budget = _env_disconnect_budget_s()
+        await self._stop_delivery_recovery()
         # Stop the revocation monitor first so it can't fire a spurious fatal
         # during/after a deliberate teardown.
         if self._revocation_monitor is not None:

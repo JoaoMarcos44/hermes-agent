@@ -25,7 +25,12 @@ def _origin_json(source) -> Optional[str]:
     if source is None:
         return None
     try:
-        return json.dumps(source.to_dict())
+        data = source.to_dict()
+        # This JSON is written by the gateway, never deserialized as a wire source. Keep the
+        # receiving relay's provenance even when housekeeping prunes its routing entry.
+        if getattr(source, "delivered_via_upstream_relay", False) is True:
+            data["_delivered_via_relay"] = True
+        return json.dumps(data)
     except Exception:
         return None
 
@@ -137,6 +142,14 @@ class SessionRecoveryMixin:
             return False
         return origin.get("scope_id", origin.get("guild_id")) == source.scope_id
 
+    def _has_initialized_agent_turn(self, session_key: str, session_id: str) -> bool:
+        """Metadata-only rows do not initialize a turn; compression ancestry retains it."""
+        reader = getattr(self._db_for_key(session_key), "get_messages", None)
+        return callable(reader) and any(
+            message.get("role") in {"user", "assistant", "tool"}
+            for message in reader(session_id, include_ancestors=True)
+        )
+
     def _create_entry_from_recovered_row(
         self, *, row: Dict[str, Any], session_key: str, source: SessionSource, now: datetime,
     ) -> SessionEntry:
@@ -156,12 +169,26 @@ class SessionRecoveryMixin:
         had_activity = row.get("_has_messages")
         if had_activity is None:
             had_activity = bool(row.get("message_count") or 0) or last_activity is not None
-        from gateway.session_identity import transport_profile_of
+        try:
+            durable_origin = json.loads(row.get("origin_json") or "{}")
+        except (TypeError, ValueError):
+            durable_origin = {}
+        delivered_via_relay = (
+            getattr(source, "delivered_via_upstream_relay", False) is True
+            or isinstance(durable_origin, dict) and durable_origin.get("_delivered_via_relay") is True
+        )
+        initialized = self._has_initialized_agent_turn(session_key, str(row["id"]))
+        from gateway.session_identity import replace_source, transport_profile_of
+        if delivered_via_relay and not source.delivered_via_upstream_relay:
+            # Retain the durable marker on the stored origin for subsequent peer refreshes,
+            # without changing the live ingress source handed to this lookup.
+            source = replace_source(source, delivered_via_upstream_relay=True)
         return SessionEntry(
             session_key=session_key, session_id=str(row["id"]), created_at=created_at,
             updated_at=updated_at, origin=source, display_name=source.chat_name,
             platform=source.platform, chat_type=source.chat_type,
-            reset_had_activity=bool(had_activity), transport_profile=transport_profile_of(source))
+            reset_had_activity=bool(had_activity), transport_profile=transport_profile_of(source),
+            agent_turn_initialized=initialized, delivered_via_relay=delivered_via_relay)
 
     def _find_gateway_session_row(
         self, *, session_key: str, source: SessionSource, allow_peer_fallback: bool,

@@ -8,9 +8,12 @@ import contextlib
 import logging
 import json
 import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from utils import atomic_json_write
+from hermes_state_relay import RELAY_RECEIPT_RETENTION_SECONDS
 
 if TYPE_CHECKING:
     from gateway.session import SessionEntry, SessionSource
@@ -238,33 +241,133 @@ class SessionPersistenceMixin:
     def _relay_discord_context_meta_key(kind: str, scope_id: str, entity_id: str) -> str:
         return f"relay_discord_context:v1:{kind}:{scope_id}:{entity_id}"
 
-    def is_relay_delivery_settled(self, dedupe_key: str) -> bool:
-        """Check whether a relay inbound delivery has already been durably settled."""
-        mem_cache = self._lazy("_settled_relay_deliveries", set)
-        if dedupe_key in mem_cache:
-            return True
-        getter = self._routing_db_method("get_meta")
-        if getter is None:
-            return False
-        try:
-            val = bool(getter(f"relay_delivery_settled:v1:{dedupe_key}"))
-            if val:
-                mem_cache.add(dedupe_key)
-            return val
-        except Exception:
-            return False
+    _RELAY_RECEIPT_CACHE_MAX = 4096
+    _RELAY_RECEIPT_RETENTION_SECONDS = RELAY_RECEIPT_RETENTION_SECONDS
+    _relay_receipt_now = staticmethod(time.time)
+    _relay_pending_now = staticmethod(time.time_ns)
 
-    def mark_relay_delivery_settled(self, dedupe_key: str) -> None:
-        """Persist a relay delivery settlement receipt so reconnects/restarts suppress replay."""
-        mem_cache = self._lazy("_settled_relay_deliveries", set)
-        mem_cache.add(dedupe_key)
-        setter = self._routing_db_method("set_meta")
-        if setter is None:
-            return
-        try:
-            setter(f"relay_delivery_settled:v1:{dedupe_key}", "1")
-        except Exception:
-            pass
+    def _relay_receipt_lock(self):
+        # setdefault publishes one lock even when executor workers race first use.
+        return self.__dict__.setdefault("_relay_receipt_guard", threading.Lock())
+
+    def _maintain_relay_receipts(self, db, cache: OrderedDict, now: float) -> None:
+        last = getattr(self, "_relay_receipt_maintenance_at", None)
+        interval = min(3600.0, self._RELAY_RECEIPT_RETENTION_SECONDS)
+        if last is None or now < last or now - last >= interval:
+            try:
+                db.prune_relay_delivery_receipts(
+                    now=now, retention_seconds=self._RELAY_RECEIPT_RETENTION_SECONDS,
+                )
+            except Exception:
+                # A locked writer can coexist with healthy WAL reads. Housekeeping
+                # must never hide a committed receipt or gate a new settlement.
+                logger.debug("Could not prune relay delivery receipts", exc_info=True)
+                return
+            self._relay_receipt_maintenance_at = now
+            cutoff = now - self._RELAY_RECEIPT_RETENTION_SECONDS
+            for key, settled_at in list(cache.items()):
+                if settled_at <= cutoff:
+                    del cache[key]
+
+    def _cache_relay_receipt(self, cache: OrderedDict, key: str, settled_at: float) -> None:
+        cache[key] = settled_at
+        cache.move_to_end(key)
+        while len(cache) > self._RELAY_RECEIPT_CACHE_MAX:
+            cache.popitem(last=False)
+
+    def is_relay_delivery_settled(self, dedupe_key: str) -> bool:
+        """Check committed receipts within the gateway's completed-delivery retention period."""
+        with self._relay_receipt_lock():
+            cache = self._lazy("_settled_relay_deliveries", OrderedDict)
+            now = self._relay_receipt_now()
+            cutoff = now - self._RELAY_RECEIPT_RETENTION_SECONDS
+            settled_at = cache.get(dedupe_key)
+            if settled_at is not None and settled_at > cutoff:
+                return True
+            cache.pop(dedupe_key, None)
+            db = self._routing_db
+            if db is None:
+                return False
+            try:
+                self._maintain_relay_receipts(db, cache, now)
+                settled_at = db.get_relay_delivery_receipt(dedupe_key, cutoff=cutoff)
+                if settled_at is None:
+                    # An upgrade can read an old committed receipt while its
+                    # timestamp migration is blocked. Do not cache an unknown age.
+                    return db.has_legacy_relay_delivery_receipt(dedupe_key)
+                self._cache_relay_receipt(cache, dedupe_key, settled_at)
+                return True
+            except Exception:
+                logger.debug("Could not read relay delivery receipt", exc_info=True)
+                return False
+
+    def mark_relay_delivery_settled(self, dedupe_key: str) -> bool:
+        """Return True only after the receipt commits; failed writes publish no RAM receipt."""
+        with self._relay_receipt_lock():
+            cache = self._lazy("_settled_relay_deliveries", OrderedDict)
+            db = self._routing_db
+            if db is None:
+                return False
+            now = self._relay_receipt_now()
+            try:
+                self._maintain_relay_receipts(db, cache, now)
+                db.set_relay_delivery_receipt(dedupe_key, settled_at=now)
+            except Exception:
+                logger.warning("Could not persist relay delivery receipt", exc_info=True)
+                return False
+            self._cache_relay_receipt(cache, dedupe_key, now)
+            return True
+
+    def stage_relay_delivery(self, dedupe_key: str, payload: Dict[str, Any]) -> bool:
+        """Accept durable pending custody only after the first event snapshot commits."""
+        with self._relay_receipt_lock():
+            db = self._routing_db
+            if db is None or not isinstance(payload, dict):
+                return False
+            try:
+                db.stage_relay_delivery_pending(
+                    dedupe_key, payload, admitted_at=self._relay_pending_now(),
+                    cutoff=self._relay_receipt_now() - self._RELAY_RECEIPT_RETENTION_SECONDS,
+                )
+                return True
+            except Exception:
+                logger.warning("Could not stage durable relay input", exc_info=True)
+                return False
+
+    def get_relay_delivery_pending(self, dedupe_key: str) -> Optional[Dict[str, Any]]:
+        with self._relay_receipt_lock():
+            db = self._routing_db
+            if db is None:
+                return None
+            try:
+                return db.get_relay_delivery_pending(dedupe_key)
+            except Exception:
+                logger.warning("Could not read durable relay input", exc_info=True)
+                return None
+
+    def pending_relay_deliveries(
+        self, *, limit: int = 100, after: Optional[tuple[int, str]] = None,
+    ) -> list[tuple[str, Dict[str, Any]]]:
+        with self._relay_receipt_lock():
+            db = self._routing_db
+            if db is None:
+                return []
+            try:
+                return db.pending_relay_deliveries(limit=limit, after=after)
+            except Exception:
+                logger.warning("Could not enumerate durable relay inputs", exc_info=True)
+                return []
+
+    def clear_relay_delivery_pending(self, dedupe_key: str) -> bool:
+        with self._relay_receipt_lock():
+            db = self._routing_db
+            if db is None:
+                return False
+            try:
+                return db.clear_relay_delivery_pending(dedupe_key)
+            except Exception:
+                logger.warning("Could not clear settled durable relay input", exc_info=True)
+                return False
 
     def _relay_discord_context_lock(self):
         return self._lazy("_relay_discord_context_guard", threading.Lock)

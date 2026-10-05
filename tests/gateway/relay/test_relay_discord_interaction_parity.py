@@ -13,6 +13,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import ProcessingOutcome
 from gateway.relay.ws_transport import _event_from_wire
 from gateway.session import SessionStore, build_session_context, build_session_key
+from tests.gateway.relay.test_relay_inbound_admission_receipt import _pending_input
 from tests.gateway.relay.test_relay_interactive import _adapter
 
 
@@ -83,6 +84,12 @@ async def _passthrough_event(adapter, forward):
     await adapter._on_passthrough(forward)
     assert adapter.handle_message.await_count == 1
     return adapter.handle_message.await_args.args[0]
+
+
+async def _settle_delivery_tasks(adapter):
+    """Call after the modeled handler has returned or the input was rejected."""
+    tasks = tuple(adapter._settlement_tasks) + tuple(adapter._session_tasks.values())
+    await asyncio.wait_for(asyncio.gather(*tasks), 3)
 
 
 @pytest.mark.asyncio
@@ -192,21 +199,40 @@ async def test_modal_submission_retains_select_menu_values():
 
 
 @pytest.mark.asyncio
-async def test_buffered_passthrough_replay_is_admitted_once_and_acked_each_time():
+@pytest.mark.parametrize("durable", [False, True], ids=["stage-refused", "capsule-committed"])
+async def test_buffered_passthrough_normal_return_without_receipt_is_retryable(tmp_path, monkeypatch, durable):
     adapter, stub = _adapter(platform="discord")
+    store = SessionStore(tmp_path, GatewayConfig())
+    adapter.set_session_store(store)
+    if not durable:
+        monkeypatch.setattr(store, "stage_relay_delivery", lambda key, payload: False)
     adapter.handle_message = AsyncMock()
     forward = _forward(type=3, id="press-buffer-1", message={"id": "bot-buffer-1"},
                        member={"user": {"id": "u1", "username": "ben"}},
                        data={"custom_id": "inspect"})
     await adapter._on_passthrough(forward, "buffer-1")
+    await _settle_delivery_tasks(adapter)
     await adapter._on_passthrough(forward, "buffer-1")
-    assert adapter.handle_message.await_count == 1
-    assert stub.acked_buffer_ids == ["buffer-1", "buffer-1"]
+    await _settle_delivery_tasks(adapter)
+    assert adapter.handle_message.await_count == 2
+    key = "passthrough_buffer:buffer-1"
+    assert key not in adapter._retained_inbound
+    assert key not in adapter._seen_inbound
+    assert not store.is_relay_delivery_settled(key)
+    assert stub.acked_buffer_ids == (["buffer-1", "buffer-1"] if durable else [])
+    if durable:
+        payload = _pending_input(store, key, buffer_id="buffer-1", text="inspect")
+        assert payload["event"]["metadata"]["discord_interaction_id"] == "press-buffer-1"
+    else:
+        assert store.get_relay_delivery_pending(key) is None
+    store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
-async def test_buffered_passthrough_cancel_before_admission_remains_retryable():
+async def test_buffered_passthrough_cancel_before_admission_remains_retryable(tmp_path):
     adapter, stub = _adapter(platform="discord")
+    store = SessionStore(tmp_path, GatewayConfig())
+    adapter.set_session_store(store)
     adapter.handle_message = AsyncMock()
     entered, release = asyncio.Event(), asyncio.Event()
     original = adapter._discord_context_for
@@ -228,26 +254,59 @@ async def test_buffered_passthrough_cancel_before_admission_remains_retryable():
     assert adapter.handle_message.await_count == 0
     assert stub.acked_buffer_ids == []
     assert "passthrough_buffer:buffer-cancel" not in adapter._seen_inbound
+    assert store.get_relay_delivery_pending("passthrough_buffer:buffer-cancel") is None
 
     release.set()
     adapter._discord_context_for = original
+    del adapter.handle_message
+    handler_entered, handler_release = asyncio.Event(), asyncio.Event()
+    consumed = []
+
+    async def handler(event):
+        consumed.append(event)
+        handler_entered.set()
+        await handler_release.wait()
+
+    adapter.set_message_handler(handler)
     await adapter._on_passthrough(forward, "buffer-cancel")
-    assert adapter.handle_message.await_count == 1
+    await asyncio.wait_for(handler_entered.wait(), 3)
+    assert len(consumed) == 1
     assert stub.acked_buffer_ids == ["buffer-cancel"]
+    payload = _pending_input(store, "passthrough_buffer:buffer-cancel",
+                             buffer_id="buffer-cancel", text=consumed[0].text)
+    assert payload["event"]["message_id"] == consumed[0].message_id
+    assert "passthrough_buffer:buffer-cancel" in adapter._retained_inbound
+    assert not store.is_relay_delivery_settled("passthrough_buffer:buffer-cancel")
+    handler_release.set()
+    await _settle_delivery_tasks(adapter)
+    assert stub.acked_buffer_ids == ["buffer-cancel"]
+    assert store.is_relay_delivery_settled("passthrough_buffer:buffer-cancel")
+    assert store.get_relay_delivery_pending("passthrough_buffer:buffer-cancel") is None
+    store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
-async def test_buffered_passthrough_replay_finishes_ack_after_post_admission_failure():
+async def test_buffered_passthrough_post_admission_failure_keeps_replay_capsule(tmp_path):
     adapter, stub = _adapter(platform="discord")
+    store = SessionStore(tmp_path, GatewayConfig())
+    adapter.set_session_store(store)
+    entered, release = asyncio.Event(), asyncio.Event()
+    consumed = []
+
+    async def handler(event):
+        consumed.append(event)
+        entered.set()
+        await release.wait()
+
+    adapter.set_message_handler(handler)
+    original = adapter.handle_message
     calls = 0
 
     async def failing(event):
         nonlocal calls
         calls += 1
-        # The work really WAS retained before the failure, so mark the established admission
-        # receipt explicitly. Invocation is not admission: the relay publishes "seen" only for
-        # retained work, and a frame the gateway did keep must not be replayed.
-        event._gateway_accepted = True
+        # The real base boundary owns a live handler task before the wrapper raises.
+        await original(event)
         raise RuntimeError("after admission")
 
     adapter.handle_message = failing
@@ -255,11 +314,29 @@ async def test_buffered_passthrough_replay_finishes_ack_after_post_admission_fai
                        member={"user": {"id": "u1", "username": "ben"}},
                        data={"custom_id": "inspect"})
     await adapter._on_passthrough(forward, "buffer-fail")
-    assert calls == 1
-    assert stub.acked_buffer_ids == []
-    await adapter._on_passthrough(forward, "buffer-fail")
+    await asyncio.wait_for(entered.wait(), 3)
     assert calls == 1
     assert stub.acked_buffer_ids == ["buffer-fail"]
+    payload = _pending_input(store, "passthrough_buffer:buffer-fail",
+                             buffer_id="buffer-fail", text=consumed[0].text)
+    assert payload["event"]["message_id"] == consumed[0].message_id
+    await adapter._on_passthrough(forward, "buffer-fail")
+    assert calls == 1
+    assert len(consumed) == 1
+    assert stub.acked_buffer_ids == ["buffer-fail", "buffer-fail"]
+    assert store.get_relay_delivery_pending("passthrough_buffer:buffer-fail") == payload
+    assert "passthrough_buffer:buffer-fail" in adapter._retained_inbound
+    assert "passthrough_buffer:buffer-fail" not in adapter._seen_inbound
+    assert not store.is_relay_delivery_settled("passthrough_buffer:buffer-fail")
+    release.set()
+    await _settle_delivery_tasks(adapter)
+    assert stub.acked_buffer_ids == ["buffer-fail", "buffer-fail"]
+    assert store.is_relay_delivery_settled("passthrough_buffer:buffer-fail")
+    assert store.get_relay_delivery_pending("passthrough_buffer:buffer-fail") is None
+    await adapter._on_passthrough(forward, "buffer-fail")
+    assert calls == 1
+    assert stub.acked_buffer_ids == ["buffer-fail", "buffer-fail", "buffer-fail"]
+    store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
@@ -1006,22 +1083,36 @@ async def test_cancelled_context_write_keeps_inbound_replay_retryable(tmp_path):
     release.set()
     assert await asyncio.to_thread(finished.wait, 3)
     await adapter._on_inbound(_message())
+    await _settle_delivery_tasks(adapter)
 
     assert adapter.handle_message.await_count == 1
     key = adapter._inbound_dedupe_key(_message())
-    assert key in adapter._seen_inbound
+    assert key not in adapter._seen_inbound
+    assert key not in adapter._retained_inbound
+    assert not store.is_relay_delivery_settled(key)
     assert key not in adapter._inflight_inbound
+    await adapter._on_inbound(_message())
+    await _settle_delivery_tasks(adapter)
+    assert adapter.handle_message.await_count == 2
     store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
 async def test_overlapping_inbound_replays_share_one_admission_owner(tmp_path):
-    """Concurrent duplicates wait on pre-admission work and only one reaches handle_message."""
+    """Concurrent duplicates share admission while the real handler owns RAM-only work."""
     config = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
     store = SessionStore(tmp_path, config)
     adapter, _ = _adapter(platform="discord")
     adapter.set_session_store(store)
-    adapter.handle_message = AsyncMock()
+    handler_entered, handler_release = asyncio.Event(), asyncio.Event()
+    consumed = []
+
+    async def handler(event):
+        consumed.append(event)
+        handler_entered.set()
+        await handler_release.wait()
+
+    adapter.set_message_handler(handler)
 
     entered = threading.Event()
     release = threading.Event()
@@ -1035,18 +1126,34 @@ async def test_overlapping_inbound_replays_share_one_admission_owner(tmp_path):
     store.observe_relay_discord_context = held
     first = asyncio.create_task(adapter._on_inbound(_message()))
     assert await asyncio.to_thread(entered.wait, 3)
-    duplicate = asyncio.create_task(adapter._on_inbound(_message()))
-    await asyncio.sleep(0)
+    duplicate_entered = asyncio.Event()
+
+    async def replay():
+        duplicate_entered.set()
+        await adapter._on_inbound(_message())
+
+    duplicate = asyncio.create_task(replay())
+    await duplicate_entered.wait()
     assert not duplicate.done()
 
     release.set()
     await asyncio.gather(first, duplicate)
-    assert adapter.handle_message.await_count == 1
+    await asyncio.wait_for(handler_entered.wait(), 3)
+    assert len(consumed) == 1
+    key = adapter._inbound_dedupe_key(_message())
+    assert key in adapter._retained_inbound
+    assert key not in adapter._seen_inbound
+    assert not store.is_relay_delivery_settled(key)
 
-    # A later replay is a normal seen hit and also stays suppressed.
+    # A later replay stays unacknowledged while RAM custody is the only owner.
     await adapter._on_inbound(_message())
-    assert adapter.handle_message.await_count == 1
+    assert len(consumed) == 1
     assert not adapter._inflight_inbound
+    handler_release.set()
+    await _settle_delivery_tasks(adapter)
+    assert store.is_relay_delivery_settled(key)
+    await adapter._on_inbound(_message())
+    assert len(consumed) == 1
     store.close_all_db_handles()
 
 @pytest.mark.asyncio
@@ -1468,4 +1575,3 @@ def test_discord_interaction_resolves_channel_id_from_partial_channel_object():
     assert event.source.chat_id == "dm-ch-888"
     assert event.source.chat_type == "group"
     assert event.source.chat_name == "alice-group"
-

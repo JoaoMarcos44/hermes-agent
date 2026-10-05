@@ -440,6 +440,9 @@ from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.inbound_receipt import (
+    begin_inbound, discard_inbound, finish_inbound, merge_inbound_receipts,
+)
 from gateway.warning_notifications import diagnostic_wake_muted
 from hermes_cli.observability.shared_metrics_gateway import records_delivery, stop_reply_clock
 from gateway.session import SessionSource, build_session_key
@@ -1766,6 +1769,13 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     replace."""
     existing = pending_messages.get(session_key)
     if existing:
+        if getattr(existing, "_relay_durable_pending", False) or getattr(event, "_relay_durable_pending", False):
+            # Each inbox capsule owns one authored user row. A refused follow-up remains in
+            # that inbox for recovery instead of becoming part of another owner's transcript.
+            if existing is not event:
+                event._gateway_accepted = False
+                discard_inbound(event)
+            return
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -1796,6 +1806,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         # A photo burst always absorbs; otherwise merge only when media is involved on either
         # side. Captions merge in every absorbing case.
         if both_photo or existing.media_urls or incoming_has_media:
+            merge_inbound_receipts(existing, event)
             if both_photo or incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -1816,11 +1827,14 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
+            merge_inbound_receipts(existing, event)
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
             _absorb_envelope(existing, event)
             return
+        if existing is not event:
+            discard_inbound(existing)
     pending_messages[session_key] = event
 
 
@@ -2551,10 +2565,18 @@ class BasePlatformAdapter(ABC):
         if self._drop_unresolved(event):
             return
         key = self._text_batch_key(event)
+        if getattr(event, "_relay_durable_pending", False):
+            key = f"{key}:relay-input:{event._relay_input_owner}"
         existing = self._pending_text_batches.get(key)
         if existing is None:
             existing = self._pending_text_batches[key] = event
         else:
+            if getattr(existing, "_relay_durable_pending", False) or getattr(event, "_relay_durable_pending", False):
+                if existing is not event:
+                    event._gateway_accepted = False
+                    discard_inbound(event)
+                return
+            merge_inbound_receipts(existing, event)
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             if event.media_urls:
@@ -3579,7 +3601,13 @@ class BasePlatformAdapter(ABC):
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
+        inbound_owner = begin_inbound(event)
+        try:
+            response = await self._message_handler(event)
+        except BaseException:
+            finish_inbound(event, consumed=False, expected_owner=inbound_owner)
+            raise
+        finish_inbound(event, consumed=True, expected_owner=inbound_owner)
         event._gateway_accepted = True
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
@@ -3801,6 +3829,8 @@ class BasePlatformAdapter(ABC):
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender and have compatible identity shapes."""
+        if getattr(existing, "_relay_durable_pending", False) or getattr(event, "_relay_durable_pending", False):
+            return False
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -3859,6 +3889,7 @@ class BasePlatformAdapter(ABC):
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
             store[session_key] = state
         else:
+            merge_inbound_receipts(state.event, event)
             if event.text:
                 state.event.text = _append_text(state.event.text, event.text)
             state.event.absorb_reply_expected(event)
@@ -3921,6 +3952,7 @@ class BasePlatformAdapter(ABC):
         state = self._text_debounce_store().pop(session_key, None)
         if state is not None:
             state.cancel_timer()
+            discard_inbound(state.event)
 
     # ── Session task + guard ownership helpers: paired with the _session_tasks owner map so
     # reconciliation is deterministic across completion, /stop /new /reset, and stale-lock heal.
@@ -3947,7 +3979,9 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        pending = self._pending_messages.pop(session_key, None)
+        if pending is not None:
+            discard_inbound(pending)
         self._requeue_counts.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
@@ -3961,13 +3995,14 @@ class BasePlatformAdapter(ABC):
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
         task = asyncio.create_task(self._process_message_background(event, session_key))
-        if not self._track_session_task(session_key, task):
+        if not self._track_session_task(session_key, task, event=event):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
+            discard_inbound(event)
             return False
         return True
 
-    def _track_session_task(self, session_key: str, task: Any) -> bool:
+    def _track_session_task(self, session_key: str, task: Any, *, event: Optional[MessageEvent] = None) -> bool:
         """Record ``task`` as the session owner and track it for shutdown; False when
         ``create_task`` was stubbed with an unhashable sentinel (tests) — the owner entry is left
         for the caller."""
@@ -3979,6 +4014,36 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+            if event is not None:
+                task._hermes_inbound_event = event
+
+                def settle_failed_task(completed):
+                    if (not completed.cancelled() and completed.exception() is None) \
+                            or getattr(completed, "_hermes_inbound_handler_completed", False):
+                        return
+                    if hasattr(completed, "_hermes_inbound_owner"):
+                        finish_inbound(event, consumed=False,
+                                       expected_owner=completed._hermes_inbound_owner)
+                        return
+                    # A drain can be cancelled before its coroutine starts. Check retained
+                    # owners before discarding: back-off leaves the event in the pending slot,
+                    # and a command may already have handed it to a replacement drain.
+                    retained = [self._pending_messages.get(session_key)]
+                    debounce = self._text_debounce_store().get(session_key)
+                    if debounce is not None:
+                        retained.append(debounce.event)
+                    replacement = self._session_tasks.get(session_key)
+                    if replacement is not None and replacement is not completed and not replacement.done():
+                        retained.append(getattr(replacement, "_hermes_inbound_event", None))
+                    if any(candidate is event or (
+                        candidate is not None and any(
+                            receipt in candidate._inbound_receipts for receipt in event._inbound_receipts
+                        )
+                    ) for candidate in retained):
+                        return
+                    discard_inbound(event)
+
+                task.add_done_callback(settle_failed_task)
         return True
 
     async def cancel_session_processing(self, session_key: str, *, release_guard: bool = True,
@@ -4004,7 +4069,9 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            pending = self._pending_messages.pop(session_key, None)
+            if pending is not None:
+                discard_inbound(pending)
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -4172,23 +4239,41 @@ class BasePlatformAdapter(ABC):
         # (or collapse distinct wakes into one turn). Its caller can retry admission.
         if event.internal and session_key in self._pending_messages:
             return
+        if self._is_queue_text_debounce_candidate(event):
+            logger.debug("[%s] New text message while session %s is active — "
+                         "debouncing follow-up (busy_text_mode=queue, window=%.2fs)", self.name,
+                         session_key, self._busy_text_debounce_seconds)
+            await self._queue_text_debounce(session_key, event)
+            return
+        # Components preserve their action/message envelope; durable inputs preserve their
+        # individual transcript owner. Refuse an incompatible follow-up for its owner to retry.
+        debounce_state = self._text_debounce_store().get(session_key)
+        if debounce_state is not None and (
+            (debounce_state.event.metadata or {}).get("discord_interaction_id")
+            or (event.metadata or {}).get("discord_interaction_id")
+            or getattr(debounce_state.event, "_relay_durable_pending", False)
+            or getattr(event, "_relay_durable_pending", False)
+        ):
+            await self._flush_text_debounce_now(session_key)
+        pending = self._pending_messages.get(session_key)
+        if pending is not None and (
+            (pending.metadata or {}).get("discord_interaction_id")
+            or (event.metadata or {}).get("discord_interaction_id")
+            or getattr(pending, "_relay_durable_pending", False)
+            or getattr(event, "_relay_durable_pending", False)
+        ):
+            return
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
             merge_pending_message_event(self._pending_messages, session_key, event)
             event._gateway_accepted = True
             return
-        if self._is_queue_text_debounce_candidate(event):
-            logger.debug("[%s] New text message while session %s is active — "
-                         "debouncing follow-up (busy_text_mode=queue, window=%.2fs)", self.name,
-                         session_key, self._busy_text_debounce_seconds)
-            await self._queue_text_debounce(session_key, event)
-        else:
-            logger.debug("[%s] New message while session %s is active — queuing follow-up "
-                         "(no interrupt, will cascade after current turn)", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event,
-                                        merge_text=event.message_type == MessageType.TEXT)
-            event._gateway_accepted = True
+        logger.debug("[%s] New message while session %s is active — queuing follow-up "
+                     "(no interrupt, will cascade after current turn)", self.name, session_key)
+        merge_pending_message_event(self._pending_messages, session_key, event,
+                                    merge_text=event.message_type == MessageType.TEXT)
+        event._gateway_accepted = True
 
     def _get_human_delay(self) -> float:
         """Random human-like pacing delay (s) from this adapter's ``human_delay`` config range
@@ -4569,6 +4654,12 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        inbound_owner = begin_inbound(event)
+        handler_completed = False
+        owner_task = asyncio.current_task()
+        if owner_task is not None:
+            owner_task._hermes_inbound_handler_completed = False
+            owner_task._hermes_inbound_owner = inbound_owner
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
 
         def _record_delivery(result):
@@ -4585,6 +4676,10 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            handler_completed = True
+            if owner_task is not None:
+                owner_task._hermes_inbound_handler_completed = True
+            finish_inbound(event, consumed=True, expected_owner=inbound_owner)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4679,6 +4774,8 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if not handler_completed:
+                finish_inbound(event, consumed=False, expected_owner=inbound_owner)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
@@ -4741,7 +4838,8 @@ class BasePlatformAdapter(ABC):
         guard = self._active_sessions.get(session_key)
         self._track_session_task(
             session_key,
-            asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard)))
+            asyncio.create_task(self._drain_after(pending_event, session_key, delay, guard)),
+            event=pending_event)
 
     async def _drain_after(self, pending_event: MessageEvent, session_key: str, delay: float,
                            guard: Optional[asyncio.Event]) -> None:
@@ -4805,6 +4903,9 @@ class BasePlatformAdapter(ABC):
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
             state.cancel_timer()
+            discard_inbound(state.event)
+        for event in self._pending_messages.values():
+            discard_inbound(event)
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
                        self._pending_messages, self._active_sessions, self._requeue_counts,
                        self._text_debounce_store()):

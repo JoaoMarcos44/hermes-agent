@@ -95,6 +95,14 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Process-local buffered-delivery owners travel with rewritten/merged input. Never wire data.
+    _inbound_receipts: List[Any] = field(default_factory=list, kw_only=True, repr=False, compare=False)
+    _inbound_deferred: bool = field(default=False, kw_only=True, repr=False, compare=False)
+    _inbound_owner: Any = field(default=None, kw_only=True, repr=False, compare=False)
+    # Trusted local relay-inbox state; survives rewritten events, never populated from wire metadata.
+    _relay_input_owner: Optional[str] = field(default=None, kw_only=True, repr=False, compare=False)
+    _relay_durable_replay: bool = field(default=False, kw_only=True, repr=False, compare=False)
+    _relay_durable_pending: bool = field(default=False, kw_only=True, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 

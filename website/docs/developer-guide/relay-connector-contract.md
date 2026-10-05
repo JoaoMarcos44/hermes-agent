@@ -302,6 +302,24 @@ then clear the flip so live delivery resumes. This reuses the same
 connector→gateway delivery leg. Connector-authoritative throughout: a gateway can
 only flip/drain ITS OWN instance.
 
+Before ACK, buffered model inputs are stored in the gateway's durable relay inbox,
+including immutable attachment copies. A background worker retries refused or
+interrupted inputs and restores them after restart. Pending inputs have no retention
+expiry; successful consumption commits a receipt and removes the pending snapshot
+in the same transaction. Separating model completion from this durable ACK allows
+later approval replies to pass through an ACK-gated backlog.
+
+The gateway retains timestamped settlement receipts for **30 days** to suppress
+completed-delivery replays across restarts. Its in-memory receipt cache is capped
+at 4096 entries; evicting a cache entry preserves the durable receipt until its
+retention expires. Expired receipts are pruned during disk receipt lookups and
+writes, at most once per hour during activity. Legacy receipts without timestamps
+receive a 30-day grace period when first adopted. This is a gateway deduplication
+window; the connector contract specifies no maximum age for buffered inputs.
+Unacknowledged deliveries remain connector-owned pending work, and this cleanup
+does not discard them. A completed delivery replayed after the window may run
+again.
+
 > NOT in scope (deferred behaviour): the autonomous idle timer that DECIDES to
 > drain, the actual machine suspend, and the NAS suspended-health model. The
 > primitive is "when the gateway drains, relay flips to buffered + replays on

@@ -74,6 +74,13 @@ async def _none_coro():
     return None
 
 
+async def _dispatch_and_settle(adapter, event):
+    """Exercise the real base handler and await completed consumption before replay."""
+    await adapter._on_inbound(event)
+    tasks = tuple(adapter._settlement_tasks) + tuple(adapter._session_tasks.values())
+    await asyncio.wait_for(asyncio.gather(*tasks), 3)
+
+
 class TestInboundReplayDedupe:
     """Finding #3 (live canary): connector replay of the original inbound
     after a WS re-handshake must not re-run the turn."""
@@ -94,7 +101,7 @@ class TestInboundReplayDedupe:
         return MessageEvent(text=text, source=source, message_id=message_id)
 
     def _tap(self, adapter, handled):
-        adapter.handle_message = lambda e: _record(handled, e)
+        adapter.set_message_handler(lambda e: _record(handled, e))
         adapter._consume_prompt_response = lambda e: _false_coro()
         adapter._localize_inbound_media = lambda e: _none_coro()
 
@@ -103,16 +110,17 @@ class TestInboundReplayDedupe:
         handled = []
         self._tap(adapter, handled)
         e = self._event()
-        loop.run_until_complete(adapter._on_inbound(e))
-        loop.run_until_complete(adapter._on_inbound(e))  # replay
+        loop.run_until_complete(_dispatch_and_settle(adapter, e))
+        assert adapter._inbound_dedupe_key(e) in adapter._seen_inbound
+        loop.run_until_complete(_dispatch_and_settle(adapter, e))  # replay
         assert len(handled) == 1
 
     def test_distinct_messages_both_handled(self, loop):
         adapter, _ = _connected_adapter()
         handled = []
         self._tap(adapter, handled)
-        loop.run_until_complete(adapter._on_inbound(self._event("1700.100")))
-        loop.run_until_complete(adapter._on_inbound(self._event("1700.200")))
+        loop.run_until_complete(_dispatch_and_settle(adapter, self._event("1700.100")))
+        loop.run_until_complete(_dispatch_and_settle(adapter, self._event("1700.200")))
         assert len(handled) == 2
 
     def test_missing_message_id_fails_open(self, loop):
@@ -120,18 +128,20 @@ class TestInboundReplayDedupe:
         handled = []
         self._tap(adapter, handled)
         e = self._event(message_id=None)
-        loop.run_until_complete(adapter._on_inbound(e))
-        loop.run_until_complete(adapter._on_inbound(e))
+        loop.run_until_complete(_dispatch_and_settle(adapter, e))
+        loop.run_until_complete(_dispatch_and_settle(adapter, e))
         assert len(handled) == 2  # never dedupe without identity
 
     def test_seen_set_bounded(self, loop):
         adapter, _ = _connected_adapter()
-        adapter.handle_message = lambda e: _none_coro()
-        adapter._consume_prompt_response = lambda e: _false_coro()
-        adapter._localize_inbound_media = lambda e: _none_coro()
-        for i in range(600):
-            loop.run_until_complete(adapter._on_inbound(self._event(f"ts.{i}")))
-        assert len(adapter._seen_inbound) <= adapter._SEEN_INBOUND_MAX
+        handled = []
+        self._tap(adapter, handled)
+        deliveries = adapter._SEEN_INBOUND_MAX + 88
+        for i in range(deliveries):
+            loop.run_until_complete(_dispatch_and_settle(adapter, self._event(f"ts.{i}")))
+        assert len(handled) == deliveries
+        assert len(adapter._seen_inbound) == adapter._SEEN_INBOUND_MAX
+        assert not adapter._retained_inbound
 
 
 class TestWireLevelReplayDedupe:
@@ -158,7 +168,7 @@ class TestWireLevelReplayDedupe:
     }
 
     def _tap(self, adapter, handled):
-        adapter.handle_message = lambda e: _record(handled, e)
+        adapter.set_message_handler(lambda e: _record(handled, e))
         adapter._consume_prompt_response = lambda e: _false_coro()
         adapter._localize_inbound_media = lambda e: _none_coro()
 
@@ -175,11 +185,13 @@ class TestWireLevelReplayDedupe:
         adapter, _ = _connected_adapter()
         handled = []
         self._tap(adapter, handled)
-        loop.run_until_complete(adapter._on_inbound(self._decode()))
+        event = self._decode()
+        loop.run_until_complete(_dispatch_and_settle(adapter, event))
+        assert adapter._inbound_dedupe_key(event) in adapter._seen_inbound
         # The connector re-delivers the SAME frame on re-handshake; the
         # decoder builds a fresh object each time, so identity must come
         # from the key, not object identity.
-        loop.run_until_complete(adapter._on_inbound(self._decode()))
+        loop.run_until_complete(_dispatch_and_settle(adapter, self._decode()))
         assert len(handled) == 1
 
     def test_same_ids_on_different_platforms_not_conflated(self, loop):
@@ -188,9 +200,9 @@ class TestWireLevelReplayDedupe:
         adapter, _ = _connected_adapter()
         handled = []
         self._tap(adapter, handled)
-        loop.run_until_complete(adapter._on_inbound(self._decode()))
+        loop.run_until_complete(_dispatch_and_settle(adapter, self._decode()))
         loop.run_until_complete(
-            adapter._on_inbound(self._decode(source={"platform": "discord"}))
+            _dispatch_and_settle(adapter, self._decode(source={"platform": "discord"}))
         )
         assert len(handled) == 2
 

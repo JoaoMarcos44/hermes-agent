@@ -22,6 +22,7 @@ from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.inbound_receipt import defer_inbound, discard_inbound
 from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
@@ -81,6 +82,8 @@ class GatewayStartupMixin:
         if queue is None:
             queue = self._startup_restore_queue = []
         queue.append(event)
+        defer_inbound(event)
+        event._gateway_accepted = True
         with suppress(Exception):
             source = event.source
             logger.info(
@@ -103,6 +106,7 @@ class GatewayStartupMixin:
                         "Dropping startup-restore queued message: adapter unavailable for %s",
                         getattr(getattr(source, "platform", None), "value", None),
                     )
+                    discard_inbound(event)
                     continue
                 # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
                 with suppress(Exception):
@@ -113,6 +117,7 @@ class GatewayStartupMixin:
                 # events still deserve their turn, and a raise here used to skip
                 # the gate release in _finish_startup_restore entirely.
                 logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
+                discard_inbound(event)
                 continue
             drained += 1
         return drained
@@ -601,6 +606,11 @@ class GatewayStartupMixin:
                     "Skipping auto-resume for %s: adapter not ready for %s", entry.session_key,
                     getattr(source.platform, "value", source.platform),
                 )
+                continue
+            # Durable relay input recovery owns the original payload and its completion receipt.
+            # An independent empty resume would race it and leave the capsule to run a second turn.
+            owns_resume = getattr(adapter, "_has_durable_resume_for", None)
+            if callable(owns_resume) and owns_resume(entry.session_key):
                 continue
             if not self._resume_owner_authorized(entry.session_key, source):
                 continue

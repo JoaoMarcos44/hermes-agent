@@ -15,7 +15,7 @@ from gateway.platforms.event import MessageEvent
 from gateway.relay.descriptor import CapabilityDescriptor
 
 # Callback the transport invokes for each inbound normalized event.
-InboundHandler = Callable[[MessageEvent], Awaitable[None]]
+InboundHandler = Callable[[MessageEvent], Awaitable[Optional[bool]]]
 
 # Callback for each forwarded passthrough request (§5.1): ``(forward, buffer_id)``.
 # ``forward`` is a ws_transport.PassthroughForward, typed Any here because

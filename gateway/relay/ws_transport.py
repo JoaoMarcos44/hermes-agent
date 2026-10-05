@@ -939,11 +939,13 @@ class WebSocketRelayTransport:
     async def _on_inbound(self, frame: Dict[str, Any]) -> None:
         if self._inbound is None:
             return
-        await self._inbound(_event_from_wire(frame.get("event", {})))
-        # A replayed buffered delivery carries a bufferId; ack AFTER the handler
-        # has taken it so the connector advances its cursor (no dup).
         buffer_id = frame.get("bufferId")
-        if buffer_id:
+        event = _event_from_wire(frame.get("event", {}))
+        event._relay_buffer_id = str(buffer_id) if buffer_id else None
+        ack_owned = await self._inbound(event)
+        # False transfers ACK ownership to the adapter's terminal-consumption receipt. Legacy
+        # handlers keep their synchronous acceptance contract; model work never blocks the reader.
+        if buffer_id and ack_owned is not False:
             await self._send_inbound_ack(str(buffer_id))
 
     async def _on_going_idle_ack(self, frame: Dict[str, Any]) -> None:

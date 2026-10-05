@@ -24,6 +24,7 @@ from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.inbound_receipt import begin_inbound, defer_inbound, discard_inbound, finish_inbound
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
 from gateway.run_inbound_unauthorized import (
@@ -621,7 +622,20 @@ class GatewayInboundMixin:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
+            existing = adapter._pending_messages.get(_quick_key)
+            if not merge_text or (
+                (getattr(existing, "metadata", None) or {}).get("discord_interaction_id")
+                or (event.metadata or {}).get("discord_interaction_id")
+                or getattr(existing, "_relay_durable_pending", False)
+                or getattr(event, "_relay_durable_pending", False)
+            ):
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return
+            defer_inbound(event)
             merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            event._gateway_accepted = True
+        else:
+            discard_inbound(event)
 
     async def _hm_busy_slash_or_photo(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -733,6 +747,9 @@ class GatewayInboundMixin:
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result
+        if getattr(event, "_relay_durable_pending", False):
+            self._queue_or_replace_pending_event(_quick_key, event)
+            return None
 
         effective_busy_input_mode = self._effective_busy_input_mode(source)
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
@@ -1305,6 +1322,7 @@ class GatewayInboundMixin:
             # thread metadata point at the message actually being answered.
             _rescued_source = getattr(_rescued, "source", None)
             source = _rescued_source if _rescued_source is not None else source
+            begin_inbound(_rescued)
             return _rescued, source, bool(getattr(_rescued, "internal", False))
         except Exception:
             logger.debug("FIFO orphan rescue pre-claim failed for %s", _quick_key, exc_info=True)
@@ -1373,7 +1391,10 @@ class GatewayInboundMixin:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
             return _limit_message
 
+        _incoming_event = event
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        _rescued_owner = getattr(event, "_inbound_owner", None)
+        _rescued_consumed = False
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1389,6 +1410,7 @@ class GatewayInboundMixin:
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                _rescued_consumed = True
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.
@@ -1407,6 +1429,8 @@ class GatewayInboundMixin:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            if event is not _incoming_event:
+                finish_inbound(event, consumed=_rescued_consumed, expected_owner=_rescued_owner)
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)

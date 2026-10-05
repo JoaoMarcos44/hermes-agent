@@ -529,6 +529,15 @@ class GatewayTurnMixin:
 
         _is_fresh_reset = getattr(session_entry, "is_fresh_reset", False)
         _agent_initialized = getattr(session_entry, "agent_turn_initialized", False)
+        if _agent_initialized is None:
+            # Old routing rows have no initialization bit. Only actual conversation rows,
+            # rather than a /status touch or session_meta marker, prove an existing turn.
+            _agent_initialized = await asyncio.to_thread(
+                self.session_store._has_initialized_agent_turn,
+                session_key, session_entry.session_id,
+            )
+            session_entry.agent_turn_initialized = _agent_initialized
+            await asyncio.to_thread(self.session_store._save_entry, session_key)
         # Use explicit initialization state rather than created_at == updated_at so read-only
         # introspection commands like /status do not consume the session:start hook (#130304).
         _is_new_session = not _agent_initialized or _was_auto_reset or _is_fresh_reset
@@ -536,7 +545,7 @@ class GatewayTurnMixin:
             session_entry.agent_turn_initialized = True
             if hasattr(self, "session_store") and hasattr(self.session_store, "_save"):
                 try:
-                    self.session_store._save()
+                    await asyncio.to_thread(self.session_store._save)
                 except Exception:
                     pass
         # Consume is_fresh_reset so it doesn't leak onto later messages in the same session.
@@ -2100,8 +2109,27 @@ class GatewayTurnMixin:
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
+        _owned_relay_resume = False
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
+            if getattr(event, "_relay_durable_replay", False):
+                from gateway.relay.durable_input import gateway_input_owner
+                if await self.async_session_store.has_input_owner(
+                    session_entry.session_id, gateway_input_owner(event),
+                ):
+                    # The authored input already reached the transcript before the crash. Continue
+                    # that turn through the existing recovery path rather than append it again.
+                    await self.async_session_store.mark_resume_pending(
+                        session_key, reason="restart_interrupted",
+                    )
+                    event.text = ""
+                    event.media_urls = []
+                    event.media_types = []
+                    event.media_text_inlined = []
+                    event.internal = True
+                    persist_user_display_kind = display_kind_for_event(event)
+                    title_user_message = None
+                    _owned_relay_resume = True
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
@@ -2117,16 +2145,22 @@ class GatewayTurnMixin:
         if _vc_note:
             turn_sidecar_notes.append(_vc_note)
 
-        # Auto-analyze user images so the model gets a description plus the local path.
-        message_text = await self._prepare_profile_scoped_inbound_message_text(
-            event=event, source=source, history=history, session_key=session_key,
-        )
-        if message_text is None:
-            return None, _session_env_tokens
+        if _owned_relay_resume:
+            # Sender/reply/channel decoration would turn the empty recovery wake into a NEW
+            # user message and tell the resume runner to skip the interrupted work.
+            self._consume_pending_native_image_paths(session_key)
+            message_text, persist_user_message, persist_user_timestamp = "", None, None
+        else:
+            # Auto-analyze user images so the model gets a description plus the local path.
+            message_text = await self._prepare_profile_scoped_inbound_message_text(
+                event=event, source=source, history=history, session_key=session_key,
+            )
+            if message_text is None:
+                return None, _session_env_tokens
 
-        message_text, persist_user_message, persist_user_timestamp = (
-            self._hmwa_apply_message_timestamp(event, message_text)
-        )
+            message_text, persist_user_message, persist_user_timestamp = (
+                self._hmwa_apply_message_timestamp(event, message_text)
+            )
 
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
@@ -2138,11 +2172,8 @@ class GatewayTurnMixin:
         self._bind_adapter_run_generation(self._delivery_adapter_for(source), session_key, run_generation)
         # Delivery IDs are only unique in their transport namespace. Keyless turns
         # need their own identity, even when another process writes to this session.
-        import uuid
-        namespace = [source.platform.value, source.profile, source.scope_id,
-                     source.chat_id, source.thread_id, str(event.message_id)]
-        owner = (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
-                 if event.message_id else str(uuid.uuid4()))
+        from gateway.relay.durable_input import gateway_input_owner
+        owner = gateway_input_owner(event)
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
@@ -3646,6 +3677,7 @@ class GatewayTurnMixin:
         from gateway.run import (
             _build_media_placeholder, _dequeue_pending_event, _is_control_interrupt_message
         )
+        from gateway.platforms.inbound_receipt import discard_inbound
         pending_event = None
         pending = None
         if result and adapter and session_key:
@@ -3692,6 +3724,8 @@ class GatewayTurnMixin:
                             "Discarding command '/%s' from pending queue — "
                             "commands must not be passed as agent input", _pending_cmd_word,
                         )
+                        if pending_event is not None:
+                            discard_inbound(pending_event)
                         pending_event = None
                         pending = None
 
@@ -3700,6 +3734,10 @@ class GatewayTurnMixin:
                 "Discarding pending follow-up for session %s during gateway %s",
                 session_key or "?", self._status_action_label(),
             )
+            if pending_event is not None:
+                discard_inbound(pending_event)
+            else:
+                self._discard_inbound_steers(session_key)
             pending_event = None
             pending = None
         return pending_event, pending
@@ -3783,8 +3821,25 @@ class GatewayTurnMixin:
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
+        """Consume the retained event or release its receipt when preparation cannot complete."""
+        from gateway.platforms.inbound_receipt import begin_inbound, finish_inbound
+        owner = begin_inbound(pending_event) if pending_event is not None else None
+        try:
+            return await self._run_agent_queued_followup_impl(
+                turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                _receipt_owner=owner,
+            )
+        except BaseException:
+            if pending_event is not None:
+                finish_inbound(pending_event, consumed=False, expected_owner=owner)
+            raise
+
+    async def _run_agent_queued_followup_impl(
+        self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
+        response: Any, result: Any, stream_task: Any, *, _receipt_owner: Any,
+    ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
+        from gateway.platforms.inbound_receipt import discard_inbound, finish_inbound
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -3807,10 +3862,13 @@ class GatewayTurnMixin:
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
-            elif adapter and hasattr(adapter, 'queue_message'):
-                adapter.queue_message(session_key, pending)
+            if pending_event is not None:
+                if adapter:
+                    self._queue_or_replace_pending_event(session_key, pending_event)
+                else:
+                    discard_inbound(pending_event)
+            else:
+                self._requeue_inbound_steers(session_key, pending, source)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
@@ -3837,6 +3895,7 @@ class GatewayTurnMixin:
                     "Discarding stale goal continuation for session %s — goal is no longer active",
                     session_key or "?",
                 )
+                discard_inbound(pending_event)
                 return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
@@ -3851,6 +3910,7 @@ class GatewayTurnMixin:
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
             if next_message is None:
+                discard_inbound(pending_event)
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
@@ -3899,6 +3959,7 @@ class GatewayTurnMixin:
         # Resolve the adapter from the follow-up's OWN source — a multiplexed gateway can route it to a
         # different profile's adapter, and only that instance holds the per-message reaction state.
         from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
+        from gateway.relay.durable_input import gateway_input_owner
         _hook_adapter = self._intake_adapter_for(next_source) if pending_event is not None else None
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
@@ -3916,16 +3977,25 @@ class GatewayTurnMixin:
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
+                    **({"gateway_input_owner": gateway_input_owner(pending_event)}
+                       if pending_event is not None and getattr(pending_event, "_relay_durable_pending", False)
+                       else {}),
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:
+            if pending_event is not None:
+                finish_inbound(pending_event, consumed=False, expected_owner=_receipt_owner)
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
             raise
         except BaseException:
+            if pending_event is not None:
+                finish_inbound(pending_event, consumed=False, expected_owner=_receipt_owner)
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.FAILURE)
             raise
+        if pending_event is not None:
+            finish_inbound(pending_event, consumed=True, expected_owner=_receipt_owner)
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)

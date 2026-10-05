@@ -5,6 +5,8 @@ cases run BasePlatformAdapter.handle_message with model execution replaced by a 
 Busy-handler fixtures retain real pending work and publish the handler's admission receipt.
 
 handle_message returns after scheduling or retaining work, not after the model turn completes.
+RAM custody suppresses concurrent replay. A committed replay capsule can release the connector's
+buffer before consumption; successful consumption atomically replaces that capsule with a receipt.
 Cancellation cases therefore suspend inside the busy handler, not in the background model task.
 """
 
@@ -114,6 +116,7 @@ async def _release_all(adapter: BasePlatformAdapter, recorder: _Recorder) -> Non
     ``store.close_all_db_handles()`` runs after this: an uncancelled debounce flush or a still-
     running background turn would keep touching the (closing) DB.
     """
+    await adapter._stop_delivery_recovery()
     recorder.release.set()
     owned = [task for task in adapter._session_tasks.values() if task is not None]
     owned += [state.task for state in adapter._text_debounce_store().values() if state.task]
@@ -124,12 +127,34 @@ async def _release_all(adapter: BasePlatformAdapter, recorder: _Recorder) -> Non
     adapter._session_tasks.clear()
     adapter._background_tasks.clear()
     adapter._text_debounce.clear()
+    await adapter._cancel_delivery_settlements()
     for event in adapter._active_sessions.values():
         event.set()
     for result in results:
         # Cancellation is intentional cleanup; other task failures must still fail the test.
         if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
             raise result
+
+
+async def _await_settlements(adapter: BasePlatformAdapter) -> None:
+    """Wait only after the test has consumed or discarded every attached receipt."""
+    await asyncio.wait_for(asyncio.gather(*tuple(adapter._settlement_tasks)), 3)
+
+
+async def _consume_all(adapter: BasePlatformAdapter, recorder: _Recorder) -> None:
+    recorder.release.set()
+    await _await_settlements(adapter)
+
+
+def _pending_input(store, key, *, buffer_id, text):
+    """An ACKed delivery remains reconstructable until its handler consumes it."""
+    payload = store.get_relay_delivery_pending(key)
+    assert payload is not None
+    assert payload["buffer_id"] == buffer_id
+    assert payload["event"]["text"] == text
+    assert payload["input_owner"]
+    assert not store.is_relay_delivery_settled(key)
+    return payload
 
 
 # ── durability: the offload wrapper is positional-only on BOTH arms ────────────
@@ -230,20 +255,26 @@ async def test_cancelled_before_admission_is_retried_then_deduped(tmp_path):
 
     release.set()
     assert await asyncio.to_thread(finished.wait, 3)
-    recorder.release.set()
     await adapter._on_inbound(_text("m1"))
-    await asyncio.sleep(0)
+    await asyncio.wait_for(recorder.entered.wait(), 3)
 
     assert len(recorder.retained) == 1
+    assert key in adapter._retained_inbound
+    assert key not in adapter._seen_inbound
+    assert not store.is_relay_delivery_settled(key)
+    await _consume_all(adapter, recorder)
     assert key in adapter._seen_inbound
+    assert store.is_relay_delivery_settled(key)
     assert not adapter._inflight_inbound
+    await _release_all(adapter, recorder)
     store.close_all_db_handles()
 
 
 @pytest.mark.parametrize("retained", [False, True], ids=["not-retained", "retained"])
 @pytest.mark.parametrize("lane", ["normalized", "passthrough"], ids=["normalized", "passthrough"])
+@pytest.mark.parametrize("durable", [False, True], ids=["stage-refused", "capsule-committed"])
 @pytest.mark.asyncio
-async def test_cancelled_during_real_handoff_settles_from_receipt(tmp_path, lane, retained):
+async def test_cancelled_during_real_handoff_settles_from_receipt(tmp_path, monkeypatch, lane, retained, durable):
     """Cancel the inbound task WHILE the real handle_message is suspended.
 
     ``handle_message`` normally RETURNS after spawning the turn, so its ``await`` only stays open
@@ -251,16 +282,19 @@ async def test_cancelled_during_real_handoff_settles_from_receipt(tmp_path, lane
     awaited. That is the only way to hold the handoff open for real, and it is what makes the
     assertion below a cancellation instead of an already-finished task.
 
-    Retained work (the handler stores it) keeps the frame consumed on a cancelled handoff; work the
-    handler never kept must stay retryable so the connector still owns it.
+    Retained work suppresses concurrent duplicate admission. A committed capsule gives gateway
+    custody even when admission is cancelled; refused staging keeps connector custody instead.
     """
     store = SessionStore(tmp_path, _config())
     adapter, recorder = _live_adapter(store)
+    if not durable:
+        monkeypatch.setattr(store, "stage_relay_delivery", lambda key, payload: False)
 
     # Occupy the session with a real turn so the next frame takes the busy path.
     await adapter._on_inbound(_text("m0"))
     await asyncio.wait_for(recorder.entered.wait(), 3)
     recorder.entered.clear()
+    occupant_settlements = set(adapter._settlement_tasks)
 
     busy_entered = asyncio.Event()
     busy_release = asyncio.Event()
@@ -278,6 +312,7 @@ async def test_cancelled_during_real_handoff_settles_from_receipt(tmp_path, lane
     adapter.set_busy_session_handler(busy_handler)
 
     incoming = _text("m1")
+    incoming._relay_buffer_id = "buf-1"
     deliver = (
         adapter._on_inbound(incoming)
         if lane == "normalized"
@@ -298,10 +333,17 @@ async def test_cancelled_during_real_handoff_settles_from_receipt(tmp_path, lane
         if lane == "normalized" else "passthrough_buffer:buf-1"
     )
     assert not adapter._inflight_inbound
-    # Both lanes left the connector's buffer unacked at the cancel: only a completed settle acks.
-    assert adapter._transport.acked_buffer_ids == []
+    assert adapter._transport.acked_buffer_ids == (["buf-1"] if durable else [])
+    assert key not in adapter._seen_inbound
+    assert not store.is_relay_delivery_settled(key)
+    if durable:
+        payload = _pending_input(store, key, buffer_id="buf-1",
+                                 text=incoming.text if lane == "normalized" else "inspect")
+        assert payload["source"]["chat_id"] == incoming.source.chat_id
+    else:
+        assert store.get_relay_delivery_pending(key) is None
     if retained:
-        assert key in adapter._seen_inbound, "a retained frame must not be replayed after a cancel"
+        assert key in adapter._retained_inbound
         # The frame the lane actually handed off: for passthrough that is the event the connector's
         # interaction body built, not the normalized ``incoming`` used by the other lane.
         handed_off = incoming if lane == "normalized" else list(
@@ -309,26 +351,41 @@ async def test_cancelled_during_real_handoff_settles_from_receipt(tmp_path, lane
         )[-1]
         assert handed_off._gateway_accepted is True
     else:
-        assert key not in adapter._seen_inbound, "an unkept frame must stay retryable"
+        await asyncio.wait_for(asyncio.gather(*(
+            adapter._settlement_tasks - occupant_settlements
+        )), 3)
+        assert key not in adapter._retained_inbound, "an unkept frame must stay retryable"
 
     # The connector redelivers the SAME frame. A retained one is dropped as a replay (its text must
     # not appear twice); an unkept one is admitted again, so nothing the user sent is lost.
     busy_release.set()
     adapter.set_busy_session_handler(None)
     if lane == "normalized":
-        await adapter._on_inbound(_text("m1"))
+        retry = _text("m1")
+        retry._relay_buffer_id = "buf-1"
+        await adapter._on_inbound(retry)
     else:
         await adapter._on_passthrough(_interaction(), "buf-1")
-    await asyncio.sleep(0)
+    assert key in adapter._retained_inbound
+    assert key not in adapter._seen_inbound
+    assert not store.is_relay_delivery_settled(key)
+    assert adapter._transport.acked_buffer_ids == (["buf-1", "buf-1"] if durable else [])
+    if durable:
+        _pending_input(store, key, buffer_id="buf-1",
+                       text=incoming.text if lane == "normalized" else "inspect")
 
     if lane == "normalized":
         # The occupying turn is still held, so the redelivered frame takes the busy lane again.
         pending = " ".join(str(e.text or "") for e in adapter._pending_messages.values())
         assert pending.count("hello") == 1, ("duplicate or lost redelivery", pending)
         assert len(recorder.retained) == 1, "the redelivery must not start a second turn"
-    else:
-        assert adapter._transport.acked_buffer_ids == ["buf-1"]
-        assert key in adapter._seen_inbound
+    await _consume_all(adapter, recorder)
+    assert key in adapter._seen_inbound
+    assert store.is_relay_delivery_settled(key)
+    assert store.get_relay_delivery_pending(key) is None
+    assert adapter._transport.acked_buffer_ids == (
+        ["buf-1", "buf-1"] if durable else ["buf-1"]
+    )
 
     await _release_all(adapter, recorder)
     store.close_all_db_handles()
@@ -336,19 +393,24 @@ async def test_cancelled_during_real_handoff_settles_from_receipt(tmp_path, lane
 
 @pytest.mark.asyncio
 async def test_no_duplicate_after_real_admission(tmp_path):
-    """Once real admission retains the turn, the connector's replay is suppressed."""
+    """RAM admission suppresses duplicates without minting a durable consumption receipt."""
     store = SessionStore(tmp_path, _config())
     adapter, recorder = _live_adapter(store)
-    recorder.release.set()
+    await adapter._on_inbound(_text("m1"))
+    await asyncio.wait_for(recorder.entered.wait(), 3)
+    assert len(recorder.retained) == 1
+    key = adapter._inbound_dedupe_key(_text("m1"))
+    assert key in adapter._retained_inbound
+    assert key not in adapter._seen_inbound
+    assert not store.is_relay_delivery_settled(key)
 
     await adapter._on_inbound(_text("m1"))
-    await asyncio.sleep(0)
     assert len(recorder.retained) == 1
-    assert adapter._inbound_dedupe_key(_text("m1")) in adapter._seen_inbound
-
+    await _consume_all(adapter, recorder)
+    assert store.is_relay_delivery_settled(key)
     await adapter._on_inbound(_text("m1"))
-    await asyncio.sleep(0)
     assert len(recorder.retained) == 1
+    await _release_all(adapter, recorder)
     store.close_all_db_handles()
 
 
@@ -357,7 +419,7 @@ async def test_overlapping_duplicates_admit_once(tmp_path):
     """Two concurrent copies of one frame: exactly one becomes the admission owner.
 
     The overlap window is the pre-admission off-loop observation, not ``handle_message``: that
-    returns as soon as the turn is spawned, so a duplicate arriving after it already sees "seen".
+    returns as soon as the turn is spawned, so later duplicates see RAM custody until consumption.
     """
     store = SessionStore(tmp_path, _config())
     adapter, recorder = _live_adapter(store)
@@ -375,27 +437,38 @@ async def test_overlapping_duplicates_admit_once(tmp_path):
 
     first = asyncio.create_task(adapter._on_inbound(_text("m1")))
     assert await asyncio.to_thread(entered.wait, 3)
-    duplicate = asyncio.create_task(adapter._on_inbound(_text("m1")))
-    await asyncio.sleep(0)
+    duplicate_entered = asyncio.Event()
+
+    async def replay():
+        duplicate_entered.set()
+        await adapter._on_inbound(_text("m1"))
+
+    duplicate = asyncio.create_task(replay())
+    await duplicate_entered.wait()
     assert not duplicate.done()
 
     release.set()
-    recorder.release.set()
     await asyncio.gather(first, duplicate)
-    await asyncio.sleep(0)
+    await asyncio.wait_for(recorder.entered.wait(), 3)
 
     assert len(recorder.retained) == 1
     assert not adapter._inflight_inbound
+    key = adapter._inbound_dedupe_key(_text("m1"))
+    assert key in adapter._retained_inbound
+    assert key not in adapter._seen_inbound
+    await _consume_all(adapter, recorder)
+    assert store.is_relay_delivery_settled(key)
+    await _release_all(adapter, recorder)
     store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
 async def test_retained_busy_text_merge_marks_admission_receipt(tmp_path):
-    """TWO same-sender queue-mode followups: both merges retain, so both mint the receipt.
+    """TWO same-sender queue-mode followups preserve RAM custody for both merged inputs.
 
     The first frame only proves the new-buffer branch; every later same-sender followup takes the
-    existing-state MERGE branch. Without the receipt the relay cannot tell "buffered and kept"
-    from "refused" — a durable frame it wrongly treats as admitted is dropped from replay forever.
+    existing-state MERGE branch. Both publish admission while their consumption receipts remain
+    unsettled, so neither may be mistaken for work the handler has already completed.
     """
     store = SessionStore(tmp_path, _config())
     adapter, recorder = _live_adapter(store)
@@ -405,7 +478,6 @@ async def test_retained_busy_text_merge_marks_admission_receipt(tmp_path):
     await adapter._on_inbound(_text("m0"))
     await asyncio.wait_for(recorder.entered.wait(), 3)
     recorder.entered.clear()
-    await asyncio.sleep(0)
 
     followups = [
         _text("m1", text="first retained text"),
@@ -413,9 +485,11 @@ async def test_retained_busy_text_merge_marks_admission_receipt(tmp_path):
     ]
     for followup in followups:
         await adapter._on_inbound(followup)
-        await asyncio.sleep(0)
         assert followup._gateway_accepted is True, followup.message_id
-        assert adapter._inbound_dedupe_key(followup) in adapter._seen_inbound, followup.message_id
+        key = adapter._inbound_dedupe_key(followup)
+        assert key in adapter._retained_inbound, followup.message_id
+        assert key not in adapter._seen_inbound, followup.message_id
+        assert not store.is_relay_delivery_settled(key), followup.message_id
 
     # One real buffered merge holds both texts EXACTLY once: nothing swallowed, nothing duplicated.
     buffered = "\n".join(
@@ -429,27 +503,49 @@ async def test_retained_busy_text_merge_marks_admission_receipt(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_policy_drop_still_consumes_the_frame(tmp_path):
-    """A NORMAL return settles the claim even when nothing was retained.
-
-    The base adapter refuses an event whose profile route targets an unserved profile, leaving the
-    receipt False. Settling on normal return preserves the historical terminal-consumption contract
-    rather than re-admitting a frame the gateway already decided on.
-    """
+async def test_policy_drop_preserves_the_replay_capsule(tmp_path, monkeypatch):
+    """An unserved route remains recoverable after durable staging releases the connector."""
     store = SessionStore(tmp_path, _config())
     adapter, recorder = _live_adapter(store)
     rejected = _text("m1")
     rejected.source.profile = "ghost-profile"
     # No gateway_runner seam: the adapter cannot resolve the route, and marks it rejected.
     rejected.source.profile_route_rejected = True
+    rejected._relay_buffer_id = "buffer-rejected"
 
-    await adapter._on_inbound(rejected)
-    await asyncio.sleep(0)
+    assert await adapter._on_inbound(rejected) is False
+    await _await_settlements(adapter)
 
     assert recorder.retained == []
     key = adapter._inbound_dedupe_key(rejected)
-    assert key in adapter._seen_inbound
+    assert key not in adapter._seen_inbound
+    assert key not in adapter._retained_inbound
+    assert not store.is_relay_delivery_settled(key)
+    assert adapter._transport.acked_buffer_ids == ["buffer-rejected"]
+    payload = _pending_input(store, key, buffer_id="buffer-rejected", text=rejected.text)
+    assert payload["source"]["profile"] == rejected.source.profile
     assert not adapter._inflight_inbound
+    # Model the isolated route-policy seam recognizing the original profile after it is served.
+    original_gate = adapter._drop_unresolved
+
+    def served_profile(event):
+        event.source.profile_route_rejected = False
+        return original_gate(event)
+
+    monkeypatch.setattr(adapter, "_drop_unresolved", served_profile)
+    retry = _text("m1")
+    retry._relay_buffer_id = "buffer-rejected"
+    await adapter._on_inbound(retry)
+    await asyncio.wait_for(recorder.entered.wait(), 3)
+    assert len(recorder.retained) == 1
+    assert recorder.retained[0].source.profile == rejected.source.profile
+    assert adapter._transport.acked_buffer_ids == ["buffer-rejected", "buffer-rejected"]
+    _pending_input(store, key, buffer_id="buffer-rejected", text=rejected.text)
+    await _consume_all(adapter, recorder)
+    assert store.is_relay_delivery_settled(key)
+    assert store.get_relay_delivery_pending(key) is None
+    assert adapter._transport.acked_buffer_ids == ["buffer-rejected", "buffer-rejected"]
+    await _release_all(adapter, recorder)
     store.close_all_db_handles()
 
 
@@ -483,15 +579,24 @@ async def test_passthrough_cancelled_before_admission_acks_and_retries(tmp_path)
     assert key not in adapter._seen_inbound
     assert key not in adapter._inflight_inbound
     assert adapter._transport.acked_buffer_ids == []
+    assert store.get_relay_delivery_pending(key) is None
 
     release.set()
     adapter._discord_context_for = original
-    recorder.release.set()
     await adapter._on_passthrough(_interaction(), "buf-1")
-    await asyncio.sleep(0)
+    await asyncio.wait_for(recorder.entered.wait(), 3)
 
     assert len(recorder.retained) == 1
+    assert key in adapter._retained_inbound
+    assert key not in adapter._seen_inbound
+    _pending_input(store, key, buffer_id="buf-1", text="inspect")
+    assert adapter._transport.acked_buffer_ids == ["buf-1"]
+    await _consume_all(adapter, recorder)
     assert key in adapter._seen_inbound
+    assert store.is_relay_delivery_settled(key)
+    assert store.get_relay_delivery_pending(key) is None
+    assert adapter._transport.acked_buffer_ids == ["buf-1"]
+    await _release_all(adapter, recorder)
     store.close_all_db_handles()
 
 
@@ -505,19 +610,23 @@ async def test_passthrough_distinct_buffers_each_admit(tmp_path):
     """
     store = SessionStore(tmp_path, _config())
     adapter, recorder = _live_adapter(store)
-    recorder.release.set()
-
     await adapter._on_passthrough(
         _interaction(interaction_id="press-a", custom_id="inspect-a"), "buf-a",
     )
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(recorder.entered.wait(), 3)
     await adapter._on_passthrough(
         _interaction(interaction_id="press-b", custom_id="inspect-b"), "buf-b",
     )
-    await asyncio.sleep(0.05)
 
-    assert "passthrough_buffer:buf-a" in adapter._seen_inbound
-    assert "passthrough_buffer:buf-b" in adapter._seen_inbound
+    for key in ("passthrough_buffer:buf-a", "passthrough_buffer:buf-b"):
+        assert key in adapter._retained_inbound
+        assert key not in adapter._seen_inbound
+        assert not store.is_relay_delivery_settled(key)
+    for suffix in ("a", "b"):
+        payload = _pending_input(store, f"passthrough_buffer:buf-{suffix}",
+                                 buffer_id=f"buf-{suffix}", text=f"inspect-{suffix}")
+        assert payload["event"]["metadata"]["discord_interaction_id"] == f"press-{suffix}"
+    assert adapter._transport.acked_buffer_ids == ["buf-a", "buf-b"]
     assert not adapter._inflight_inbound
     # "Admitted" means RETAINED, not necessarily run now: the first press spawned a turn and the
     # second is parked as pending follow-up work. Both texts must survive somewhere real.
@@ -527,12 +636,21 @@ async def test_passthrough_distinct_buffers_each_admit(tmp_path):
     )
     assert "inspect-a" in settled + pending
     assert "inspect-b" in settled + pending
+    await _consume_all(adapter, recorder)
+    consumed = " ".join(str(event.text or "") for event in recorder.retained)
+    assert consumed.count("inspect-a") == 1
+    assert consumed.count("inspect-b") == 1
+    assert sorted(adapter._transport.acked_buffer_ids) == ["buf-a", "buf-b"]
+    for key in ("passthrough_buffer:buf-a", "passthrough_buffer:buf-b"):
+        assert store.is_relay_delivery_settled(key)
+        assert store.get_relay_delivery_pending(key) is None
+    await _release_all(adapter, recorder)
     store.close_all_db_handles()
 
 
 @pytest.mark.asyncio
 async def test_passthrough_overlapping_duplicates_admit_once(tmp_path):
-    """Two concurrent copies of ONE buffer: exactly one admission, and both copies are acked."""
+    """Concurrent copies share a replay capsule; ACK does not imply completed consumption."""
     store = SessionStore(tmp_path, _config())
     adapter, recorder = _live_adapter(store)
     stub = adapter._transport
@@ -550,18 +668,34 @@ async def test_passthrough_overlapping_duplicates_admit_once(tmp_path):
 
     first = asyncio.create_task(adapter._on_passthrough(_interaction(), "buf-x"))
     await asyncio.wait_for(entered.wait(), 3)
-    duplicate = asyncio.create_task(adapter._on_passthrough(_interaction(), "buf-x"))
-    await asyncio.sleep(0)
+    duplicate_entered = asyncio.Event()
+
+    async def replay():
+        duplicate_entered.set()
+        await adapter._on_passthrough(_interaction(), "buf-x")
+
+    duplicate = asyncio.create_task(replay())
+    await duplicate_entered.wait()
     assert not duplicate.done()
 
     release.set()
-    recorder.release.set()
     await asyncio.gather(first, duplicate)
-    await asyncio.sleep(0)
+    await asyncio.wait_for(recorder.entered.wait(), 3)
 
     assert len(recorder.retained) == 1
+    _pending_input(store, "passthrough_buffer:buf-x", buffer_id="buf-x", text="inspect")
     assert stub.acked_buffer_ids == ["buf-x", "buf-x"]
+    assert "passthrough_buffer:buf-x" in adapter._retained_inbound
+    assert "passthrough_buffer:buf-x" not in adapter._seen_inbound
+    await _consume_all(adapter, recorder)
+    assert store.is_relay_delivery_settled("passthrough_buffer:buf-x")
+    assert store.get_relay_delivery_pending("passthrough_buffer:buf-x") is None
+    assert stub.acked_buffer_ids == ["buf-x", "buf-x"]
+    await adapter._on_passthrough(_interaction(), "buf-x")
+    assert stub.acked_buffer_ids == ["buf-x", "buf-x", "buf-x"]
+    assert len(recorder.retained) == 1
     assert not adapter._inflight_inbound
+    await _release_all(adapter, recorder)
     store.close_all_db_handles()
 
 
@@ -575,11 +709,12 @@ async def test_inbound_dedupe_persists_settlement_across_reopen(tmp_path):
 
     event = _text("msg-dedupe-reopen", text="hello")
     await adapter1._on_inbound(event)
-    await asyncio.sleep(0.01)
+    await _await_settlements(adapter1)
 
     dedupe_key = adapter1._inbound_dedupe_key(event)
     assert dedupe_key is not None
     assert store1.is_relay_delivery_settled(dedupe_key)
+    await _release_all(adapter1, recorder1)
     store1.close_all_db_handles()
 
     store2 = SessionStore(tmp_path, cfg)
@@ -588,9 +723,9 @@ async def test_inbound_dedupe_persists_settlement_across_reopen(tmp_path):
 
     dup_event = _text("msg-dedupe-reopen", text="hello")
     await adapter2._on_inbound(dup_event)
-    await asyncio.sleep(0.01)
 
     assert len(recorder2.retained) == 0
+    await _release_all(adapter2, recorder2)
     store2.close_all_db_handles()
 
 
@@ -712,10 +847,12 @@ async def test_cancelled_inline_reply_does_not_replay_completed_command(tmp_path
         release.set()
         await asyncio.wait_for(adapter._on_inbound(inline), 3)
         assert len(completed) == 1, f"Expected 1 completion, got {len(completed)}"
+        await _await_settlements(adapter)
+        assert store.is_relay_delivery_settled(adapter._inbound_dedupe_key(inline))
     finally:
         release.set()
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        occupant.release.set()
+        await _release_all(adapter, occupant)
         store.close_all_db_handles()

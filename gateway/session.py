@@ -541,7 +541,8 @@ class SessionEntry:
     prompt_pin: Optional[Dict[str, Any]] = None
     # Track whether an actual agent turn has initialized this session.
     # Prevents read-only commands like /status from consuming the session:start hook.
-    agent_turn_initialized: bool = False
+    # None is a pre-field routing row awaiting transcript-backed initialization migration.
+    agent_turn_initialized: Optional[bool] = False
     # Trusted transport provenance: persisted separately from wire SessionSource to survive reload.
     delivered_via_relay: bool = False
 
@@ -609,7 +610,12 @@ class SessionEntry:
 
         defaults = {f.name: f.default for f in fields(cls)}
         plain = {n: data.get(n, defaults[n]) for n in cls._PLAIN_FIELDS + cls._RESET_FIELDS}
+        if "agent_turn_initialized" not in data:
+            plain["agent_turn_initialized"] = None
         plain["expiry_finalized"] = data.get("expiry_finalized", data.get("memory_flushed", False))
+        if origin is not None and plain["delivered_via_relay"] is True:
+            # Only the trusted routing entry can restore transport provenance; wire sources cannot.
+            origin.delivered_via_upstream_relay = True
         transport_profile = data.get("transport_profile")
         return cls(
             session_key=session_key, session_id=session_id,
