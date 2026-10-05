@@ -1350,7 +1350,8 @@ class RelayAdapter(BasePlatformAdapter):
         meta: Dict[str, Any] = dict(metadata or {})
         # ``getattr``: relay tests build bare adapters via ``__new__`` without ``__init__``.
         for key, cache in (
-            ("scope_id", self._scope_by_chat), ("user_id", self._dm_user_by_chat),
+            ("scope_id", getattr(self, "_scope_by_chat", {})),
+            ("user_id", getattr(self, "_dm_user_by_chat", {})),
             ("profile", getattr(self, "_profile_by_chat", {})),
         ):
             if not meta.get(key):

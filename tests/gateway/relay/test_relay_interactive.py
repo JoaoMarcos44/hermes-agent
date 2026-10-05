@@ -506,3 +506,10 @@ def test_minted_prompt_ids_are_instance_scoped_and_callback_safe():
     # A legacy id minted before the nonce existed (no "." segment) is still
     # treated as ours, so a prompt in flight across an upgrade resolves.
     assert a._minted_here("a1b2c3d4") is True
+
+
+def test_bare_adapter_with_scope_does_not_raise():
+    bare = RelayAdapter.__new__(RelayAdapter)
+    assert bare._with_scope("c1", None) == {}
+    assert bare._with_scope("c1", {"existing": 1}) == {"existing": 1}
+
