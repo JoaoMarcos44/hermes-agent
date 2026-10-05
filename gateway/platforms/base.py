@@ -1779,6 +1779,20 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         if incoming_has_media:
             existing.media_text_inlined = _padded_inline_flags(existing)
             incoming_inline_flags = _padded_inline_flags(event)
+        def _absorb_envelope(target: MessageEvent, incoming: MessageEvent) -> None:
+            latest_message_id = getattr(incoming, "message_id", None)
+            latest_anchor = latest_message_id or getattr(incoming, "reply_to_message_id", None)
+            if latest_message_id is not None:
+                target.message_id = str(latest_message_id)
+            if latest_anchor is not None and hasattr(target, "reply_to_message_id"):
+                target.reply_to_message_id = str(latest_anchor)
+            if getattr(incoming, "metadata", None) and isinstance(incoming.metadata, dict):
+                target_meta = getattr(target, "metadata", None)
+                target.metadata = {**(target_meta if isinstance(target_meta, dict) else {}), **incoming.metadata}
+            if getattr(incoming, "source", None) is not None and getattr(target, "source", None) is not None:
+                if getattr(incoming.source, "message_id", None) is not None:
+                    target.source.message_id = incoming.source.message_id
+
         # A photo burst always absorbs; otherwise merge only when media is involved on either
         # side. Captions merge in every absorbing case.
         if both_photo or existing.media_urls or incoming_has_media:
@@ -1789,6 +1803,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             existing.absorb_reply_expected(event)
+            _absorb_envelope(existing, event)
             if existing_is_photo or incoming_is_photo:
                 existing.message_type = MessageType.PHOTO
             elif existing_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
@@ -1804,6 +1819,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
+            _absorb_envelope(existing, event)
             return
     pending_messages[session_key] = event
 

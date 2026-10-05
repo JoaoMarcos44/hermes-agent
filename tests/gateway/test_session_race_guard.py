@@ -152,6 +152,35 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.media_types == ["image/png"]
 
 
+def test_merge_pending_message_event_absorbs_latest_envelope_and_metadata():
+    pending = {}
+    source1 = SessionSource(platform=Platform.DISCORD, chat_id="c1", message_id="m1")
+    event1 = MessageEvent(
+        text="part 1",
+        message_type=MessageType.TEXT,
+        source=source1,
+        message_id="m1",
+        metadata={"k1": "v1"},
+    )
+    source2 = SessionSource(platform=Platform.DISCORD, chat_id="c1", message_id="m2")
+    event2 = MessageEvent(
+        text="part 2",
+        message_type=MessageType.TEXT,
+        source=source2,
+        message_id="m2",
+        metadata={"k2": "v2"},
+    )
+    merge_pending_message_event(pending, "s1", event1, merge_text=True)
+    merge_pending_message_event(pending, "s1", event2, merge_text=True)
+
+    merged = pending["s1"]
+    assert merged.text == "part 1\npart 2"
+    assert merged.message_id == "m2"
+    assert merged.source.message_id == "m2"
+    assert merged.metadata == {"k1": "v1", "k2": "v2"}
+
+
+
 @pytest.mark.asyncio
 async def test_recent_telegram_followups_append_in_pending_queue():
     runner = _make_runner()
