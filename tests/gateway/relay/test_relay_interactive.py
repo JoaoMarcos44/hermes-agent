@@ -227,6 +227,48 @@ def test_discord_component_interaction_decodes_prompt_token():
     assert event.message_type == MessageType.COMMAND
 
 
+def test_discord_select_interaction_retains_values_and_decodes_prompt():
+    adapter, _stub = _adapter()
+
+    class ForwardSelect:
+        platform = "discord"
+        method = "POST"
+        path = "/interactions/bot1"
+        body = (
+            b'{"type": 3, "id": "i1", "channel_id": "ch1", "guild_id": "g1",'
+            b' "message": {"id": "pm55"},'
+            b' "member": {"user": {"id": "u1", "username": "ben"}},'
+            b' "data": {"custom_id": "menu1", "values": ["opt1", "opt2"]}}'
+        )
+
+    event = adapter._discord_interaction_to_event(ForwardSelect())
+    assert event is not None
+    assert event.text == "menu1 opt1 opt2"
+    assert event.metadata.get("discord_component_values") == ["opt1", "opt2"]
+
+    class ForwardPromptSelect:
+        platform = "discord"
+        method = "POST"
+        path = "/interactions/bot1"
+        body = (
+            b'{"type": 3, "id": "i2", "channel_id": "ch1", "guild_id": "g1",'
+            b' "message": {"id": "pm55"},'
+            b' "member": {"user": {"id": "u1", "username": "ben"}},'
+            b' "data": {"custom_id": "menu_prompt", "values": ["hp1:a1b2c3d4:approve"]}}'
+        )
+
+    event2 = adapter._discord_interaction_to_event(ForwardPromptSelect())
+    assert event2 is not None
+    assert event2.prompt_response == {
+        "prompt_id": "a1b2c3d4",
+        "option_id": "approve",
+        "prompt_message_id": "pm55",
+    }
+    assert event2.text == "/approve"
+    assert event2.message_type == MessageType.COMMAND
+
+
+
 # ── react ack lifecycle ──────────────────────────────────────────────────
 
 

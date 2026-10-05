@@ -1479,7 +1479,17 @@ class RelayAdapter(BasePlatformAdapter):
                 text = " ".join(parts).strip()
                 message_type = MessageType.COMMAND
         elif itype == 3:
-            text = str(data.get("custom_id") or "")
+            custom_id = str(data.get("custom_id") or "")
+            raw_values = data.get("values")
+            component_values = (
+                [str(v) for v in raw_values if v is not None]
+                if isinstance(raw_values, list)
+                else []
+            )
+            if component_values:
+                text = f"{custom_id} {' '.join(component_values)}".strip()
+            else:
+                text = custom_id
         elif itype == 5:
             modal_fields = self._discord_modal_fields(data.get("components"))
             text = "\n".join(
@@ -1545,7 +1555,9 @@ class RelayAdapter(BasePlatformAdapter):
             profile=getattr(forward, "profile", None),
         )
         metadata = {"discord_interaction_id": interaction_id} if interaction_id else {}
-        if itype == 5:
+        if itype == 3 and component_values:
+            metadata["discord_component_values"] = component_values
+        elif itype == 5:
             # Preserve exact submitted identity/value pairs separately from the human-readable
             # text rendering. Empty optional values are meaningful and must not disappear.
             metadata["discord_modal_fields"] = modal_fields
@@ -1563,10 +1575,15 @@ class RelayAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
         if itype == 3:
-            # A component press whose custom_id is a Hermes prompt token
+            # A component press whose custom_id or selected option is a Hermes prompt token
             # (hp1:<prompt_id>:<option_id>) becomes a STRUCTURED prompt answer;
             # foreign custom_ids keep the best-effort TEXT shape.
-            decoded = self._decode_prompt_token(text)
+            decoded = self._decode_prompt_token(str(data.get("custom_id") or ""))
+            if not decoded and component_values:
+                for v in component_values:
+                    decoded = self._decode_prompt_token(v)
+                    if decoded:
+                        break
             if decoded:
                 prompt_id, option_id = decoded
                 prompt_message_id = actual_message_id
