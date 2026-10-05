@@ -3841,11 +3841,9 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                # ``pending_event`` is already ACCEPTED work (the drain popped it out of a queued
-                # slot), so it must reach the queue unmerged. Merging it into the staged occupant
-                # would either destroy that occupant or run this turn under a differing prompt
-                # identity (#126167). The FIFO has no cap on accepted work, so admission here
-                # cannot discard the event the way the fresh-input cap does.
+                # ``pending_event`` is already ACCEPTED work (drain-popped), so it must reach the
+                # queue unmerged — merging would destroy the staged occupant or run this turn under a
+                # differing prompt identity (#126167). The FIFO has no cap on accepted work.
                 from gateway.platforms.base import prompt_identity_conflict
                 occupant = adapter._pending_messages.get(session_key)
                 if prompt_identity_conflict(occupant, pending_event):
@@ -3927,26 +3925,17 @@ class GatewayTurnMixin:
             with suppress(Exception):
                 await _clear_adapter.send_typing(source.chat_id, metadata=_status_thread_metadata)
 
-        # Re-baseline the cached agent's message_count before recursing, else the coherence guard
-        # rebuilds on OUR OWN flushed rows (the outer handler re-baselines only after the chain).
-        # Re-baseline the cached agent's message_count snapshot before recursing into the in-band queued
-        # (/queue) follow-up turn. The first turn has completed and flushed its own user + assistant rows to
-        # the SessionDB, so the cross-process coherence guard (#45966) — which this recursive _run_agent
-        # call re-enters — would otherwise see the grown on-disk count against the stale build-time snapshot
-        # and rebuild the agent on THIS process's OWN writes, destroying the prompt-cache prefix #46237 was
-        # merged to preserve. The existing re-baseline in _handle_message_with_agent only runs after the
-        # whole _run_agent chain unwinds — too late for the in-band follow-up. Use the same (session_key,
-        # session_id) the recursive call runs under so the snapshot matches exactly what the follow-up's
-        # guard will consult. Fail-safe in helper.
+        # Re-baseline the cached agent's message_count before recursing into the in-band queued
+        # follow-up: the cross-process coherence guard (#45966) would otherwise see this turn's own
+        # flushed rows against the stale build-time snapshot and rebuild the agent, destroying the
+        # prompt-cache prefix (#46237). The outer handler re-baselines only after the chain unwinds.
         # Acknowledge the follow-up the way an idle-session message is: this in-band drain is the only
-        # place a queued/interrupting message ever runs, so base.py's hook site is never entered for it.
-        # Resolve the adapter from the follow-up's OWN source — a multiplexed gateway can route it to a
-        # different profile's adapter, and only that instance holds the per-message reaction state.
+        # place a queued/interrupting message ever runs. Resolve the adapter from the follow-up's OWN
+        # source — a multiplexed gateway can route it to a different profile's adapter.
         from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
         _hook_adapter = self._intake_adapter_for(next_source) if pending_event is not None else None
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
-        # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
-        # (the helper's own ``except Exception`` does not catch cancellation).
+        # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker.
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
