@@ -386,6 +386,8 @@ class GatewayAuthorizationMixin:
         source = getattr(entry, "origin", None)
         if source is None:
             return None
+        if getattr(entry, "delivered_via_relay", False):
+            source.delivered_via_upstream_relay = True
         from gateway.session_identity import restore_identity
         restore_identity(source, runner=self, transport_profile=getattr(entry, "transport_profile", None))
         return source

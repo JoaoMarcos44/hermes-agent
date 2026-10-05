@@ -510,11 +510,11 @@ async def test_passthrough_distinct_buffers_each_admit(tmp_path):
     await adapter._on_passthrough(
         _interaction(interaction_id="press-a", custom_id="inspect-a"), "buf-a",
     )
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
     await adapter._on_passthrough(
         _interaction(interaction_id="press-b", custom_id="inspect-b"), "buf-b",
     )
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
 
     assert "passthrough_buffer:buf-a" in adapter._seen_inbound
     assert "passthrough_buffer:buf-b" in adapter._seen_inbound
@@ -563,3 +563,159 @@ async def test_passthrough_overlapping_duplicates_admit_once(tmp_path):
     assert stub.acked_buffer_ids == ["buf-x", "buf-x"]
     assert not adapter._inflight_inbound
     store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_inbound_dedupe_persists_settlement_across_reopen(tmp_path):
+    """Inbound relay delivery settlement is durably persisted across SessionStore reopen."""
+    cfg = _config()
+    store1 = SessionStore(tmp_path, cfg)
+    adapter1, recorder1 = _live_adapter(store1)
+    recorder1.release.set()
+
+    event = _text("msg-dedupe-reopen", text="hello")
+    await adapter1._on_inbound(event)
+    await asyncio.sleep(0.01)
+
+    dedupe_key = adapter1._inbound_dedupe_key(event)
+    assert dedupe_key is not None
+    assert store1.is_relay_delivery_settled(dedupe_key)
+    store1.close_all_db_handles()
+
+    store2 = SessionStore(tmp_path, cfg)
+    adapter2, recorder2 = _live_adapter(store2)
+    recorder2.release.set()
+
+    dup_event = _text("msg-dedupe-reopen", text="hello")
+    await adapter2._on_inbound(dup_event)
+    await asyncio.sleep(0.01)
+
+    assert len(recorder2.retained) == 0
+    store2.close_all_db_handles()
+
+
+def test_restored_relay_delivery_ownership_after_reopen(tmp_path):
+    """Restored session source preserves delivered_via_upstream_relay and routes to RelayAdapter."""
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    cfg = _config()
+    store1 = SessionStore(tmp_path, cfg)
+    adapter, _ = _live_adapter(store1)
+    runner = GatewayRunner(cfg)
+    runner.adapters = {Platform.RELAY: adapter}
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="c1", user_id="u1", delivered_via_upstream_relay=True)
+    entry = store1.get_or_create_session(src)
+    assert getattr(entry, "delivered_via_relay", False) is True
+    store1.close_all_db_handles()
+
+    store2 = SessionStore(tmp_path, cfg)
+    restored_entry = store2.get_or_create_session(src)
+    restored_src = runner._restored_source(restored_entry)
+    assert restored_src.delivered_via_upstream_relay is True
+    assert runner._delivery_adapter_for(restored_src) is adapter
+    store2.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_text_debounce_merging_preserves_interaction_identity(tmp_path):
+    """Merging text debounce events preserves discord_interaction_id discriminator and anchor."""
+    cfg = _config()
+    store = SessionStore(tmp_path, cfg)
+    adapter, _ = _live_adapter(store)
+    adapter._busy_text_mode = "queue"
+    adapter._busy_text_debounce_seconds = 10.0
+
+    press1 = _text("press-1", text="first press")
+    press1.metadata = {"discord_interaction_id": "press-1"}
+    press1.reply_to_message_id = "bot-1"
+
+    press2 = _text("press-2", text="second press")
+    press2.metadata = {"discord_interaction_id": "press-2"}
+    press2.reply_to_message_id = "bot-2"
+
+    key = adapter._event_session_key(press1)
+    await adapter._queue_text_debounce(key, press1)
+    await adapter._queue_text_debounce(key, press2)
+
+    state = adapter._text_debounce_store().get(key)
+    assert state is not None
+    assert state.event.metadata.get("discord_interaction_id") == "press-2"
+    assert state.event.reply_to_message_id == "bot-2"
+    assert state.event.text == "second press"
+    adapter._discard_text_debounce(key)
+    store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_first_turn_lifecycle_after_status_command(tmp_path):
+    """Executing /status sets agent_turn_initialized=False so the first real turn emits session:start."""
+    from unittest.mock import AsyncMock
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    cfg = _config()
+    runner = GatewayRunner(cfg)
+    runner.session_store = SessionStore(tmp_path, cfg)
+    runner.hooks.emit = AsyncMock()
+
+    src = SessionSource(platform=Platform.DISCORD, chat_id="c1", user_id="u1")
+    event = MessageEvent(text="/status", source=src, message_id="m-status")
+    await runner._handle_status_command(event)
+
+    entry = await runner.async_session_store.get_or_create_session(src)
+    assert getattr(entry, "agent_turn_initialized", False) is False
+
+    _, is_new = await runner._hmwa_open_session(entry, entry.session_key, src)
+    assert is_new is True
+    assert runner.hooks.emit.await_count == 1
+    runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_inline_reply_does_not_replay_completed_command(tmp_path):
+    """Cancelling a bypass command while sending its reply suppresses replaying the completed command."""
+    from gateway.platforms.base import SendResult
+    cfg = _config()
+    store = SessionStore(tmp_path, cfg)
+    adapter, occupant = _live_adapter(store)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = []
+
+    async def handler(event):
+        completed.append(event.message_id)
+        return "handled"
+
+    async def send_reply(**kwargs):
+        if len(completed) == 1 and not release.is_set():
+            entered.set()
+            await release.wait()
+        return SendResult(success=True, message_id="reply-1")
+
+    occ = _text("occupant-cancel", text="busy occupant")
+    inline = _text("inline-cancel", text="/new")
+
+    task = None
+    try:
+        await adapter._on_inbound(occ)
+        await asyncio.wait_for(occupant.entered.wait(), 3)
+        adapter.set_message_handler(handler)
+        adapter._send_with_retry = send_reply
+        task = asyncio.create_task(adapter._on_inbound(inline))
+        await asyncio.wait_for(entered.wait(), 3)
+        assert not task.done()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        release.set()
+        await asyncio.wait_for(adapter._on_inbound(inline), 3)
+        assert len(completed) == 1, f"Expected 1 completion, got {len(completed)}"
+    finally:
+        release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        occupant.release.set()
+        store.close_all_db_handles()

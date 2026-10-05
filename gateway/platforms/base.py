@@ -3564,6 +3564,7 @@ class BasePlatformAdapter(ABC):
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
+        event._gateway_accepted = True
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
             return
@@ -3783,7 +3784,7 @@ class BasePlatformAdapter(ABC):
         return result
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
+        """Return True when two text debounce events came from the same sender and have compatible identity shapes."""
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -3797,7 +3798,20 @@ class BasePlatformAdapter(ABC):
                 return (platform, "dm", str(source.chat_id))
             return None
         existing_sender = _identity(existing)
-        return existing_sender is not None and existing_sender == _identity(event)
+        if existing_sender is None or existing_sender != _identity(event):
+            return False
+
+        # Incompatible identity shapes must not merge:
+        # A forwarded Discord interaction has a distinct action ID and attached message anchor that cannot
+        # merge with ordinary text or another distinct interaction action.
+        existing_meta = getattr(existing, "metadata", None) or {}
+        incoming_meta = getattr(event, "metadata", None) or {}
+        existing_is_interaction = bool(isinstance(existing_meta, dict) and existing_meta.get("discord_interaction_id"))
+        incoming_is_interaction = bool(isinstance(incoming_meta, dict) and incoming_meta.get("discord_interaction_id"))
+        if existing_is_interaction or incoming_is_interaction:
+            return False
+
+        return True
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""
@@ -3838,6 +3852,13 @@ class BasePlatformAdapter(ABC):
                 state.event.message_id = str(latest_message_id)
             if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
                 state.event.reply_to_message_id = str(latest_anchor)
+            if getattr(event, "metadata", None) and isinstance(event.metadata, dict):
+                if not getattr(state.event, "metadata", None) or not isinstance(state.event.metadata, dict):
+                    state.event.metadata = {}
+                state.event.metadata.update(event.metadata)
+            if getattr(event, "source", None) is not None and getattr(state.event, "source", None) is not None:
+                if getattr(event.source, "message_id", None) is not None:
+                    state.event.source.message_id = event.source.message_id
             state.last_ts = now
         # Both a new buffer and an existing-buffer merge retain this event.
         event._gateway_accepted = True
@@ -3984,20 +4005,36 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
+        consumed = False
         try:
-            # Send BEFORE cancelling so cancellation side effects can't drop the "/new"
-            # confirmation.
-            await self._dispatch_inline_reply(event, log_cmd=cmd)
-            await self.cancel_session_processing(session_key, release_guard=False, discard_pending=False)
+            try:
+                # Send BEFORE cancelling so cancellation side effects can't drop the "/new"
+                # confirmation.
+                await self._dispatch_inline_reply(event, log_cmd=cmd)
+            finally:
+                consumed = bool(getattr(event, "_gateway_accepted", False))
+                if consumed:
+                    # The reset/stop command was consumed by the handler; finish owned cleanup even if
+                    # response sending was cancelled.
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self.cancel_session_processing(session_key, release_guard=False, discard_pending=False)
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self._drain_pending_after_session_command(session_key, command_guard)
         except Exception:
             # On failure restore the original guard so the session isn't left half-reset.
-            if self._active_sessions.get(session_key) is command_guard:
+            if not consumed and self._active_sessions.get(session_key) is command_guard:
                 if session_key in self._session_tasks and current_guard is not None:
                     self._active_sessions[session_key] = current_guard
                 else:
                     self._release_session_guard(session_key, guard=command_guard)
             raise
-        await self._drain_pending_after_session_command(session_key, command_guard)
+        except asyncio.CancelledError:
+            if not consumed and self._active_sessions.get(session_key) is command_guard:
+                if session_key in self._session_tasks and current_guard is not None:
+                    self._active_sessions[session_key] = current_guard
+                else:
+                    self._release_session_guard(session_key, guard=command_guard)
+            raise
 
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background

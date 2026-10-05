@@ -539,6 +539,11 @@ class SessionEntry:
     # Exact session-context/channel inputs from the last human turn. Append-only dataclass field so
     # older positional construction of transport_profile keeps its meaning.
     prompt_pin: Optional[Dict[str, Any]] = None
+    # Track whether an actual agent turn has initialized this session.
+    # Prevents read-only commands like /status from consuming the session:start hook.
+    agent_turn_initialized: bool = False
+    # Trusted transport provenance: persisted separately from wire SessionSource to survive reload.
+    delivered_via_relay: bool = False
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -546,6 +551,7 @@ class SessionEntry:
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
         "expiry_finalized", "suspended", "resume_pending", "resume_reason",
+        "agent_turn_initialized", "delivered_via_relay",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",
@@ -1041,12 +1047,14 @@ class SessionStore(
         """Create a candidate outside the lock and publish it only if the key is still vacant;
         returns ``create_session`` kwargs when the candidate won."""
         session_id = _new_session_id(now)
+        delivered_via_relay = getattr(source, "delivered_via_upstream_relay", False) is True
         candidate = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=source, display_name=source.chat_name, platform=source.platform,
             chat_type=source.chat_type, was_auto_reset=decision.reset_reason is not None,
             auto_reset_reason=decision.reset_reason, reset_had_activity=decision.reset_had_activity,
             prev_session_id=decision.prev_session_id, transport_profile=transport_profile_of(source),
+            delivered_via_relay=delivered_via_relay,
         )
         with self._lock:
             current = self._entries.get(session_key)
@@ -1152,7 +1160,8 @@ class SessionStore(
         new_entry = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,
-            transport_profile=old_entry.transport_profile, **fields,
+            transport_profile=old_entry.transport_profile,
+            delivered_via_relay=getattr(old_entry, "delivered_via_relay", False), **fields,
         )
         self._entries[session_key] = new_entry
         self._save()

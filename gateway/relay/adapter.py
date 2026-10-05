@@ -905,6 +905,17 @@ class RelayAdapter(BasePlatformAdapter):
         # class default is False, so only an explicit descriptor bit turns it on.
         self.supports_inchannel_continuable = bool(getattr(descriptor, "supports_inchannel_continuable", False))
 
+    def _is_delivery_seen(self, dedupe_key: str) -> bool:
+        if dedupe_key in self._seen_inbound:
+            return True
+        store = getattr(self, "_session_store", None) or getattr(self, "session_store", None)
+        if store is not None:
+            checker = getattr(store, "is_relay_delivery_settled", None)
+            if callable(checker) and checker(dedupe_key):
+                self._seen_inbound[dedupe_key] = None
+                return True
+        return False
+
     async def _claim_inbound_dedupe(
         self, dedupe_key: Optional[str],
     ) -> Tuple[bool, Optional[asyncio.Future[bool]]]:
@@ -918,7 +929,7 @@ class RelayAdapter(BasePlatformAdapter):
             return True, None
         inflight = self.__dict__.setdefault("_inflight_inbound", {})
         while True:
-            if dedupe_key in self._seen_inbound:
+            if self._is_delivery_seen(dedupe_key):
                 logger.info("relay inbound dropped as replay (dedupe key=%s)", dedupe_key)
                 return False, None
             pending = inflight.get(dedupe_key)
@@ -942,6 +953,14 @@ class RelayAdapter(BasePlatformAdapter):
         if admitted:
             self._seen_inbound[dedupe_key] = None
             self._evict_oldest(self._seen_inbound, self._SEEN_INBOUND_MAX)
+            store = getattr(self, "_session_store", None) or getattr(self, "session_store", None)
+            if store is not None:
+                marker = getattr(store, "mark_relay_delivery_settled", None)
+                if callable(marker):
+                    try:
+                        marker(dedupe_key)
+                    except Exception:
+                        logger.debug("failed to persist relay delivery settlement for %s", dedupe_key, exc_info=True)
         if inflight.get(dedupe_key) is claim:
             inflight.pop(dedupe_key, None)
         if not claim.done():

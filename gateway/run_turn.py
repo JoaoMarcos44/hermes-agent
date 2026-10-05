@@ -528,7 +528,17 @@ class GatewayTurnMixin:
             session_entry.was_auto_reset = False
 
         _is_fresh_reset = getattr(session_entry, "is_fresh_reset", False)
-        _is_new_session = session_entry.created_at == session_entry.updated_at or _was_auto_reset or _is_fresh_reset
+        _agent_initialized = getattr(session_entry, "agent_turn_initialized", False)
+        # Use explicit initialization state rather than created_at == updated_at so read-only
+        # introspection commands like /status do not consume the session:start hook (#130304).
+        _is_new_session = not _agent_initialized or _was_auto_reset or _is_fresh_reset
+        if not _agent_initialized:
+            session_entry.agent_turn_initialized = True
+            if hasattr(self, "session_store") and hasattr(self.session_store, "_save"):
+                try:
+                    self.session_store._save()
+                except Exception:
+                    pass
         # Consume is_fresh_reset so it doesn't leak onto later messages in the same session.
         if _is_fresh_reset:
             # See #6508.

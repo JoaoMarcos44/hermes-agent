@@ -238,6 +238,34 @@ class SessionPersistenceMixin:
     def _relay_discord_context_meta_key(kind: str, scope_id: str, entity_id: str) -> str:
         return f"relay_discord_context:v1:{kind}:{scope_id}:{entity_id}"
 
+    def is_relay_delivery_settled(self, dedupe_key: str) -> bool:
+        """Check whether a relay inbound delivery has already been durably settled."""
+        mem_cache = self._lazy("_settled_relay_deliveries", set)
+        if dedupe_key in mem_cache:
+            return True
+        getter = self._routing_db_method("get_meta")
+        if getter is None:
+            return False
+        try:
+            val = bool(getter(f"relay_delivery_settled:v1:{dedupe_key}"))
+            if val:
+                mem_cache.add(dedupe_key)
+            return val
+        except Exception:
+            return False
+
+    def mark_relay_delivery_settled(self, dedupe_key: str) -> None:
+        """Persist a relay delivery settlement receipt so reconnects/restarts suppress replay."""
+        mem_cache = self._lazy("_settled_relay_deliveries", set)
+        mem_cache.add(dedupe_key)
+        setter = self._routing_db_method("set_meta")
+        if setter is None:
+            return
+        try:
+            setter(f"relay_delivery_settled:v1:{dedupe_key}", "1")
+        except Exception:
+            pass
+
     def _relay_discord_context_lock(self):
         return self._lazy("_relay_discord_context_guard", threading.Lock)
 
@@ -335,12 +363,16 @@ class SessionPersistenceMixin:
                 }
                 if merged == current:
                     continue
-                setter(
-                    self._relay_discord_context_meta_key(kind, scope_id, entity_id),
-                    json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
-                )
+                cache_key = (kind, scope_id, entity_id)
+                try:
+                    setter(
+                        self._relay_discord_context_meta_key(kind, scope_id, entity_id),
+                        json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
+                    )
+                except Exception:
+                    continue
                 cache = self._publish_relay_discord_context_record(
-                    cache, (kind, scope_id, entity_id), merged
+                    cache, cache_key, merged
                 )
                 changed = True
         return changed
@@ -378,12 +410,16 @@ class SessionPersistenceMixin:
                 merged = {**current, **incoming}
                 if merged == current:
                     continue
-                setter(
-                    self._relay_discord_context_meta_key(kind, scope_id, entity_id),
-                    json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
-                )
+                cache_key = (kind, scope_id, entity_id)
+                try:
+                    setter(
+                        self._relay_discord_context_meta_key(kind, scope_id, entity_id),
+                        json.dumps(merged, separators=(",", ":"), ensure_ascii=False),
+                    )
+                except Exception:
+                    continue
                 cache = self._publish_relay_discord_context_record(
-                    cache, (kind, scope_id, entity_id), merged
+                    cache, cache_key, merged
                 )
                 changed = True
         return changed
