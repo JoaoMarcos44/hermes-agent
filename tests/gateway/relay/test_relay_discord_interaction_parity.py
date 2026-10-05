@@ -1448,3 +1448,24 @@ async def test_discord_identity_churn_keeps_prompt_bytes_and_key_stable(tmp_path
     assert renamed_key != base_key
     assert renamed_prompt != base_prompt
     assert "Hermes / #renamed" in renamed_prompt
+
+
+def test_discord_interaction_resolves_channel_id_from_partial_channel_object():
+    adapter, _ = _adapter(platform="discord")
+    payload = {
+        "id": "i-dm-fallback",
+        "type": 2,
+        "data": {"name": "help"},
+        "user": {"id": "u-dm", "username": "alice"},
+        "channel": {
+            "id": "dm-ch-888",
+            "type": 3,
+            "name": "alice-group",
+        },
+    }
+    event = adapter._discord_interaction_to_event(_forward(), payload=payload)
+    assert event is not None
+    assert event.source.chat_id == "dm-ch-888"
+    assert event.source.chat_type == "group"
+    assert event.source.chat_name == "alice-group"
+

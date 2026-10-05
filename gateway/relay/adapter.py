@@ -1143,13 +1143,15 @@ class RelayAdapter(BasePlatformAdapter):
         if not user_is_authoritative and not parent and not channel_name:
             return
         try:
+            channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+            interaction_channel_id = str(payload.get("channel_id") or channel.get("id") or event.source.chat_id or "")
             # Passing target keywords to the wrapper raises before storage runs. Bind them first
             # so the same callable works with either executor.
             await self._offload_discord_context_io(
                 partial(
                     observe,
                     str(payload.get("guild_id") or ""),
-                    str(payload.get("channel_id") or ""),
+                    interaction_channel_id,
                     str(event.source.user_id or ""),
                     user_name=event.source.user_name if user_is_authoritative else None,
                     parent_chat_id=str(parent) if parent else None,
@@ -1411,9 +1413,11 @@ class RelayAdapter(BasePlatformAdapter):
                 user = (member.get("user") if isinstance(member, dict) else None) or payload.get("user") or {}
                 if not isinstance(user, dict):
                     user = {}
+                channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+                interaction_channel_id = str(payload.get("channel_id") or channel.get("id") or "")
                 context = await self._discord_context_for(
                     str(payload.get("guild_id") or ""),
-                    str(payload.get("channel_id") or ""),
+                    interaction_channel_id,
                     str(user.get("id") or ""),
                 )
                 event = self._discord_interaction_to_event(forward, payload=payload, context=context)
@@ -1519,7 +1523,8 @@ class RelayAdapter(BasePlatformAdapter):
             user = {}
         guild_id = payload.get("guild_id")
         scope = str(guild_id or "")
-        chat_id = str(payload.get("channel_id") or "")
+        channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+        chat_id = str(payload.get("channel_id") or channel.get("id") or "")
         context = (
             dict(context)
             if isinstance(context, dict)
@@ -1531,7 +1536,6 @@ class RelayAdapter(BasePlatformAdapter):
             context.get("user_name"),
             is_guild=bool(guild_id),
         )
-        channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
         chat_name = (str(channel["name"]).strip() if channel.get("name") else None) or context.get("chat_name")
         chat_topic = (str(channel["topic"]).strip() if channel.get("topic") else None) or context.get("chat_topic")
         is_thread = bool(guild_id) and channel.get("type") in (10, 11, 12)
@@ -1551,7 +1555,7 @@ class RelayAdapter(BasePlatformAdapter):
             # logical platform, and _capture_scope skips the generic "relay".
             platform=Platform.DISCORD,
             chat_id=chat_id,
-            chat_type="thread" if is_thread else ("group" if guild_id else "dm"),
+            chat_type="thread" if is_thread else ("group" if guild_id or channel.get("type") == 3 else "dm"),
             thread_id=chat_id if is_thread else None,
             parent_chat_id=parent_chat_id,
             user_id=str(user["id"]) if user.get("id") else None,
