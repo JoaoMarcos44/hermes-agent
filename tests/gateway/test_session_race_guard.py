@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import merge_pending_message_event
+from gateway.platforms.base import BasePlatformAdapter, merge_pending_message_event
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
@@ -317,3 +317,43 @@ async def test_stop_during_sentinel_force_cleans_session():
 # Test 7: Shutdown skips sentinel entries
 # ------------------------------------------------------------------
     # Should not have raised on the sentinel
+
+
+@pytest.mark.asyncio
+async def test_debounced_followup_drains_when_session_task_finishes():
+    class TestStubAdapter(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(PlatformConfig(), Platform.DISCORD)
+            self.processed = []
+
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def get_chat_info(self, chat_id): return {}
+        async def send(self, *args, **kwargs): pass
+
+        async def _process_message_background(self, event, session_key):
+            self.processed.append((event.text, session_key))
+
+    adapter = TestStubAdapter()
+    source = SessionSource(platform=Platform.DISCORD, chat_id="c1", user_id="u1")
+    session_key = "test_session_drain_1"
+
+    guard1 = asyncio.Event()
+    task1 = asyncio.create_task(asyncio.sleep(0.01))
+    adapter._active_sessions[session_key] = guard1
+    adapter._session_tasks[session_key] = task1
+
+    event2 = MessageEvent(
+        text="debounced follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="m2",
+    )
+    await adapter._queue_text_debounce(session_key, event2)
+
+    await task1
+    adapter._finish_session_task(session_key, guard1)
+
+    await asyncio.sleep(0.05)
+    assert any(item[0] == "debounced follow-up" for item in adapter.processed)
+

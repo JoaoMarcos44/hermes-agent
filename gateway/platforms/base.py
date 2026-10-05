@@ -3886,7 +3886,13 @@ class BasePlatformAdapter(ABC):
         """Timer task that flushes the debounced text buffer."""
         try:
             await asyncio.sleep(delay)
-            await self._flush_text_debounce_now(session_key)
+            flushed = await self._flush_text_debounce_now(session_key)
+            if flushed:
+                current_task = self._session_tasks.get(session_key)
+                if current_task is None or current_task.done():
+                    pending_event = self._pending_messages.pop(session_key, None)
+                    if pending_event is not None:
+                        self._spawn_drain_task(pending_event, session_key)
         except asyncio.CancelledError:
             return
         finally:
@@ -4538,10 +4544,15 @@ class BasePlatformAdapter(ABC):
         drain task and leave it the guard. Nothing pending: release the guard only if we still own
         it."""
         late_pending = self._pending_messages.pop(session_key, None)
+        if late_pending is None:
+            debounce_state = self._text_debounce_store().pop(session_key, None)
+            if debounce_state is not None:
+                debounce_state.cancel_timer()
+                late_pending = debounce_state.event
         current_task = asyncio.current_task()
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
-            if existing_task is not None and existing_task is not current_task:
+            if existing_task is not None and not existing_task.done() and existing_task is not current_task:
                 # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
                 # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
                 # spawning two concurrent _process_message_background tasks for the same key (#17758
