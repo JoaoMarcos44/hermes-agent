@@ -1451,8 +1451,21 @@ class RelayAdapter(BasePlatformAdapter):
     @staticmethod
     def _discord_interaction_payload(forward) -> Optional[Dict[str, Any]]:
         """Parse one forwarded Discord interaction body without performing any storage I/O."""
+        raw_body = getattr(forward, "body", b"")
+        if isinstance(raw_body, str):
+            text = raw_body
+        elif isinstance(raw_body, (bytes, bytearray)):
+            try:
+                text = raw_body.decode("utf-8")
+            except Exception:
+                return None
+        else:
+            try:
+                text = bytes(raw_body).decode("utf-8")
+            except Exception:
+                return None
         try:
-            payload = json.loads(bytes(getattr(forward, "body", b"")).decode("utf-8"))
+            payload = json.loads(text)
         except Exception:  # noqa: BLE001
             return None
         return payload if isinstance(payload, dict) else None

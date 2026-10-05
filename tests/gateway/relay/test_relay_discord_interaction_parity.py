@@ -335,6 +335,23 @@ def test_discord_interaction_renders_boolean_flags_and_subcommands():
     assert event.message_type == MessageType.COMMAND
 
 
+def test_discord_interaction_payload_accepts_str_and_bytes_body():
+    class ForwardStr:
+        platform = "discord"
+        body = '{"type": 2, "id": "str-1", "data": {"name": "status"}}'
+
+    class ForwardBytes:
+        platform = "discord"
+        body = b'{"type": 2, "id": "bytes-1", "data": {"name": "status"}}'
+
+    from gateway.relay.adapter import RelayAdapter
+    p1 = RelayAdapter._discord_interaction_payload(ForwardStr())
+    p2 = RelayAdapter._discord_interaction_payload(ForwardBytes())
+    assert p1 is not None and p1["id"] == "str-1"
+    assert p2 is not None and p2["id"] == "bytes-1"
+
+
+
 @pytest.mark.asyncio
 async def test_discord_interaction_processing_reactions_use_message_anchor():
     """Processing reactions target the attached message, never the unique action id."""
