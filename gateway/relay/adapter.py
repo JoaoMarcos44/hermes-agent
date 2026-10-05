@@ -1661,14 +1661,21 @@ class RelayAdapter(BasePlatformAdapter):
         for opt in options:
             if not isinstance(opt, dict):
                 continue
-            if opt.get("type") in (1, 2):
+            if opt.get("type") in (1, 2) or ("options" in opt and isinstance(opt.get("options"), list)):
                 sub_name = str(opt.get("name") or "").strip()
                 if sub_name:
                     parts.append(sub_name)
                 parts.extend(RelayAdapter._render_interaction_options(opt.get("options")))
             else:
                 value = opt.get("value")
-                if value is not None and str(value).strip():
+                opt_type = opt.get("type")
+                if opt_type == 5 or isinstance(value, bool):
+                    if value is True:
+                        flag_name = str(opt.get("name") or "").strip()
+                        if flag_name:
+                            prefix = "" if flag_name.startswith("-") else "--"
+                            parts.append(f"{prefix}{flag_name}")
+                elif value is not None and str(value).strip():
                     parts.append(str(value).strip())
         return parts
 

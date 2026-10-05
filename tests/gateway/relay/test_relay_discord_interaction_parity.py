@@ -308,6 +308,33 @@ async def test_model_reaching_slash_keeps_discord_prompt_presence_stable(monkeyp
     assert len(set(prompts)) == 1
 
 
+def test_discord_interaction_renders_boolean_flags_and_subcommands():
+    from gateway.platforms.base import MessageType
+    adapter, _ = _adapter(platform="discord")
+    forward = _forward(
+        type=2,
+        id="slash-sub-1",
+        data={
+            "name": "skills",
+            "options": [
+                {
+                    "name": "install",
+                    "type": 1,
+                    "options": [
+                        {"name": "identifier", "type": 3, "value": "AxlStyle"},
+                        {"name": "now", "type": 5, "value": True},
+                        {"name": "force", "type": 5, "value": False},
+                    ],
+                }
+            ],
+        },
+    )
+    event = adapter._discord_interaction_to_event(forward)
+    assert event is not None
+    assert event.text == "/skills install AxlStyle --now"
+    assert event.message_type == MessageType.COMMAND
+
+
 @pytest.mark.asyncio
 async def test_discord_interaction_processing_reactions_use_message_anchor():
     """Processing reactions target the attached message, never the unique action id."""
