@@ -449,20 +449,23 @@ def _aws_live_or_curated_ids(slug: str, curated: dict, *fallback_keys: str,
 
 def _nous_picker_model_ids(curated: dict, force_fresh_nous_tier: bool) -> list:
     """Nous serves a huge live catalog; the picker shows ONLY the curated agentic list, augmented
-    with the Portal's free/paid recommendations (new models surface without a CLI release) and
-    narrowed by org policy. Mirrors ``_model_flow_nous`` so GUI pickers match the CLI. A failed
+    with the Portal's free/paid recommendations and paid-tier sale models, then narrowed by org
+    policy. Mirrors ``_model_flow_nous`` so GUI pickers match the CLI. A failed
     recommendation fetch still yields a policy-filtered curated list."""
     model_ids = curated.get("nous", [])
     try:
         from hermes_cli.models_pricing import get_pricing_for_provider
         from hermes_cli.models import (
             check_nous_free_tier,
+            union_with_nous_on_sale_models,
             union_with_portal_free_recommendations,
             union_with_portal_paid_recommendations,
         )
         from hermes_cli.auth import get_provider_auth_state
-        # Cache-only: both Portal unions below discard the pricing map (``model_ids, _ = ...``);
-        # only the appended ids matter, so a live catalog fetch here buys nothing but latency.
+        # Cache-only: a cold cache must not hold the picker open. The Portal unions only append ids;
+        # the on-sale union reads the rows the background prewarm filled under the same key the
+        # fetcher registers (base + credential fingerprint), so a logged-in account's cached_only
+        # read finds them.
         pricing = get_pricing_for_provider("nous", cached_only=True) or {}
         try:
             portal = (get_provider_auth_state("nous") or {}).get("portal_base_url", "") or ""
@@ -472,6 +475,7 @@ def _nous_picker_model_ids(curated: dict, force_fresh_nous_tier: bool) -> list:
             model_ids, _ = union_with_portal_free_recommendations(model_ids, pricing, portal)
         else:
             model_ids, _ = union_with_portal_paid_recommendations(model_ids, pricing, portal)
+            model_ids = union_with_nous_on_sale_models(model_ids, pricing)
     except Exception:
         pass
     try:
@@ -1043,27 +1047,53 @@ def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
 def _lap_bare_custom_row(b: _PickerBuild, custom_providers: list | None) -> None:
     """Section 3b: ``model.provider: custom`` + ``model.base_url`` with no named
     providers:/custom_providers row — surface it so /model does not look like it ignored
-    config.yaml."""
-    if not (b.current_provider_norm == "custom" and b.current_base_url and "custom" not in b.seen_slugs):
+    config.yaml.
+
+    The endpoint comes from the caller's current-provider slice when the session is on it,
+    and otherwise from the static config.yaml ``model:`` block: the row used to appear only
+    while it happened to be the active provider, so switching away made it vanish and the
+    unconfigured-canonical fallback substituted a misleading 0-model placeholder (#59702).
+    ``is_current`` is then true only when the caller's slice points back at this URL."""
+    if "custom" in b.seen_slugs:
         return
+    base_url = default_model = ""
+    if b.current_provider_norm == "custom" and b.current_base_url:
+        base_url = b.current_base_url
+        default_model = b.current_model
+    else:
+        try:
+            from hermes_cli.config import load_config
+            cfg_model = load_config().get("model")
+        except Exception:  # health: allow BLE001 -- config.yaml may be user-edited or mid-migration; a read failure must degrade to "no row", never crash the picker
+            cfg_model = None
+        # config.model can be a bare string in older configs (see load_picker_context);
+        # only a mapping carries a provider/base_url to recover here.
+        if not isinstance(cfg_model, dict):
+            return
+        base_url = str(cfg_model.get("base_url") or "").strip()
+        if str(cfg_model.get("provider") or "").strip().lower() != "custom" or not base_url:
+            return
+        default_model = str(cfg_model.get("default", cfg_model.get("name", "")) or "").strip()
     if any(
-        isinstance(cp, dict) and _norm_url(_entry_base_url(cp)) == _norm_url(b.current_base_url)
+        isinstance(cp, dict) and _norm_url(_entry_base_url(cp)) == _norm_url(base_url)
         for cp in (custom_providers or [])):
         return
-    api_url = str(b.current_base_url).strip().rstrip("/")
-    models = [b.current_model] if b.current_model else []
+    api_url = base_url.strip().rstrip("/")
+    is_current = b.current_provider_norm == "custom" and b.current_base_url_norm == _norm_url(api_url)
+    models = [default_model] if default_model else []
     native_catalog_empty = False
     try:
         discovered, native_catalog_empty = _discover_endpoint_models(
             "", api_url, "custom", False, headers=None, api_mode=None,
-            probe_live=bool(b.refresh or b.probe_current_custom_provider), discovery_allowed=True,
+            probe_live=bool(b.refresh or (b.probe_current_custom_provider and is_current)),
+            discovery_allowed=True,
             fast_custom_probe=b.resolved_fast_custom_probe)
         if discovered is not None:
             models = discovered
     except Exception:
         pass
     b.add_endpoint_row(
-        "custom", "Custom endpoint", api_url, models, True, native_catalog_empty,
+        "custom", "Custom endpoint", api_url, models, is_current, native_catalog_empty,
         source="model-config", shown=_cap_models(models, b.max_models))
 
 
@@ -1192,12 +1222,12 @@ def _build_curated_lists(current_provider: str, current_base_url: str, current_m
 
 
 def list_authenticated_providers(
-    current_provider: str = "", current_base_url: str = "", user_providers: dict = None,
+    current_provider: str = "", current_base_url: str = "", user_providers: dict | None = None,
     custom_providers: list | None = None, *, force_fresh_nous_tier: bool = False,
     max_models: int | None = None, current_model: str = "", refresh: bool = False,
     probe_custom_providers: bool = True, probe_current_custom_provider: bool = False,
     for_picker: bool = False, excluded_providers: list | None = None,
-    non_blocking_catalogs: bool = False, fast_custom_probe: bool | None = None) -> List[dict]:
+    non_blocking_catalogs: bool = False, fast_custom_probe: bool | None = None) -> list[dict]:
     """Detect which providers have credentials and list their curated (not full models.dev) models.
 
     Returns dicts with ``slug`` (the --provider value), ``name``, ``is_current``,
@@ -1315,7 +1345,7 @@ def _finalize_picker_rows(results: list, user_providers, current_model: str) -> 
     return results
 
 
-def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = "") -> List[dict]:
+def _prepend_moa_picker_provider(providers: list[dict], current_provider: str = "") -> list[dict]:
     """Add the virtual MoA provider row used by interactive model pickers.
 
     ``list_authenticated_providers()`` only returns real/auth-backed providers; the CLI inventory
@@ -1332,11 +1362,11 @@ def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = 
 
 
 def list_picker_providers(
-    current_provider: str = "", current_base_url: str = "", user_providers: dict = None,
+    current_provider: str = "", current_base_url: str = "", user_providers: dict | None = None,
     custom_providers: list | None = None, max_models: int | None = None, current_model: str = "",
     include_moa: bool = False, excluded_providers: list | None = None,
     non_blocking_catalogs: bool = False, probe_custom_providers: bool = True,
-    probe_current_custom_provider: bool = False) -> List[dict]:
+    probe_current_custom_provider: bool = False) -> list[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
 
     OpenRouter's list is replaced with :func:`hermes_cli.models.fetch_openrouter_models` (curated
@@ -1355,7 +1385,7 @@ def list_picker_providers(
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
 
-    filtered: List[dict] = []
+    filtered: list[dict] = []
     for p in providers:
         if str(p.get("slug", "")).lower() == "openrouter":
             try:

@@ -17,26 +17,26 @@ from pathlib import Path
 from typing import Mapping, NoReturn, Sequence
 
 __all__ = [
+    "FILTER_DISCOVERY_FAILED",
     "IS_WINDOWS",
-    "resolve_node_command",
-    "split_command_line",
-    "restore_ambient_pythonpath",
-    "suppress_platform_ver_console",
-    "windows_detach_flags",
-    "windows_detach_flags_without_breakaway",
-    "windows_hide_flags",
-    "windows_detach_popen_kwargs",
+    "NO_DRIVER_DIFF_FLAGS",
+    "NO_LAZY_FETCH_ENV",
     "bounded_git_probe",
     "bounded_probe_run",
-    "selected_git_env",
     "expose_pm_git",
     "noninteractive_git_env",
     "noninteractive_repo_git_env",
-    "FILTER_DISCOVERY_FAILED",
-    "NO_DRIVER_DIFF_FLAGS",
-    "NO_LAZY_FETCH_ENV",
-    "pid_is_hermes",
     "pid_exists_stdlib",
+    "pid_is_hermes",
+    "resolve_node_command",
+    "restore_ambient_pythonpath",
+    "selected_git_env",
+    "split_command_line",
+    "suppress_platform_ver_console",
+    "windows_detach_flags",
+    "windows_detach_flags_without_breakaway",
+    "windows_detach_popen_kwargs",
+    "windows_hide_flags",
 ]
 
 # Flags that neutralize *attribute-scoped* diff drivers on any diff-rendering git command. A
@@ -219,6 +219,26 @@ def windows_hide_flags() -> int:
     """
     return _CREATE_NO_WINDOW if IS_WINDOWS else 0
 
+
+
+def no_prompt_git_kwargs() -> dict:
+    """``subprocess.run`` kwargs for the updater's network git calls.
+
+    GitHub answers anonymous fetches with HTTP 401 during outages (and for
+    unreachable repos); git then prompts ``Username for 'https://github.com':``
+    on the inherited terminal and the update sits there forever. Disable the
+    prompt so the fetch fails fast into ``_classify_fetch_failure``. Only the
+    *prompt* is disabled — a configured credential helper / askpass still
+    runs, so a private-fork origin keeps authenticating non-interactively.
+    Lives here, dependency-free, because the update hand-off's bootstrap
+    interpreter runs the treeless conversion before any dependency exists.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "Never"
+    # Every network git spawn (fetch/pull/shallow heal) runs under a console-less
+    # desktop backend on Windows; hide the per-spawn console (#117781).
+    return {"stdin": subprocess.DEVNULL, "env": env, "creationflags": windows_hide_flags()}
 
 def suppress_platform_ver_console() -> None:
     """Stub ``platform._syscmd_ver`` on Windows so it never flashes a console. No-op elsewhere.
@@ -819,15 +839,24 @@ def bounded_probe_run(
         # Timeout OR any other communicate() failure (torn-down pipe, decode error): tree-kill and
         # drain bounded — leaving it running would leak the suspended-descendant class this guards.
         _close_job(job)
-        kill_process_tree(proc)
-        try:
-            proc.communicate(timeout=1)
-        except Exception:
-            pass
+        kill_and_drain(proc, 1)
         return None
     # The probe exited on its own; anything it left behind (`&` jobs) goes with the job.
     _close_job(job)
     return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
+
+
+def kill_and_drain(proc: "subprocess.Popen", seconds: float) -> "tuple | None":
+    """Tree-kill *proc* (:func:`kill_process_tree`), then read what its pipes still hold for at
+    most *seconds*: ``(stdout, stderr)``, or ``None`` when a descendant the kill missed still
+    holds them. Those pipes are left to ``communicate()``'s reader threads, never closed
+    (closing a pipe a thread is reading blocks; a ``with Popen`` exit would close them)."""
+    kill_process_tree(proc)
+    try:
+        return proc.communicate(timeout=seconds)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        proc.stdin = proc.stdout = proc.stderr = None
+        return None
 
 
 def _close_job(job) -> None:
