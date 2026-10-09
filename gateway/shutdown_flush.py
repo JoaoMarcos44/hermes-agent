@@ -75,11 +75,19 @@ def _write_payload(flush_dir: Path, payload: dict[str, Any]) -> Path:
 
 
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
-    """Serialise and write one pending value; return True when a payload was written."""
+    """Serialise and write one pending value; return True when a payload was written.
+
+    Every payload gets an explicit ``seq`` (callers with their own ordering key, like the
+    overflow flush, override it). Recovery orders on ``(ts, seq, name)`` and ``ts`` has
+    one-second resolution, so without ``seq`` two payloads written in the same second sort
+    by their random UUID filename — the adapter shutdown spool (older pending head, then
+    the newer debounced buffer) could replay newest-first (#126167 review F2).
+    """
     try:
         serialised = _serialise_value(value)
         if serialised is None:
             return False
+        extra.setdefault("seq", next(_TRANSCRIPT_SPOOL_SEQ))
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True
     except Exception as exc:
