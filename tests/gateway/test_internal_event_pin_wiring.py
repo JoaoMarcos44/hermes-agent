@@ -961,3 +961,29 @@ async def test_channel_override_turns_keep_one_cached_agent_and_the_pin(
     assert entry[0].model == expected_model
     assert _TurnAgent.instances == 1, f"agent rebuilt {_TurnAgent.instances - 1}x across 3 turns"
     assert runner._peek_session_state(KEY).conversation.ephemeral_pin is not None, "context pin cleared"
+
+
+@pytest.mark.asyncio
+async def test_draining_turn_leaves_accepted_followups_for_shutdown_spool(monkeypatch):
+    """#126167 review F4 — a finishing agent turn must not consume accepted work while a
+    restart/shutdown waits: ``_draining`` teardown snapshots the adapter's pending and
+    overflow buckets for durable recovery, so dequeueing them here (and then discarding
+    under the drain guard) loses events the spool never saw. Admitted A and B must survive
+    the drain intact, in place, in order, with their prompt identity."""
+    from gateway.run import _build_media_placeholder  # noqa: F401  (import shape check)
+
+    runner, adapter = _merge_boundary(monkeypatch)
+    source = _human_source()
+    a = MessageEvent(text="accepted-first", source=source, message_id="A1")
+    b = MessageEvent(text="accepted-second", source=_other_sender_source(), message_id="B1")
+    adapter._pending_messages[KEY] = a
+    runner._session_state(KEY).conversation.queued_events.append(b)
+
+    runner._draining = True
+    result = {"final_response": "done", "messages": []}
+    pending_event, pending = await runner._run_agent_drain_pending(result, adapter, source, KEY)
+
+    assert pending_event is None and pending is None
+    # Both accepted events survive, in place, in FIFO order, for the shutdown spool.
+    assert adapter._pending_messages[KEY] is a
+    assert _queued_events(runner) == [b]

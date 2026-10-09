@@ -3638,6 +3638,16 @@ class GatewayTurnMixin:
         )
         pending_event = None
         pending = None
+        if self._draining:
+            # #126167 review F4: a restart/shutdown is waiting for this turn, and teardown
+            # snapshots the pending/overflow buckets for durable recovery. Dequeueing here
+            # would pop the session's accepted work and discard it below, before the
+            # spool can see it. Leave every bucket intact and run no follow-up.
+            logger.info(
+                "Leaving queued follow-ups intact for session %s during gateway %s",
+                session_key or "?", self._status_action_label(),
+            )
+            return pending_event, pending
         if result and adapter and session_key:
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
