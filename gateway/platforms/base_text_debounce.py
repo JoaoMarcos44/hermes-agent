@@ -32,11 +32,11 @@ class TextDebounceMixin:
     - ``self.gateway_runner``: optional runner ref
     """
 
-    def _text_debounce_store(self) -> dict[str, "TextDebounceState"]:
+    def _text_debounce_store(self) -> dict[str, TextDebounceState]:
         from gateway.platforms.base import _lazy_attr
         return _lazy_attr(self, "_text_debounce", dict)
 
-    def _is_queue_text_debounce_candidate(self, event: "MessageEvent") -> bool:
+    def _is_queue_text_debounce_candidate(self, event: MessageEvent) -> bool:
         """Return True for normal text eligible for queue-mode debounce."""
         result = (
             getattr(self, "_busy_text_mode", "interrupt") == "queue"
@@ -47,12 +47,12 @@ class TextDebounceMixin:
                          self.name, getattr(event, "session_key", "?"), len(event.text or ""))
         return result
 
-    def _can_merge_text_debounce_events(self, existing: "MessageEvent", event: "MessageEvent") -> bool:
+    def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender AND carry the same
         prompt identity (see :func:`prompt_identity_conflict`)."""
-        from gateway.platforms.base import _platform_name
+        from gateway.platforms.base import _platform_name, prompt_identity_conflict
 
-        def _identity(candidate: "MessageEvent"):
+        def _identity(candidate: MessageEvent):
             source = getattr(candidate, "source", None)
             if source is None:
                 return None
@@ -66,8 +66,7 @@ class TextDebounceMixin:
         existing_sender = _identity(existing)
         if existing_sender is None or existing_sender != _identity(event):
             return False
-        return bool(getattr(existing, "preserve_prompt_pins", False)) == bool(
-            getattr(event, "preserve_prompt_pins", False))
+        return not prompt_identity_conflict(existing, event)
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""
@@ -78,7 +77,7 @@ class TextDebounceMixin:
                        state.first_ts + self._busy_text_hard_cap_seconds)
         return max(0.0, deadline - time.monotonic())
 
-    def _route_preserved_debounce_event(self, session_key: str, event: "MessageEvent") -> bool:
+    def _route_preserved_debounce_event(self, session_key: str, event: MessageEvent) -> bool:
         """Hand a buffered turn whose PROMPT IDENTITY differs from the turn it would coalesce with
         to the runner's bounded FIFO admission, so it runs as its own turn.
 
@@ -98,7 +97,7 @@ class TextDebounceMixin:
             return False
         return bool(admit(session_key, event))
 
-    async def _queue_text_debounce(self, session_key: str, event: "MessageEvent") -> None:
+    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
         """Buffer normal queue-mode busy text and schedule a bounded flush."""
         from gateway.platforms.base import TextDebounceState, _append_text, merge_pending_message_event, prompt_identity_conflict
 

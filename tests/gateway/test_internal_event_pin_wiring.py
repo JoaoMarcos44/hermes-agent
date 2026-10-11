@@ -681,7 +681,7 @@ async def _owns_recursion_cap_restage(monkeypatch, caplog, *, media: bool) -> No
     """
     runner, adapter = _merge_boundary(monkeypatch)
 
-    human, staged, third = await _drive_recursion_cap(runner, adapter, _human_source(), media=media)
+    human, staged, _third = await _drive_recursion_cap(runner, adapter, _human_source(), media=media)
 
     # The drained A — older, already accepted — takes the slot back; the staged B
     # moves to the overflow HEAD (not a merge target: a differing-identity merge
@@ -706,7 +706,7 @@ async def _owns_recursion_cap_same_identity_control(monkeypatch, caplog) -> None
     runner, adapter = _merge_boundary(monkeypatch)
     source = _human_source()
 
-    human, staged, third = await _drive_recursion_cap(
+    human, staged, _third = await _drive_recursion_cap(
         runner, adapter, source, media=False, synthetic=False)
 
     # No prompt-identity conflict, but the pre-guard same-identity merge replaced
@@ -1005,7 +1005,7 @@ async def test_draining_turn_leaves_accepted_followups_for_shutdown_spool(monkey
     overflow buckets for durable recovery, so dequeueing them here (and then discarding
     under the drain guard) loses events the spool never saw. Admitted A and B must survive
     the drain intact, in place, in order, with their prompt identity."""
-    from gateway.run import _build_media_placeholder  # noqa: F401  (import shape check)
+    from gateway.run import _build_media_placeholder  # (import shape check)
 
     runner, adapter = _merge_boundary(monkeypatch)
     source = _human_source()

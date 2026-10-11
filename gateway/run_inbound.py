@@ -578,7 +578,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         self._drop_turn_slot(_quick_key, run_generation=_generation_at_interrupt)
 
     def _hm_merge_pending_for_source(
-        self, source: SessionSource, _quick_key: str, event: "MessageEvent", *, merge_text: bool = False
+        self, source: SessionSource, _quick_key: str, event: MessageEvent, *, merge_text: bool = False
     ) -> bool:
         """Merge *event* into the adapter's pending slot; refuse across differing prompt identities.
 

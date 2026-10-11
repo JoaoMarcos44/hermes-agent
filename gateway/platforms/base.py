@@ -1803,16 +1803,15 @@ class EphemeralReply(str):
 def prompt_identity_conflict(existing: Any, event: MessageEvent) -> bool:
     """True when *event* may NOT coalesce into *existing*: their prompt identities differ.
 
-    A non-internal synthetic carries the session's PINNED prompt identity, so absorbing a human
-    turn into it would run that turn under the synthetic's pins and ``message_id=None`` reply
-    anchor instead of recording its own (#126167). ``preserve_prompt_pins`` is read on its own,
-    never through ``event_preserves_prompt_pins``: ``internal`` must not change what a merge
-    refusal decides, because it alone gates authorization and the emergency stop.
+    Compares canonical ``event_preserves_prompt_pins`` AND requires the same ``internal`` class,
+    so an internal wake and a non-internal synthetic that both preserve stay separate (#126167).
     """
     if existing is None:
         return False
-    return bool(getattr(existing, "preserve_prompt_pins", False)) != bool(
-        getattr(event, "preserve_prompt_pins", False))
+    from gateway.platforms.event import event_preserves_prompt_pins
+    if event_preserves_prompt_pins(existing) != event_preserves_prompt_pins(event):
+        return True
+    return bool(getattr(existing, "internal", False)) != bool(getattr(event, "internal", False))
 
 
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
@@ -3825,7 +3824,7 @@ class BasePlatformAdapter(TextDebounceMixin, ABC):
             return existing_text
         return f"{existing_text}\n\n{new_text}".strip()
 
-    def _spool_on_shutdown(self, kind: str, turns: Dict[str, Any]) -> int:
+    def _spool_on_shutdown(self, kind: str, turns: dict[str, Any]) -> int:
         """Spool *turns* to the existing shutdown spool on the way out; return turns written.
 
         A spool failure must not abort teardown (the remaining buckets still have to be cleared),

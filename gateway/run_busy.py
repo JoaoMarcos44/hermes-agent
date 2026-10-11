@@ -131,6 +131,35 @@ class GatewayBusySessionMixin:
         # else: no adapter — leave the head in place so we don't silently drop it.
         return pending_event
 
+    def _restage_accepted_front(
+        self, session_key: str, adapter: Any, event: Optional[MessageEvent]
+    ) -> None:
+        """Return locally-owned ACCEPTED work to the FRONT of a session's queue.
+
+        ``event`` is already accepted and OLDER than the current slot occupant (a successor the
+        promotion staged for the next recursion), so it takes the slot and the occupant moves to
+        the overflow HEAD: the next drains then resume in admission order (A, B, C). An
+        ``_enqueue_fifo`` append would run A after newer overflow items; a merge would destroy
+        the occupant (#126167). The caller owns the run-generation fence — never restage work
+        whose generation was invalidated (``/new``, ``/stop``).
+        """
+        if event is None:
+            return
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        overflow = self._overflow_queue(session_key)
+        if isinstance(pending_slot, dict):
+            occupant = pending_slot.get(session_key)
+            if occupant is not None and occupant is not event:
+                if overflow is not None:
+                    overflow.insert(0, occupant)
+                else:
+                    self._session_state(session_key).conversation.queued_events.insert(0, occupant)
+            pending_slot[session_key] = event
+        elif overflow is not None:
+            overflow.insert(0, event)
+        else:
+            self._session_state(session_key).conversation.queued_events.insert(0, event)
+
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
         depth = len(self._overflow_queue(session_key) or ())

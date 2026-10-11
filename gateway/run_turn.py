@@ -3638,6 +3638,7 @@ class GatewayTurnMixin:
         )
         pending_event = None
         pending = None
+        _drain_generation = self._current_session_run_generation(session_key)
         if self._draining:
             # #126167 review F4: a restart/shutdown is waiting for this turn, and teardown
             # snapshots the pending/overflow buckets for durable recovery. Dequeueing here
@@ -3665,16 +3666,28 @@ class GatewayTurnMixin:
             elif pending_event:
                 # Transcribe audio BEFORE it becomes the next user turn (real transcript, not a path).
                 _pending_text = pending_event.text or ""
-                if self._pending_event_audio_paths(pending_event):
-                    pending, _ = await self._transcribe_and_echo_pending_voice(
-                        pending_event, adapter, source, _pending_text, log_context="Voice-drain",
-                        metadata={"thread_id": source.thread_id} if source.thread_id else None,
-                    )
-                    pending = pending or _build_media_placeholder(pending_event)
-                else:
-                    pending = _pending_text or _build_media_placeholder(pending_event)
+                try:
+                    if self._pending_event_audio_paths(pending_event):
+                        pending, _ = await self._transcribe_and_echo_pending_voice(
+                            pending_event, adapter, source, _pending_text, log_context="Voice-drain",
+                            metadata={"thread_id": source.thread_id} if source.thread_id else None,
+                        )
+                        pending = pending or _build_media_placeholder(pending_event)
+                    else:
+                        pending = _pending_text or _build_media_placeholder(pending_event)
+                except BaseException:
+                    # A cancelled/failed transcription unwinds this coroutine: hand A back to the
+                    # queue before re-raising, unless its run generation was invalidated.
+                    if self._is_session_run_current(session_key, _drain_generation):
+                        self._restage_accepted_front(session_key, adapter, pending_event)
+                    raise
                 if pending:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
+
+        # Post-transcription fence: a /new or /stop invalidated the run generation while the
+        # drain was suspended, so the stale A (and any steer) must not be returned or restaged.
+        if not self._is_session_run_current(session_key, _drain_generation):
+            return None, None
 
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
         leftover_steer = (result.get("pending_steer") or "").strip() if result else None
@@ -3685,20 +3698,7 @@ class GatewayTurnMixin:
             elif pending_event and adapter and session_key:
                 # User steered during the turn, but a background event or queued message arrived.
                 # Deliver the user's steer first and restore the pending event to the head of the queue.
-                overflow = self._overflow_queue(session_key)
-                if hasattr(adapter, "_pending_messages") and isinstance(adapter._pending_messages, dict):
-                    promoted = adapter._pending_messages.get(session_key)
-                    if promoted is not None:
-                        if overflow is not None:
-                            overflow.insert(0, promoted)
-                        else:
-                            self._session_state(session_key).conversation.queued_events.insert(0, promoted)
-                    adapter._pending_messages[session_key] = pending_event
-                else:
-                    if overflow is not None:
-                        overflow.insert(0, pending_event)
-                    else:
-                        self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
+                self._restage_accepted_front(session_key, adapter, pending_event)
                 pending_event = None
                 pending = leftover_steer
                 logger.debug(
@@ -3739,6 +3739,8 @@ class GatewayTurnMixin:
                 "Discarding pending follow-up for session %s during gateway %s",
                 session_key or "?", self._status_action_label(),
             )
+            if pending_event is not None and self._is_session_run_current(session_key, _drain_generation):
+                self._restage_accepted_front(session_key, adapter, pending_event)
             pending_event = None
             pending = None
         return pending_event, pending
@@ -3855,14 +3857,7 @@ class GatewayTurnMixin:
                 # turn under the synthetic's pins; a same-identity merge replaces the
                 # occupant and loses it — so both restage: A takes the slot, B moves to the
                 # overflow head, C keeps its place, and the next drains run A, B, C.
-                occupant = adapter._pending_messages.get(session_key)
-                if occupant is not None and occupant is not pending_event:
-                    overflow = self._overflow_queue(session_key)
-                    if overflow is not None:
-                        overflow.insert(0, occupant)
-                    else:
-                        self._session_state(session_key).conversation.queued_events.insert(0, occupant)
-                adapter._pending_messages[session_key] = pending_event
+                self._restage_accepted_front(session_key, adapter, pending_event)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
