@@ -3823,7 +3823,6 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -3847,15 +3846,23 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                # ``pending_event`` is already ACCEPTED work (drain-popped), so it must reach the
-                # queue unmerged — merging would destroy the staged occupant or run this turn under a
-                # differing prompt identity (#126167). The FIFO has no cap on accepted work.
-                from gateway.platforms.base import prompt_identity_conflict
+                # ``pending_event`` is already ACCEPTED work (drain-popped) and OLDER than
+                # the staged occupant (the promotion staged it for the NEXT recursion), so
+                # it must be front-restaged AHEAD of the occupant: an ``_enqueue_fifo``
+                # append would run it after the newer overflow items, and a merge would
+                # destroy the staged occupant (#126167). The identity branches differ only
+                # in WHY merging is unsafe — a differing-identity merge would run the human
+                # turn under the synthetic's pins; a same-identity merge replaces the
+                # occupant and loses it — so both restage: A takes the slot, B moves to the
+                # overflow head, C keeps its place, and the next drains run A, B, C.
                 occupant = adapter._pending_messages.get(session_key)
-                if prompt_identity_conflict(occupant, pending_event):
-                    self._enqueue_fifo(session_key, pending_event, adapter)
-                else:
-                    merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                if occupant is not None and occupant is not pending_event:
+                    overflow = self._overflow_queue(session_key)
+                    if overflow is not None:
+                        overflow.insert(0, occupant)
+                    else:
+                        self._session_state(session_key).conversation.queued_events.insert(0, occupant)
+                adapter._pending_messages[session_key] = pending_event
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}

@@ -310,26 +310,55 @@ def _cap_turn_ctx(source, *, depth: int) -> TurnContext:
     return ctx
 
 
-async def _drive_recursion_cap(runner, adapter, source, *, media):
-    """Drain-ordering where the human turn is dequeued and a synthetic is staged in the slot.
+async def _drive_recursion_cap(runner, adapter, source, *, media, synthetic=True):
+    """Admission order A → B → C through the real drain, promotion and recursion cap.
 
-    ``pending_event`` is ALREADY ACCEPTED work at this point (the drain popped it out of a
-    queued slot), so the cap branch must give it a slot of its own rather than merge it.
+    A is the slot occupant the real drain pops, B is the synthetic the real
+    promotion stages into the freed slot, C stays in overflow. All three are
+    ACCEPTED work by the time the cap branch runs, so the queue itself must
+    resume in admission order.
     """
+    result = {"interrupted": True, "messages": []}
     human = MessageEvent(
-        text="human photo caption" if media else "human text turn",
-        source=source, message_id="H-cap",
+        text="A human photo caption" if media else "A human turn",
+        source=source, message_id="A-cap",
         message_type=MessageType.PHOTO if media else MessageType.TEXT,
-        media_urls=["/tmp/cap.png"] if media else [],
+        media_urls=["/tmp/cap-a.png"] if media else [],
         media_types=["image/png"] if media else [],
     )
-    human._gateway_accepted = True
-    staged = runner._synthetic_prompt_event(source, "[goal] resume continuation")
-    adapter._pending_messages[KEY] = staged
+    adapter._pending_messages[KEY] = human
+    human._gateway_accepted = True  # accepted at admission; the drain pops it as such
+    if synthetic:
+        staged = runner._synthetic_prompt_event(source, "[goal] staged continuation")
+    else:
+        staged = MessageEvent(text="B same-identity follow-up", source=_human_source(), message_id="B-cap")
+        staged._gateway_accepted = True
+    third = MessageEvent(text="C human turn", source=_other_sender_source(), message_id="C-cap")
+    runner._enqueue_fifo(KEY, staged, adapter)
+    runner._enqueue_fifo(KEY, third, adapter)
+    # Real drain: pops A and stages B (the synthetic) into the slot for the next turn.
+    drained, _pending = await runner._run_agent_drain_pending(result, adapter, source, KEY)
+    assert drained is human, "the real drain must pop the oldest accepted event"
     await runner._run_agent_queued_followup(
-        _cap_turn_ctx(source, depth=runner._MAX_INTERRUPT_DEPTH), adapter, human.text, human,
-        "prev-response", {"interrupted": True, "messages": []}, None)
-    return human, staged
+        _cap_turn_ctx(source, depth=runner._MAX_INTERRUPT_DEPTH), adapter, drained.text, drained,
+        "prev-response", result, None)
+    return human, staged, third
+
+
+async def _consume_drain_order(runner, adapter, source) -> list:
+    """Consume slot + overflow the way the post-turn drain does, in order.
+
+    Membership-only assertions cannot see reordering or loss, so the regression
+    drives the real ``_run_agent_drain_pending`` until the queue is empty.
+    """
+    result = {"interrupted": True, "messages": []}
+    order: list[str] = []
+    for _ in range(10):
+        event, _pending = await runner._run_agent_drain_pending(result, adapter, source, KEY)
+        if event is None:
+            break
+        order.append(event.text)
+    return order
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -643,44 +672,50 @@ async def _owns_refused_merge_runs_its_own_turn(monkeypatch, caplog, *, media: b
 
 
 async def _owns_recursion_cap_restage(monkeypatch, caplog, *, media: bool) -> None:
-    """The recursion cap must not merge already-accepted drained work into the slot occupant.
+    """The recursion cap restages accepted work in admission order.
 
-    Before the guard, a TEXT pair silently destroyed the staged occupant and a PHOTO pair
-    absorbed the human turn's media into the synthetic's pinned identity with a ``None`` reply
-    anchor. The occupant keeps the slot and the accepted turn gets its own FIFO slot, so the
-    next promotion runs both.
+    Before the guard, ``_enqueue_fifo`` appended the drained A behind C and the
+    merge branch replaced the staged B for same-identity TEXT pairs, so the
+    queue resumed as ``B, C, A`` — or lost B entirely. The queue must resume
+    ``A, B, C`` through the real drain.
     """
     runner, adapter = _merge_boundary(monkeypatch)
 
-    human, staged = await _drive_recursion_cap(runner, adapter, _human_source(), media=media)
+    human, staged, third = await _drive_recursion_cap(runner, adapter, _human_source(), media=media)
 
-    assert adapter._pending_messages[KEY] is staged, "cap merge destroyed the staged occupant"
-    assert staged.text == "[goal] resume continuation"
-    assert staged.media_urls == [], "human media absorbed into the preserving synthetic head"
-    assert human in _queued_events(runner), "already-accepted drained turn owns no queued slot"
+    # The drained A — older, already accepted — takes the slot back; the staged B
+    # moves to the overflow HEAD (not a merge target: a differing-identity merge
+    # would run the human turn under the synthetic's pins, a same-identity merge
+    # would replace and lose B).
+    assert adapter._pending_messages[KEY] is human, "drained A is not restaged ahead of B"
+    assert _queued_events(runner)[0] is staged, "staged B is not behind the restaged A"
     assert human._gateway_accepted is True
     # The accepted turn keeps its own prompt identity and reply anchor.
     assert human.preserve_prompt_pins is False
-    assert human.message_id == "H-cap"
-    assert human.media_urls == (["/tmp/cap.png"] if media else [])
+    assert human.message_id == "A-cap"
+    assert human.media_urls == (["/tmp/cap-a.png"] if media else [])
+    # ORDER, not membership: A is the next drain, then B, then C — no loss.
+    order = await _consume_drain_order(runner, adapter, _human_source())
+    assert order == ["A human photo caption" if media else "A human turn",
+                     "[goal] staged continuation", "C human turn"], \
+        f"accepted work reordered/lost at the cap: {order!r}"
 
 
 async def _owns_recursion_cap_same_identity_control(monkeypatch, caplog) -> None:
-    """Control: with no identity difference the cap keeps its original merge behaviour."""
+    """Same-identity restage: accepted B survives in admission order too."""
     runner, adapter = _merge_boundary(monkeypatch)
     source = _human_source()
 
-    normal = MessageEvent(text="normal follow-up", source=source, message_id="N1")
-    normal._gateway_accepted = True
-    adapter._pending_messages[KEY] = normal
+    human, staged, third = await _drive_recursion_cap(
+        runner, adapter, source, media=False, synthetic=False)
 
-    drained = MessageEvent(text="drained human turn", source=source, message_id="H2")
-    drained._gateway_accepted = True
-    await runner._run_agent_queued_followup(
-        _cap_turn_ctx(source, depth=runner._MAX_INTERRUPT_DEPTH), adapter, drained.text, drained,
-        "prev-response", {"interrupted": True, "messages": []}, None)
-
-    assert adapter._pending_messages[KEY] is drained, "same-identity cap merge behaviour changed"
+    # No prompt-identity conflict, but the pre-guard same-identity merge replaced
+    # the occupant and lost B. Restaging keeps both: A in the slot, B at the head.
+    assert adapter._pending_messages[KEY] is human, "drained A is not restaged ahead of B"
+    assert _queued_events(runner)[0] is staged, "staged B is not behind the restaged A"
+    order = await _consume_drain_order(runner, adapter, source)
+    assert order == ["A human turn", "B same-identity follow-up", "C human turn"], \
+        f"same-identity accepted work reordered/lost at the cap: {order!r}"
 
 
 async def _owns_refused_debounce_arrival_is_reported(monkeypatch, caplog) -> None:
