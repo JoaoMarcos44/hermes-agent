@@ -3640,10 +3640,7 @@ class GatewayTurnMixin:
         pending = None
         _drain_generation = self._current_session_run_generation(session_key)
         if self._draining:
-            # #126167 review F4: a restart/shutdown is waiting for this turn, and teardown
-            # snapshots the pending/overflow buckets for durable recovery. Dequeueing here
-            # would pop the session's accepted work and discard it below, before the
-            # spool can see it. Leave every bucket intact and run no follow-up.
+            # Shutdown owns the queue snapshot; do not consume its accepted work (#126167).
             logger.info(
                 "Leaving queued follow-ups intact for session %s during gateway %s",
                 session_key or "?", self._status_action_label(),
@@ -3676,10 +3673,9 @@ class GatewayTurnMixin:
                     else:
                         pending = _pending_text or _build_media_placeholder(pending_event)
                 except BaseException:
-                    # A cancelled/failed transcription unwinds this coroutine: hand A back to the
-                    # queue before re-raising, unless its run generation was invalidated.
-                    if self._is_session_run_current(session_key, _drain_generation):
-                        self._restage_accepted_front(session_key, adapter, pending_event)
+                    # Preserve accepted work only while its owner survives the suspension.
+                    self._restage_accepted_front(
+                        session_key, adapter, pending_event, run_generation=_drain_generation)
                     raise
                 if pending:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
@@ -3736,11 +3732,11 @@ class GatewayTurnMixin:
 
         if self._draining and (pending_event or pending):
             logger.info(
-                "Discarding pending follow-up for session %s during gateway %s",
+                "Stopping follow-up dispatch for session %s during gateway %s",
                 session_key or "?", self._status_action_label(),
             )
-            if pending_event is not None and self._is_session_run_current(session_key, _drain_generation):
-                self._restage_accepted_front(session_key, adapter, pending_event)
+            self._restage_accepted_front(
+                session_key, adapter, pending_event, run_generation=_drain_generation)
             pending_event = None
             pending = None
         return pending_event, pending
@@ -3848,15 +3844,7 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                # ``pending_event`` is already ACCEPTED work (drain-popped) and OLDER than
-                # the staged occupant (the promotion staged it for the NEXT recursion), so
-                # it must be front-restaged AHEAD of the occupant: an ``_enqueue_fifo``
-                # append would run it after the newer overflow items, and a merge would
-                # destroy the staged occupant (#126167). The identity branches differ only
-                # in WHY merging is unsafe — a differing-identity merge would run the human
-                # turn under the synthetic's pins; a same-identity merge replaces the
-                # occupant and loses it — so both restage: A takes the slot, B moves to the
-                # overflow head, C keeps its place, and the next drains run A, B, C.
+                # The popped event predates the promoted slot; neither append nor merge is safe.
                 self._restage_accepted_front(session_key, adapter, pending_event)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)

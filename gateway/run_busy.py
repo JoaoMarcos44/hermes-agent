@@ -132,7 +132,7 @@ class GatewayBusySessionMixin:
         return pending_event
 
     def _restage_accepted_front(
-        self, session_key: str, adapter: Any, event: Optional[MessageEvent]
+        self, session_key: str, adapter: Any, event: Optional[MessageEvent], *, run_generation: Optional[int] = None,
     ) -> None:
         """Return locally-owned ACCEPTED work to the FRONT of a session's queue.
 
@@ -140,10 +140,12 @@ class GatewayBusySessionMixin:
         promotion staged for the next recursion), so it takes the slot and the occupant moves to
         the overflow HEAD: the next drains then resume in admission order (A, B, C). An
         ``_enqueue_fifo`` append would run A after newer overflow items; a merge would destroy
-        the occupant (#126167). The caller owns the run-generation fence — never restage work
-        whose generation was invalidated (``/new``, ``/stop``).
+        the occupant (#126167). Across an await, supply ``run_generation`` so an invalidated
+        owner cannot restore work into the successor's queue (``/new``, ``/stop``).
         """
         if event is None:
+            return
+        if run_generation is not None and not self._is_session_run_current(session_key, run_generation):
             return
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         overflow = self._overflow_queue(session_key)
