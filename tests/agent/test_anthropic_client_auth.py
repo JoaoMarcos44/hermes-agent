@@ -10,6 +10,7 @@ per-file line ceiling.
 import pytest
 
 from agent.anthropic_adapter import build_anthropic_client
+from agent.anthropic_credentials import _is_oauth_token
 
 SENTINEL = "sentinel-env-token-DO-NOT-SEND"
 
@@ -99,3 +100,41 @@ def test_key_cmd_token_lands_in_the_header_its_family_needs(monkeypatch, base_ur
     client._client.event_hooks["request"][0](request)
     sent = {"x-api-key": request.headers.get("x-api-key"), "bearer": request.headers.get("authorization")}
     assert sent == ({"x-api-key": key, "bearer": None} if expect == "x-api-key" else {"x-api-key": None, "bearer": "Bearer " + key})
+
+
+@pytest.mark.parametrize(("family", "declared", "expected"), [
+    ("api03", True, False), ("usr01", True, False), ("svc01", True, False), ("admin01", True, False),
+    # A Console family Anthropic ships after _API_KEY_FAMILIES: the declaration decides, not the
+    # prefix list, or the next family repeats #137334 (Claude Code identity -> subscription billing
+    # -> 400 "credit balance is too low").
+    ("team01", True, False),
+    # Undeclared values keep the historical OAuth default (#137140: OAuth prefixes shipped later
+    # must keep working), and positively OAuth shapes stay OAuth wherever they are stored.
+    ("team01", False, True), ("sid01", False, True), ("oat01", True, True),
+])
+def test_declared_env_api_key_decides_the_ambiguous_family_band(monkeypatch, family, declared, expected):
+    """``ANTHROPIC_API_KEY`` is an API key by declaration for families whose shape is ambiguous."""
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    key = "sk-" + "ant-" + family + "-" + "X" * 24
+    monkeypatch.setenv("ANTHROPIC_API_KEY" if declared else "ANTHROPIC_TOKEN", key)
+    assert _is_oauth_token(key) is expected
+
+
+def test_declared_env_api_key_never_rides_the_claude_code_identity(monkeypatch):
+    """Wire proof for #137334's class: a declared API key of an unknown family must not go out with the
+    Claude Code identity (that request shape is billed against the subscription bucket, not the credit)."""
+    pytest.importorskip("anthropic")
+    monkeypatch.setattr("agent.anthropic_adapter._claude_code_version_cache", "0.0.0")
+    key = "sk-" + "ant-" + "team01" + "-" + "X" * 24
+    monkeypatch.setenv("ANTHROPIC_API_KEY", key)
+    headers = {k.lower(): v for k, v in wire_headers(build_anthropic_client(key, "https://api.anthropic.com")).items()}
+    assert headers.get("x-api-key") == key
+    assert headers.get("authorization") is None
+    assert "claude-code-20250219" not in headers.get("anthropic-beta", "")
+    assert "claude-code/" not in headers.get("user-agent", "")
+    # Control: the same shape from a source that declares nothing keeps the OAuth default.
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    headers = {k.lower(): v for k, v in wire_headers(build_anthropic_client(key, "https://api.anthropic.com")).items()}
+    assert headers.get("authorization") == "Bearer " + key
+    assert "claude-code-20250219" in headers.get("anthropic-beta", "")

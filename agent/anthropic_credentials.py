@@ -59,14 +59,48 @@ def _first_env(*names: str) -> str:
     return next((v for v in (_getenv(n).strip() for n in names) if v), "")
 
 
+# Console/API-key families (pay per token, x-api-key) and positively OAuth token shapes (Claude Code
+# subscription). A ``sk-ant-*`` family in neither list is ambiguous: see ``_is_oauth_token``.
+_API_KEY_FAMILIES = ("sk-ant-api", "sk-ant-usr", "sk-ant-svc", "sk-ant-admin")
+_OAUTH_TOKEN_SHAPES = ("sk-ant-oat", "eyJ", "cc-")
+
+
+def _declared_env_api_key() -> str:
+    """The credential the operator explicitly configured as an API key (``ANTHROPIC_API_KEY``).
+
+    Same accessor ``resolve_anthropic_token`` reads that variable through, so the declaration is
+    seen wherever the credential itself is. Outside a secret scope while multiplexing,
+    ``get_secret`` refuses the read on purpose (another profile's value must never leak here):
+    fall back to ``''`` so classification degrades to the shape heuristic instead of failing the
+    request that was about to be sent.
+    """
+    try:
+        return _first_env("ANTHROPIC_API_KEY")
+    except Exception as exc:  # scope refusal and co: a declaration miss must not fail classification
+        logger.debug("ANTHROPIC_API_KEY declaration unreadable for credential classification (%s)", exc)
+        return ""
+
+
 def _is_oauth_token(key: str) -> bool:
-    """True for Anthropic OAuth/setup tokens (sk-ant-oat*, eyJ JWTs, cc-); False for the Console
-    API-key families sk-ant-api*, sk-ant-usr*, sk-ant-svc* and sk-ant-admin* (#133856) — they pay
-    per token and authenticate as x-api-key, so the Claude Code identity must not ride along.
-    Unknown sk-ant-* prefixes still classify as OAuth so OAuth prefixes Anthropic ships later keep working."""
-    if not key or key.startswith(("sk-ant-api", "sk-ant-usr", "sk-ant-svc", "sk-ant-admin")):
+    """True for Anthropic OAuth/setup tokens; False for API keys.
+
+    Shape is authoritative where it is unambiguous: the Console API-key families ``sk-ant-api*``,
+    ``sk-ant-usr*``, ``sk-ant-svc*`` and ``sk-ant-admin*`` (#133856) pay per token, and the OAuth
+    shapes ``sk-ant-oat*`` / ``eyJ*`` JWTs / ``cc-*`` carry a Claude Code subscription — none of them
+    change meaning with where they are stored. Any other ``sk-ant-*`` family is ambiguous, because a
+    prefix list cannot keep up with Anthropic's key families (#137334): every new Console family
+    would ride the Claude Code identity and be billed against the subscription bucket (HTTP 400
+    "Your credit balance is too low"). There the operator's declaration wins — the value configured
+    in ``ANTHROPIC_API_KEY`` is an API key regardless of prefix. Undeclared values keep the historical
+    OAuth default so OAuth prefixes Anthropic ships later keep working."""
+    if not key or key.startswith(_API_KEY_FAMILIES):
         return False
-    return key.startswith(("sk-ant-", "eyJ", "cc-"))
+    if key.startswith(_OAUTH_TOKEN_SHAPES):
+        return True
+    if key.startswith("sk-ant-"):
+        declared = _declared_env_api_key()
+        return not (declared and key.strip() == declared.strip())
+    return False
 
 
 def is_native_anthropic_host(base_url: Any) -> bool:
