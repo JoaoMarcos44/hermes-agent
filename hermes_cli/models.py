@@ -2226,16 +2226,20 @@ def _fetch_anthropic_models(
         return None
 
     resolved_base_url = base_url
-    token = (api_key or "").strip() or resolve_anthropic_token()
+    explicit = (api_key or "").strip()
+    token = explicit or resolve_anthropic_token()
     if not token:
         # A pool credential and its endpoint are one security boundary — never pair the pool key
         # with a caller-provided endpoint.
         token, resolved_base_url = _resolve_anthropic_pool_catalog_credentials()
+        declared_api_key = bool(token)  # that helper only returns auth_type=api_key pool rows
+    else:
+        declared_api_key = True if explicit else None
     if not token:
         return None
 
     headers: dict[str, str] = {"anthropic-version": "2023-06-01"}
-    is_oauth = _is_oauth_token(token)
+    is_oauth = _is_oauth_token(token, declared_api_key=declared_api_key)
     if is_oauth:
         headers["Authorization"] = f"Bearer {token}"
         from agent.anthropic_adapter import _COMMON_BETAS, _OAUTH_ONLY_BETAS, _CONTEXT_1M_BETA

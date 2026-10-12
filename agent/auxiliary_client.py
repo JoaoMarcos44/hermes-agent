@@ -2912,11 +2912,13 @@ def _try_custom_endpoint() -> tuple[Optional[Any], Optional[str]]:
         return CodexAuxiliaryClient(real_client, model), model
     if custom_mode == "anthropic_messages":
         # OAuth identity only when the host is exactly api.anthropic.com (key_cmd callable included,
-        # #114967); third-party Anthropic-compatible gateways never get it.
+        # #114967); third-party Anthropic-compatible gateways never get it. A static config key is an
+        # API key by declaration (#137334); a key_cmd/Entra callable has no declaration.
+        _declared = True if isinstance(custom_key, str) else None
         try:
             from agent.anthropic_adapter import build_anthropic_client
             from agent.anthropic_credentials import anthropic_route_is_oauth
-            real_client = build_anthropic_client(custom_key, custom_base)
+            real_client = build_anthropic_client(custom_key, custom_base, declared_api_key=_declared)
         except ImportError:
             logger.warning(
                 "Custom endpoint declares api_mode=anthropic_messages but the "
@@ -2924,7 +2926,7 @@ def _try_custom_endpoint() -> tuple[Optional[Any], Optional[str]]:
             )
             return _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra), model
         return AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base,
-                                        is_oauth=anthropic_route_is_oauth(custom_base, custom_key)), model
+                                        is_oauth=anthropic_route_is_oauth(custom_base, custom_key, declared_api_key=_declared)), model
     # URL-based anthropic detection for custom endpoints without explicit api_mode.
     _fallback_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
     return _maybe_wrap_anthropic(_fallback_client, model, custom_key, custom_base, custom_mode), model
@@ -3054,6 +3056,18 @@ def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
         token = explicit_api_key or resolve_anthropic_token()
     if not token:
         return None, None
+    # Source declaration for ambiguous sk-ant-* families (#137334): a key handed in explicitly is an
+    # API key, a pool row carries its own auth_type, and resolver output keeps shape + env defaults.
+    if callable(token) and not isinstance(token, str):
+        declared_api_key = None  # key_cmd / Entra: shape decides per mint (#114967)
+    elif explicit_api_key:
+        declared_api_key = True
+    elif entry is not None:
+        from agent.credential_pool import AUTH_TYPE_API_KEY
+        _auth_type = getattr(entry, "auth_type", None)
+        declared_api_key = (_auth_type == AUTH_TYPE_API_KEY) if _auth_type is not None else None
+    else:
+        declared_api_key = None
     # Honor config.yaml model.base_url only when provider is anthropic AND the URL is
     # Anthropic-compatible; a foreign host (Codex, OpenRouter) would 401 every aux call.
     base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
@@ -3083,14 +3097,14 @@ def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
             return None, None
         base_url = override_url
     from agent.anthropic_credentials import _is_oauth_token
-    is_oauth = _is_oauth_token(token)
+    is_oauth = _is_oauth_token(token, declared_api_key=declared_api_key)
     model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     if _aux_probe_active():
         # Probe: token + adapter import resolved; skip real client construction.
         return _AuxProbeClientStub(api_key="", base_url=base_url), model
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
-        real_client = build_anthropic_client(token, base_url)
+        real_client = build_anthropic_client(token, base_url, declared_api_key=declared_api_key)
     except ImportError:
         return None, None  # Adapter imports fine but the anthropic SDK itself is missing.
     return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
@@ -5214,10 +5228,12 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
     # the Anthropic SDK sees the original (un-rewritten) URL.
     # Mirrors the anonymous-custom branch in _try_custom_endpoint(). See #15033.
     if entry_api_mode == "anthropic_messages":
+        # A static config key is an API key by declaration (#137334); a key_cmd callable is not.
+        _declared = True if isinstance(custom_key, str) else None
         try:
             from agent.anthropic_adapter import build_anthropic_client
             from agent.anthropic_credentials import anthropic_route_is_oauth
-            real_client = build_anthropic_client(custom_key, custom_base)
+            real_client = build_anthropic_client(custom_key, custom_base, declared_api_key=_declared)
             if entry_headers:
                 # Same entry headers as the two OpenAI-wire arms; ``with_options`` merges onto the
                 # beta/credential-Omit headers the builder installed (#109595).
@@ -5228,7 +5244,7 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
             return _route_client(req, _named_custom_openai_wire_client(custom_base, custom_key, entry_headers), final_model)
         return _route_client(
             req, AnthropicAuxiliaryClient(real_client, final_model, custom_key, custom_base,
-                                          is_oauth=anthropic_route_is_oauth(custom_base, custom_key)), final_model)
+                                          is_oauth=anthropic_route_is_oauth(custom_base, custom_key, declared_api_key=_declared)), final_model)
     client = _named_custom_openai_wire_client(custom_base, custom_key, entry_headers)
     # codex_responses, or auto-detect via _wrap_transport (which reads the task-level api_mode).
     if entry_api_mode == "codex_responses":

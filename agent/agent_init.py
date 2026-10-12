@@ -2285,6 +2285,7 @@ def _snapshot_primary_runtime(agent):
             "anthropic_api_key": agent._anthropic_api_key,
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
+            "anthropic_api_key_declared": getattr(agent, "_anthropic_api_key_declared", None),
         })
 
 

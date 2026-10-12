@@ -81,6 +81,7 @@ def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb
         is_anthropic = fb_provider == "anthropic"
         effective_key = credential or (resolve_anthropic_token(model=getattr(agent, "model", None)) if is_anthropic else None) or ""
         agent.api_key = agent._anthropic_api_key = effective_key
+        agent._anthropic_api_key_declared = None  # carried-over client key: source kind is unknown here
         agent._anthropic_base_url = fb_base_url
         agent._anthropic_client = build_anthropic_client(effective_key, fb_base_url, timeout=timeout)
         agent._is_anthropic_oauth = anthropic_route_is_oauth(fb_base_url, effective_key, provider=fb_provider)
@@ -484,29 +485,39 @@ class ClientLifecycleMixin:
         self._abort_request_slot_client(_OPENAI_SLOT, client, reason=reason)
 
     def _request_anthropic_client_key(self) -> tuple:
-        """Cache key over everything forcing a fresh client: credential, base URL/region, timeout, 1M-beta flag."""
+        """Cache key over everything forcing a fresh client: credential (+ its source declaration),
+        base URL/region, timeout, 1M-beta flag."""
         if getattr(self, "provider", None) == "bedrock":
             return ("bedrock", getattr(self, "_bedrock_region", "us-east-1") or "us-east-1")
         return (
             "direct", self._anthropic_api_key, getattr(self, "_anthropic_base_url", None),
             get_provider_request_timeout(self.provider, self.model), bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+            getattr(self, "_anthropic_api_key_declared", None),
         )
 
-    def _build_direct_anthropic_client(self, token: str, base_url: Any) -> Any:
+    def _build_direct_anthropic_client(self, token: str, base_url: Any, *, declared_api_key=None) -> Any:
         """Native Anthropic client for ``token``/``base_url`` with the provider/model request timeout."""
         from agent.anthropic_adapter import build_anthropic_client
-        return build_anthropic_client(token, base_url, timeout=get_provider_request_timeout(self.provider, self.model))
+        return build_anthropic_client(
+            token, base_url, timeout=get_provider_request_timeout(self.provider, self.model),
+            declared_api_key=declared_api_key,
+        )
 
-    def _anthropic_oauth_flag(self, token: str) -> bool:
+    def _anthropic_oauth_flag(self, token: str, *, declared_api_key=None) -> bool:
         """OAuth flag only on native Anthropic routes; third-party Anthropic-protocol endpoints must not trip OAuth paths."""
         from agent.anthropic_credentials import anthropic_route_is_oauth
-        return anthropic_route_is_oauth(getattr(self, "_anthropic_base_url", None), token, provider=self.provider)
+        return anthropic_route_is_oauth(
+            getattr(self, "_anthropic_base_url", None), token, provider=self.provider,
+            declared_api_key=declared_api_key,
+        )
 
     def _build_anthropic_client_for_key(self, key: tuple) -> Any:
         from agent.anthropic_adapter import build_anthropic_bedrock_client, build_anthropic_client
         if key[0] == "bedrock":
             return build_anthropic_bedrock_client(key[1])
-        return build_anthropic_client(key[1], key[2], timeout=key[3], drop_context_1m_beta=key[4])
+        return build_anthropic_client(
+            key[1], key[2], timeout=key[3], drop_context_1m_beta=key[4], declared_api_key=key[5],
+        )
 
     def _create_request_anthropic_client(self, *, reason: str) -> Any:
         """Build (or reuse) a request-local Anthropic client for one in-flight call.
@@ -915,6 +926,7 @@ class ClientLifecycleMixin:
             return False
         old_token = self._anthropic_api_key
         self._anthropic_api_key, self._is_anthropic_oauth = new_token, self._anthropic_oauth_flag(new_token)
+        self._anthropic_api_key_declared = None  # resolver output: shape + env declaration decide
         # Claude Code revokes the old token on refresh: every holder of it (agent.api_key, the compressor's
         # main_runtime, the fallback-restore snapshot) must move too, or compression 401s for the session's life.
         if self.api_key == old_token:
@@ -925,6 +937,9 @@ class ClientLifecycleMixin:
         rt = getattr(self, "_primary_runtime", None) or {}
         if rt.get("anthropic_api_key") == old_token:  # fallback restore rebuilds from the key + flag pair
             rt["is_anthropic_oauth"] = self._is_anthropic_oauth
+            # The refreshed token comes from the resolver: drop any stale source declaration carried by
+            # the spent key rather than attaching it to this one. Absent == None for the restore (#137334).
+            rt.pop("anthropic_api_key_declared", None)
         for k in ("api_key", "anthropic_api_key", "compressor_api_key"):
             if rt.get(k) == old_token:
                 rt[k] = new_token
@@ -997,9 +1012,17 @@ class ClientLifecycleMixin:
         if self.api_mode == "anthropic_messages":
             with suppress(Exception):
                 self._anthropic_client.close()
+            from agent.credential_pool import AUTH_TYPE_API_KEY
+            # The pool row carries its own kind: keep it with the key so rebuilds/restore do not
+            # re-guess an ambiguous sk-ant-* family from shape alone (#137334).
+            _auth_type = getattr(entry, "auth_type", None)
+            declared_api_key = (_auth_type == AUTH_TYPE_API_KEY) if _auth_type is not None else None
             self._anthropic_api_key, self._anthropic_base_url = runtime_key, stripped_base
-            self._anthropic_client = self._build_direct_anthropic_client(runtime_key, self._anthropic_base_url)
-            self._is_anthropic_oauth = self._anthropic_oauth_flag(runtime_key)
+            self._anthropic_api_key_declared = declared_api_key
+            self._anthropic_client = self._build_direct_anthropic_client(
+                runtime_key, self._anthropic_base_url, declared_api_key=declared_api_key,
+            )
+            self._is_anthropic_oauth = self._anthropic_oauth_flag(runtime_key, declared_api_key=declared_api_key)
             self.api_key, self.base_url = runtime_key, stripped_base
             return True
         self.api_key, self.base_url = runtime_key, stripped_base
