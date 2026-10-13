@@ -1,8 +1,16 @@
-"""Shutdown must preserve admission order across slot, overflow and debounce owners."""
+"""Recover prior history before accepted pending work, preserving admission order."""
+
+import sqlite3
+from unittest.mock import patch
 
 import pytest
 
-from gateway.shutdown_flush import flush_overflow_to_file, recover_pending_spool
+from gateway.shutdown_flush import (
+    flush_overflow_to_file,
+    flush_pending_to_file,
+    recover_pending_spool,
+    spool_dropped_transcript_message,
+)
 from hermes_state import SessionDB
 from tests.gateway.test_drained_event_conservation import (
     KEY, _make_runner, _overflow, _text_event,
@@ -38,5 +46,82 @@ async def test_shutdown_replays_admission_order_across_queue_owners(
         )
         assert (recovered, held) == (3, set())
         assert [row["content"] for row in db.get_messages("recovered")] == [a.text, b.text, c.text]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("history_spooled_first", [False, True])
+def test_prior_history_replays_before_unexecuted_queue(monkeypatch, tmp_path, history_spooled_first):
+    runner, adapter = _make_runner(monkeypatch)
+    history = {"role": "assistant", "content": "H history"}
+    if history_spooled_first:
+        assert spool_dropped_transcript_message("recovered", history)
+    a = _text_event("A pending", "A")
+    assert runner._queue_or_replace_pending_event(KEY, a) is True
+    if not history_spooled_first:
+        assert spool_dropped_transcript_message("recovered", history)
+    assert flush_pending_to_file(adapter._pending_messages) == 1
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.ensure_session("recovered", "gateway")
+        assert recover_pending_spool(
+            db, session_resolver=lambda key, not_after=None: ("recovered", db),
+        ) == (2, set())
+        assert [(row["role"], row["content"]) for row in db.get_messages("recovered")] == [
+            ("assistant", "H history"), ("user", "A pending"),
+        ]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("failed_content", ["H history", "A pending"])
+@pytest.mark.parametrize("retry_at_boot", [False, True])
+def test_failed_mixed_recovery_retries_before_later_and_live_rows(
+    monkeypatch, tmp_path, failed_content, retry_at_boot,
+):
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    runner, adapter = _make_runner(monkeypatch)
+    for text in ("A pending", "B overflow"):
+        assert runner._queue_or_replace_pending_event(KEY, _text_event(text, text)) is True
+    assert spool_dropped_transcript_message("recovered", {"role": "assistant", "content": "H history"})
+    assert flush_pending_to_file(adapter._pending_messages) == 1
+    assert flush_overflow_to_file({KEY: list(_overflow(runner))}) == 1
+    assert spool_dropped_transcript_message("other", {"role": "user", "content": "other session"})
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        for sid in ("recovered", "other"):
+            db.ensure_session(sid, "gateway")
+        resolver = lambda key, not_after=None: ("recovered", db)
+        append = db.append_message
+
+        def fail_one(**kwargs):
+            if kwargs["content"] == failed_content:
+                raise sqlite3.OperationalError("controlled database outage")
+            return append(**kwargs)
+
+        monkeypatch.setattr(db, "append_message", fail_one)
+        expected_before_retry = [] if failed_content == "H history" else ["H history"]
+        assert recover_pending_spool(db, session_resolver=resolver) == (
+            1 + len(expected_before_retry), {"recovered"},
+        )
+        assert [row["content"] for row in db.get_messages("recovered")] == expected_before_retry
+        assert [row["content"] for row in db.get_messages("other")] == ["other session"]
+        monkeypatch.setattr(db, "append_message", append)
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        store._loaded = True
+        store._db = db
+        monkeypatch.setattr(store, "resolve_session_id_for_key", resolver)
+        store.mark_spooled_drop_sessions({"recovered"})
+        if retry_at_boot:
+            assert recover_pending_spool(db, session_resolver=resolver) == (
+                3 - len(expected_before_retry), set(),
+            )
+        store.append_to_transcript("recovered", {"role": "user", "content": "live"})
+        assert [row["content"] for row in db.get_messages("recovered")] == [
+            "H history", "A pending", "B overflow", "live",
+        ]
     finally:
         db.close()
