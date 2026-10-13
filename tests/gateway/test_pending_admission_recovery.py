@@ -148,8 +148,9 @@ def test_failed_mixed_recovery_retries_before_later_and_live_rows(
                 else:
                     blocked.setattr(Path, "read_text", fail_spool_read)
                 store.append_to_transcript("recovered", {"role": "user", "content": "held live"})
-                expected_during_barrier = expected_before_retry if retry_mode == "spool_unreadable" else ["H history"]
-                assert [row["content"] for row in db.get_messages("recovered")] == expected_during_barrier
+                # The scan resolves retained routes before replaying any row, so an unavailable
+                # route holds the entire remaining batch, including its older history.
+                assert [row["content"] for row in db.get_messages("recovered")] == expected_before_retry
             stalled_rows = ["held live"]
         if retry_mode == "boot":
             assert recover_pending_spool(db, session_resolver=resolver) == (
