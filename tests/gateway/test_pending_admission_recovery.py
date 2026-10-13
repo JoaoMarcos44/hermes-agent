@@ -13,7 +13,10 @@ from gateway.shutdown_flush import (
 )
 from hermes_state import SessionDB
 from tests.gateway.test_drained_event_conservation import (
-    KEY, _make_runner, _overflow, _text_event,
+    KEY,
+    _make_runner,
+    _overflow,
+    _text_event,
 )
 
 

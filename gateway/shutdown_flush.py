@@ -170,8 +170,9 @@ def spool_dropped_transcript_message(session_id: str, message: dict[str, Any]) -
         return None
 
 
-def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = False) -> tuple[int, int]:
-    """Replay cap-dropped transcript messages spooled for *session_id*; return ``(replayed,
+def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = False,
+                           session_resolver=None) -> tuple[int, int]:
+    """Replay transcript and boot-retained pending messages for *session_id*; return ``(replayed,
     remaining)``. ``replay(message_dict)`` runs per message in drop order; a spool file is deleted
     only after its replay succeeds. The first failure stops the drain (the DB is likely still
     unhealthy) and keeps the rest for retry, unless the DB rejected that row's own values
@@ -195,11 +196,11 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
             continue
         # A parseable non-object file (scalar/list) cannot be attributed to any session: skip it
         # like unparseable JSON instead of letting ``.get`` abort the whole drain.
-        if (not isinstance(payload, dict)
-                or payload.get("reason") != TRANSCRIPT_CAP_DROP_REASON
-                or payload.get("session_key") != session_id):
+        if not isinstance(payload, dict):
             continue
-        message = (payload.get("data") or {}).get("message")
+        message = _spooled_message_for_session(payload, session_id, session_resolver)
+        if message is None:
+            continue
         if not isinstance(message, dict):
             logger.warning("Removing structurally invalid transcript spool file %s", path)
             path.unlink(missing_ok=True)
@@ -224,6 +225,40 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
         logger.info("Replayed %d spooled transcript message(s) for %s after DB recovery", replayed,
                     session_id)
     return replayed, remaining
+
+
+def _pending_replay_target(payload, session_db, session_resolver):
+    """Resolve pending work without falling back to an unrelated profile store."""
+    session_key, data = payload.get("session_key", ""), payload.get("data", {})
+    session_id, target_db = data.get("session_id", ""), session_db
+    if not session_id and session_resolver is not None:
+        try:
+            resolved = session_resolver(session_key, not_after=payload.get("ts"))
+        except Exception as exc:
+            logger.debug("Session key->id resolution failed for %s: %s", session_key, exc)
+            resolved = None
+        if resolved and resolved[1] is not None:
+            session_id, target_db = resolved
+    return session_id, target_db
+
+
+def _spooled_message_for_session(payload, session_id, session_resolver):
+    """Live retry includes only pending rows retained by boot, never a fresh queue snapshot."""
+    data = payload.get("data") or {}
+    if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
+        if payload.get("session_key") == session_id:
+            message = data.get("message")
+            return message if message is not None else False
+        return None
+    if payload.get("reason") == AGENT_HISTORY_REASON or not _has_recovery_order(payload):
+        return None
+    if not data.get("text") or not payload.get("session_key"):
+        return None
+    resolved_id, _db = _pending_replay_target(payload, None, session_resolver)
+    if resolved_id != session_id:
+        return None
+    return {"role": "user", "content": data["text"],
+            "timestamp": payload.get("ts", int(time.time()))}
 
 
 def _json_safe(value: Any) -> bool:
@@ -271,14 +306,46 @@ def _sort_number(value: Any) -> float:
 
 
 def _spool_sort_key(payload: dict[str, Any], name: str) -> tuple:
-    """Admission order plus explicit continuation priority and filename, shared by live/restart replay."""
+    """Retained boot debt, prior history, then unexecuted work in admission/continuation order."""
     # seq is per process (_TRANSCRIPT_SPOOL_SEQ) and ts has one-second resolution, so files two
     # processes spool in the same second can interleave; within one process the order is exact.
     # Every writer stamps seq; a missing one is a legacy slot head, sorted before its tail via -1.
+    if _has_recovery_order(payload):
+        return 0, payload["recovery_order"], 0, 0, name
+    # Transcript rows belong to the turn preceding pending input, even if an outage spooled
+    # them after that input was admitted. Never let queue admission move them behind it.
+    category = 1 if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON else 2
     execution_order = payload.get("execution_order")
     if isinstance(execution_order, list) and len(execution_order) == 3:
-        return (*(_sort_number(part) for part in execution_order), name)
-    return _sort_number(payload.get("ts")), _sort_number(payload.get("seq", -1)), 0, name
+        return (category, *(_sort_number(part) for part in execution_order), name)
+    return category, _sort_number(payload.get("ts")), _sort_number(payload.get("seq", -1)), 0, name
+
+
+def _has_recovery_order(payload) -> bool:
+    value = payload.get("recovery_order")
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _freeze_recovery_order(paths) -> None:
+    """Persist the whole boot batch before replay, including still-unresolved routes.
+
+    A held pending row must precede new live rows that an ongoing outage later spools as
+    transcript history. Atomic rewrites in order also preserve a partially stamped prefix
+    across a crash. A write failure aborts startup before any resume or inbound work.
+    """
+    from utils import atomic_json_write
+
+    for order, path in enumerate(paths):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(payload, dict) or payload.get("reason") == AGENT_HISTORY_REASON:
+            continue
+        if _has_recovery_order(payload) and payload["recovery_order"] == order:
+            continue
+        payload["recovery_order"] = order
+        atomic_json_write(path, payload, mode=0o600, fsync_dir=True)
 
 
 def is_row_rejection(exc: BaseException) -> bool:
@@ -365,6 +432,7 @@ def recover_pending_spool(session_db=None, *, session_resolver=None) -> tuple[in
     flush_files = _order_flush_files(_get_flush_dir().glob("*.json"))
     if not flush_files:
         return 0, set()
+    _freeze_recovery_order(flush_files)
     own_db = session_db is None
     if own_db:
         from hermes_state_registry import acquire
@@ -440,6 +508,10 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
             blocked_sessions[spooled_sid] = 1
             raise
         return True
+    return _recover_pending_payload(session_db, path, payload, session_resolver, blocked_sessions)
+
+
+def _recover_pending_payload(session_db, path, payload, session_resolver, blocked_sessions) -> bool:
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     text = data.get("text", "")
     if not text or not session_key:
@@ -451,22 +523,22 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
     # the store owning the key. ``session_db`` (the owned default) serves only payloads that already
     # carry a session_id; a resolver-resolved payload goes to the resolver's db alone, never the
     # ambient root store (a None db from the resolver is not a fallback signal — it is "preserve").
-    session_id, target_db = data.get("session_id", ""), session_db
-    if not session_id and session_resolver is not None:
-        try:
-            resolved = session_resolver(session_key, not_after=payload.get("ts"))
-        except Exception as exc:
-            logger.debug("Session key->id resolution failed for %s: %s", session_key, exc)
-            resolved = None
-        if resolved and resolved[1] is not None:
-            session_id, target_db = resolved
+    session_id, target_db = _pending_replay_target(payload, session_db, session_resolver)
     if not session_id:
         logger.warning("Cannot recover pending message for %s: no session_id in flush file and "
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
         return False
-    target_db.append_message(session_id=session_id, role="user", content=text,
-                             timestamp=payload.get("ts", int(time.time())))
+    if session_id in blocked_sessions:
+        blocked_sessions[session_id] += 1
+        return False
+    try:
+        target_db.append_message(session_id=session_id, role="user", content=text,
+                                 timestamp=payload.get("ts", int(time.time())))
+    except Exception as exc:
+        if not is_row_rejection(exc):
+            blocked_sessions[session_id] = 1
+        raise
     return True
 
 
@@ -494,6 +566,8 @@ def recover_gateway_pending(runner) -> int:
         token = set_hermes_home_override(str(home))
         try:
             count, held_back = recover_pending_spool(session_resolver=store.resolve_session_id_for_key)
+        except OSError:
+            raise  # An incomplete order stamp must stop live work in every served profile.
         except Exception:  # one profile's unreadable spool must not strand the others'
             logger.warning("Pending-message recovery failed for profile %s", name, exc_info=True)
             continue
