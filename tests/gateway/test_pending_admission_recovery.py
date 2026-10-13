@@ -75,9 +75,9 @@ def test_prior_history_replays_before_unexecuted_queue(monkeypatch, tmp_path, hi
 
 
 @pytest.mark.parametrize("failed_content", ["H history", "A pending"])
-@pytest.mark.parametrize("retry_at_boot", [False, True])
+@pytest.mark.parametrize("retry_mode", ["boot", "live", "stalled_live"])
 def test_failed_mixed_recovery_retries_before_later_and_live_rows(
-    monkeypatch, tmp_path, failed_content, retry_at_boot,
+    monkeypatch, tmp_path, failed_content, retry_mode,
 ):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
@@ -93,7 +93,9 @@ def test_failed_mixed_recovery_retries_before_later_and_live_rows(
     try:
         for sid in ("recovered", "other"):
             db.ensure_session(sid, "gateway")
-        resolver = lambda key, not_after=None: ("recovered", db)
+        def resolver(key, not_after=None):
+            return "recovered", db
+
         append = db.append_message
 
         def fail_one(**kwargs):
@@ -108,20 +110,27 @@ def test_failed_mixed_recovery_retries_before_later_and_live_rows(
         )
         assert [row["content"] for row in db.get_messages("recovered")] == expected_before_retry
         assert [row["content"] for row in db.get_messages("other")] == ["other session"]
-        monkeypatch.setattr(db, "append_message", append)
         with patch("gateway.session.SessionStore._ensure_loaded"):
             store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
         store._loaded = True
         store._db = db
         monkeypatch.setattr(store, "resolve_session_id_for_key", resolver)
         store.mark_spooled_drop_sessions({"recovered"})
-        if retry_at_boot:
+        stalled_rows = []
+        if retry_mode == "stalled_live":
+            store._MAX_PENDING_PER_SESSION = 1
+            stalled_rows = [f"stalled live {idx}" for idx in range(3)]
+            for text in stalled_rows:
+                store.append_to_transcript("recovered", {"role": "user", "content": text})
+            assert [row["content"] for row in db.get_messages("recovered")] == expected_before_retry
+        monkeypatch.setattr(db, "append_message", append)
+        if retry_mode == "boot":
             assert recover_pending_spool(db, session_resolver=resolver) == (
                 3 - len(expected_before_retry), set(),
             )
         store.append_to_transcript("recovered", {"role": "user", "content": "live"})
         assert [row["content"] for row in db.get_messages("recovered")] == [
-            "H history", "A pending", "B overflow", "live",
+            "H history", "A pending", "B overflow", *stalled_rows, "live",
         ]
     finally:
         db.close()

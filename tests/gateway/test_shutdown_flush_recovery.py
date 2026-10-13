@@ -441,7 +441,8 @@ def test_repairable_spool_replay_failure_still_reaches_fts_rebuild(flush_dir, ma
     assert not store._dirty_transcripts
 
 
-def test_boot_recovery_runs_before_resume_turns_and_queued_inbound(monkeypatch):
+@pytest.mark.parametrize("ordering_write_fails", [False, True])
+def test_boot_recovery_runs_before_resume_turns_and_queued_inbound(monkeypatch, ordering_write_fails):
     """Resume turns and queued inbound write live rows. The store knows nothing about the previous
     run's spool until recovery has run, so a live row written first lands ahead of it for good."""
     import asyncio
@@ -449,8 +450,13 @@ def test_boot_recovery_runs_before_resume_turns_and_queued_inbound(monkeypatch):
     import gateway.run as gateway_run
 
     order = []
-    monkeypatch.setattr("gateway.shutdown_flush.recover_gateway_pending",
-                        lambda runner: order.append("recover") or 0)
+    def recover(runner):
+        order.append("recover")
+        if ordering_write_fails:
+            raise OSError("cannot preserve replay ordering")
+        return 0
+
+    monkeypatch.setattr("gateway.shutdown_flush.recover_gateway_pending", recover)
     monkeypatch.setattr(gateway_run, "_restart_notification_pending", lambda: False)
     monkeypatch.setattr(gateway_run, "_planned_restart_notification_pending", lambda: False)
 
@@ -466,9 +472,13 @@ def test_boot_recovery_runs_before_resume_turns_and_queued_inbound(monkeypatch):
         _finish_startup_restore=finish_startup_restore,
         _send_session_db_warning_notifications=noop, _spawn_supervised=lambda *a, **k: None,
     )
-    asyncio.run(gateway_run.GatewayRunner._start_finish_wiring(runner, 0))
-
-    assert order == ["recover", "resume", "drain inbound"]
+    if ordering_write_fails:
+        with pytest.raises(OSError, match="cannot preserve replay ordering"):
+            asyncio.run(gateway_run.GatewayRunner._start_finish_wiring(runner, 0))
+        assert order == ["recover"]
+    else:
+        asyncio.run(gateway_run.GatewayRunner._start_finish_wiring(runner, 0))
+        assert order == ["recover", "resume", "drain inbound"]
 
 
 def test_shutdown_spool_replays_in_acceptance_order_not_filename_order(
