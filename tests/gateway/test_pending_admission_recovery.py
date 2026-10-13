@@ -78,7 +78,7 @@ def test_prior_history_replays_before_unexecuted_queue(monkeypatch, tmp_path, hi
 
 
 @pytest.mark.parametrize("failed_content", ["H history", "A pending"])
-@pytest.mark.parametrize("retry_mode", ["boot", "live", "stalled_live"])
+@pytest.mark.parametrize("retry_mode", ["boot", "live", "stalled_live", "route_failure", "route_missing", "spool_unreadable"])
 def test_failed_mixed_recovery_retries_before_later_and_live_rows(
     monkeypatch, tmp_path, failed_content, retry_mode,
 ):
@@ -127,6 +127,30 @@ def test_failed_mixed_recovery_retries_before_later_and_live_rows(
                 store.append_to_transcript("recovered", {"role": "user", "content": text})
             assert [row["content"] for row in db.get_messages("recovered")] == expected_before_retry
         monkeypatch.setattr(db, "append_message", append)
+        if retry_mode in {"route_failure", "route_missing", "spool_unreadable"}:
+            from pathlib import Path
+
+            with monkeypatch.context() as blocked:
+                def fail_route(*args, **kwargs):
+                    raise RuntimeError("controlled routing failure")
+
+                read_text = Path.read_text
+
+                def fail_spool_read(path, *args, **kwargs):
+                    if path.parent.name == "pending_messages":
+                        raise OSError("controlled spool read failure")
+                    return read_text(path, *args, **kwargs)
+
+                if retry_mode == "route_failure":
+                    blocked.setattr(store, "resolve_session_id_for_key", fail_route)
+                elif retry_mode == "route_missing":
+                    blocked.setattr(store, "resolve_session_id_for_key", lambda *a, **k: None)
+                else:
+                    blocked.setattr(Path, "read_text", fail_spool_read)
+                store.append_to_transcript("recovered", {"role": "user", "content": "held live"})
+                expected_during_barrier = expected_before_retry if retry_mode == "spool_unreadable" else ["H history"]
+                assert [row["content"] for row in db.get_messages("recovered")] == expected_during_barrier
+            stalled_rows = ["held live"]
         if retry_mode == "boot":
             assert recover_pending_spool(db, session_resolver=resolver) == (
                 3 - len(expected_before_retry), set(),

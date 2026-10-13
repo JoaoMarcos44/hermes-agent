@@ -185,14 +185,14 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
         candidates = list(_get_flush_dir().glob("pending-*.json"))
     except Exception as exc:
         logger.debug("Cannot scan transcript spool: %s", exc)
-        return 0, 0
+        raise
     entries = []
     for path in candidates:
         if path in _REPLAYED_UNREMOVABLE:
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception:
+        except (ValueError, RecursionError):
             continue
         # A parseable non-object file (scalar/list) cannot be attributed to any session: skip it
         # like unparseable JSON instead of letting ``.get`` abort the whole drain.
@@ -227,7 +227,7 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
     return replayed, remaining
 
 
-def _pending_replay_target(payload, session_db, session_resolver):
+def _pending_replay_target(payload, session_db, session_resolver, *, require_resolution=False):
     """Resolve pending work without falling back to an unrelated profile store."""
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     session_id, target_db = data.get("session_id", ""), session_db
@@ -235,10 +235,14 @@ def _pending_replay_target(payload, session_db, session_resolver):
         try:
             resolved = session_resolver(session_key, not_after=payload.get("ts"))
         except Exception as exc:
+            if require_resolution:
+                raise
             logger.debug("Session key->id resolution failed for %s: %s", session_key, exc)
             resolved = None
         if resolved and resolved[1] is not None:
             session_id, target_db = resolved
+    if require_resolution and not session_id:
+        raise RuntimeError(f"Retained pending session route is unavailable for {session_key}")
     return session_id, target_db
 
 
@@ -254,7 +258,8 @@ def _spooled_message_for_session(payload, session_id, session_resolver):
         return None
     if not data.get("text") or not payload.get("session_key"):
         return None
-    resolved_id, _db = _pending_replay_target(payload, None, session_resolver)
+    resolved_id, _db = _pending_replay_target(
+        payload, None, session_resolver, require_resolution=True)
     if resolved_id != session_id:
         return None
     return {"role": "user", "content": data["text"],
