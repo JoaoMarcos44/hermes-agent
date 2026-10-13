@@ -74,20 +74,40 @@ def _write_payload(flush_dir: Path, payload: dict[str, Any]) -> Path:
     return final_path
 
 
+def mark_pending_admission(event: Any) -> None:
+    """Stamp accepted queue work once, before independent owners can flush it out of order."""
+    if event._pending_admission_order is None:
+        event._pending_admission_order = (int(time.time()), next(_TRANSCRIPT_SPOOL_SEQ))
+
+
+def mark_pending_execution_front(event: Any, before: Any) -> None:
+    """Retain a late steer's explicit priority without rewriting anyone's admission stamp."""
+    mark_pending_admission(event)
+    if before is None:
+        return
+    mark_pending_admission(before)
+    order = before._pending_execution_order or (*before._pending_admission_order, 0)
+    event._pending_execution_order = (*order[:2], order[2] - 1)
+
+
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written.
 
-    Every payload gets an explicit ``seq`` (callers with their own ordering key, like the
-    overflow flush, override it). Recovery orders on ``(ts, seq, name)`` and ``ts`` has
-    one-second resolution, so without ``seq`` two payloads written in the same second sort
-    by their random UUID filename — the adapter shutdown spool (older pending head, then
-    the newer debounced buffer) could replay newest-first (#126167 review F2).
+    Queue events retain their first admission's ``(ts, seq)`` across independent shutdown
+    owners. Legacy values keep write-time ordering. Both use the existing recovery key.
     """
     try:
         serialised = _serialise_value(value)
         if serialised is None:
             return False
-        extra.setdefault("seq", next(_TRANSCRIPT_SPOOL_SEQ))
+        admission_order = getattr(value, "_pending_admission_order", None)
+        if isinstance(admission_order, tuple):
+            extra["ts"], extra["seq"] = admission_order
+        else:
+            extra.setdefault("seq", next(_TRANSCRIPT_SPOOL_SEQ))
+        execution_order = getattr(value, "_pending_execution_order", None)
+        if isinstance(execution_order, tuple):
+            extra["execution_order"] = execution_order
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True
     except Exception as exc:
@@ -113,9 +133,8 @@ def flush_overflow_to_file(overflow_by_session: dict[str, Any], *, reason: str =
 
     The adapter slot holds the queue head and ``SessionState.conversation.queued_events`` the
     tail; both must survive restart. Each event is its own payload in the slot-flush shape so
-    ``recover_pending_to_db`` replays them unchanged; ``seq`` comes from the same per-process
-    counter as every other spool owner, so the tail orders after the slot head written in the
-    same second instead of restarting at zero (#126167 review F3).
+    ``recover_pending_to_db`` replays them unchanged. First-admission ordering spans the
+    slot, overflow and debounce owners, regardless of which owner flushes first.
     """
     if not overflow_by_session:
         return 0
@@ -252,12 +271,14 @@ def _sort_number(value: Any) -> float:
 
 
 def _spool_sort_key(payload: dict[str, Any], name: str) -> tuple:
-    """Drop-order key ``(ts, seq, filename)`` for one spool payload. The live drain and the restart
-    pass both sort on it, so they replay a session's files in the same order."""
+    """Admission order plus explicit continuation priority and filename, shared by live/restart replay."""
     # seq is per process (_TRANSCRIPT_SPOOL_SEQ) and ts has one-second resolution, so files two
     # processes spool in the same second can interleave; within one process the order is exact.
     # Every writer stamps seq; a missing one is a legacy slot head, sorted before its tail via -1.
-    return _sort_number(payload.get("ts")), _sort_number(payload.get("seq", -1)), name
+    execution_order = payload.get("execution_order")
+    if isinstance(execution_order, list) and len(execution_order) == 3:
+        return (*(_sort_number(part) for part in execution_order), name)
+    return _sort_number(payload.get("ts")), _sort_number(payload.get("seq", -1)), 0, name
 
 
 def is_row_rejection(exc: BaseException) -> bool:

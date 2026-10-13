@@ -1857,6 +1857,8 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
             return
+    from gateway.shutdown_flush import mark_pending_admission
+    mark_pending_admission(event)
     pending_messages[session_key] = event
 
 

@@ -271,6 +271,7 @@ async def test_drain_restage_fenced_by_run_generation(monkeypatch, scenario):
     re-raises and the successor D/E are untouched.
     """
     runner, adapter = _make_runner(monkeypatch)
+    generation = runner._begin_session_run_generation(KEY)
     a, b, c = (
         _voice_event("A voice caption", "A1"),
         _text_event("B follow-up", "B1"),
@@ -285,7 +286,8 @@ async def test_drain_restage_fenced_by_run_generation(monkeypatch, scenario):
     barrier = _SttBarrier(fail=fail)
     _install_barrier(runner, barrier)
     result = {"interrupted": True, "messages": [], "pending_steer": steer}
-    task = asyncio.create_task(runner._run_agent_drain_pending(result, adapter, _source(), KEY))
+    task = asyncio.create_task(runner._run_agent_drain_pending(
+        result, adapter, _source(), KEY, run_generation=generation))
     await asyncio.wait_for(barrier.entered.wait(), timeout=5.0)
 
     # The real drain popped A and staged B into the freed slot before suspending.

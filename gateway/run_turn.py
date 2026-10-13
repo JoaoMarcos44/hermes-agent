@@ -23,7 +23,7 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, event_preserves_prompt_pins
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
@@ -35,6 +35,7 @@ from gateway.session import (
 )
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import TurnContext
+from gateway.run_pending import GatewayPendingTurnMixin
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -165,7 +166,7 @@ def hygiene_no_commit_reason(agent) -> str:
     return "in-place commit did not complete"
 
 
-class GatewayTurnMixin:
+class GatewayTurnMixin(GatewayPendingTurnMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
     def _resolve_session_agent_runtime(
@@ -3627,120 +3628,6 @@ class GatewayTurnMixin:
             if callable(_mark_turn):
                 _mark_turn(turn_ctx.session_key, turn_ctx.run_generation)
 
-    async def _run_agent_drain_pending(
-        self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str]
-    ) -> tuple[Any, Optional[str]]:
-        """Dequeue the adapter's pending / interrupt / leftover-steer follow-up as ``(pending_event, pending)``.
-
-        Keyed by session_key (not source.chat_id) to match the adapter's storage keys."""
-        from gateway.run import (
-            _build_media_placeholder, _dequeue_pending_event, _is_control_interrupt_message
-        )
-        pending_event = None
-        pending = None
-        _drain_generation = self._current_session_run_generation(session_key)
-        if self._draining:
-            # Shutdown owns the queue snapshot; do not consume its accepted work (#126167).
-            logger.info(
-                "Leaving queued follow-ups intact for session %s during gateway %s",
-                session_key or "?", self._status_action_label(),
-            )
-            return pending_event, pending
-        if result and adapter and session_key:
-            pending_event = _dequeue_pending_event(adapter, session_key)
-            # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
-            # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
-            pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-            if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
-                interrupt_message = result.get("interrupt_message")
-                if _is_control_interrupt_message(interrupt_message):
-                    logger.info(
-                        "Ignoring control interrupt message for session %s: %s",
-                        session_key or "?", interrupt_message,
-                    )
-                else:
-                    pending = interrupt_message
-            elif pending_event:
-                # Transcribe audio BEFORE it becomes the next user turn (real transcript, not a path).
-                _pending_text = pending_event.text or ""
-                try:
-                    if self._pending_event_audio_paths(pending_event):
-                        pending, _ = await self._transcribe_and_echo_pending_voice(
-                            pending_event, adapter, source, _pending_text, log_context="Voice-drain",
-                            metadata={"thread_id": source.thread_id} if source.thread_id else None,
-                        )
-                        pending = pending or _build_media_placeholder(pending_event)
-                    else:
-                        pending = _pending_text or _build_media_placeholder(pending_event)
-                except BaseException:
-                    # Preserve accepted work only while its owner survives the suspension.
-                    self._restage_accepted_front(
-                        session_key, adapter, pending_event, run_generation=_drain_generation)
-                    raise
-                if pending:
-                    logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
-
-        # Post-transcription fence: a /new or /stop invalidated the run generation while the
-        # drain was suspended, so the stale A (and any steer) must not be returned or restaged.
-        if not self._is_session_run_current(session_key, _drain_generation):
-            return None, None
-
-        # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
-        leftover_steer = (result.get("pending_steer") or "").strip() if result else None
-        if leftover_steer:
-            if not pending and not pending_event:
-                pending = leftover_steer
-                logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
-            elif pending_event and adapter and session_key:
-                # User steered during the turn, but a background event or queued message arrived.
-                # Deliver the user's steer first and restore the pending event to the head of the queue.
-                self._restage_accepted_front(session_key, adapter, pending_event)
-                pending_event = None
-                pending = leftover_steer
-                logger.debug(
-                    "Delivering leftover /steer before queued event for session %s: '%s...'",
-                    session_key, pending[:40],
-                )
-            elif pending and not pending_event:
-                from gateway.platforms.base import MessageEvent
-                # A deferred steer continues the active channel context, just like an eventless
-                # follow-up: mark it preserving so the drain reuses the session's pins, without
-                # pre-resolving them here or marking the user as internal.
-                steer_event = MessageEvent(
-                    text=leftover_steer, source=source, preserve_prompt_pins=True,
-                )
-                if session_key:
-                    self._enqueue_fifo(session_key, steer_event, adapter)
-                logger.debug(
-                    "Enqueued leftover /steer behind pending message for session %s: '%s...'",
-                    session_key or "?", leftover_steer[:40],
-                )
-
-        # Safety net: a pending slash command is never passed to the agent as user input.
-        if pending and pending.strip().startswith("/"):
-            _pending_cmd_word = pending.strip().split(None, 1)[0][1:].lower()
-            if _pending_cmd_word:
-                with suppress(Exception):
-                    from hermes_cli.commands import resolve_command as _rc_pending
-                    if _rc_pending(_pending_cmd_word):
-                        logger.info(
-                            "Discarding command '/%s' from pending queue — "
-                            "commands must not be passed as agent input", _pending_cmd_word,
-                        )
-                        pending_event = None
-                        pending = None
-
-        if self._draining and (pending_event or pending):
-            logger.info(
-                "Stopping follow-up dispatch for session %s during gateway %s",
-                session_key or "?", self._status_action_label(),
-            )
-            self._restage_accepted_front(
-                session_key, adapter, pending_event, run_generation=_drain_generation)
-            pending_event = None
-            pending = None
-        return pending_event, pending
-
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
     ) -> None:
@@ -3815,166 +3702,6 @@ class GatewayTurnMixin:
                 _bg_result = _bg_cb()
                 if inspect.isawaitable(_bg_result):
                     await _bg_result
-
-    async def _run_agent_queued_followup(
-        self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
-        response: Any, result: Any, stream_task: Any,
-    ) -> Any:
-        """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.run import _preserve_queued_followup_history_offset
-        source, session_id, session_key, run_generation = (
-            turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
-        )
-        _interrupt_depth, history, _status_thread_metadata = (
-            turn_ctx._interrupt_depth, turn_ctx.history, turn_ctx._status_thread_metadata,
-        )
-        logger.debug("Processing pending message: '%s...'", pending[:40])
-
-        # Clear the interrupt event so the recursive _run_agent isn't re-interrupted (infinite loop).
-        _active = getattr(adapter, "_active_sessions", None) if adapter else None
-        if _active and session_key and session_key in _active:
-            _active[session_key].clear()
-
-        # Cap recursion depth (user keeps sending while the agent keeps failing).
-        # (#816)
-        if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
-            logger.warning(
-                "Interrupt recursion depth %d reached for session %s — "
-                "queueing message instead of recursing.", _interrupt_depth, session_key,
-            )
-            adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event:
-                # The popped event predates the promoted slot; neither append nor merge is safe.
-                self._restage_accepted_front(session_key, adapter, pending_event)
-            elif adapter and hasattr(adapter, 'queue_message'):
-                adapter.queue_message(session_key, pending)
-            return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
-
-        # Interrupted: discard the response ("Operation interrupted." is noise).
-        if not result.get("interrupted"):
-            await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
-
-        updated_history = result.get("messages", history)
-        next_source, next_message, next_session_key = source, pending, session_key
-        # message_type is carried into the recursive call so queued voice turns can stream TTS.
-        next_message_id = next_channel_prompt = next_message_type = None
-        # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
-        # distinct from the reply anchor above (None in forum topics). Carry it or two chained
-        # topic turns with the same text would collide on one obligation id (queued-final-ledger).
-        next_inbound_id = None
-        # Queued Discord turns carry the same routing note as first turns; persist the authored text.
-        next_persist_message = None
-        next_display_kind = display_kind_for_event(pending_event)
-        next_reply_expected = pending_event.reply_expected if pending_event is not None else None
-        # See #60671.
-        if pending_event is not None:
-            next_source = getattr(pending_event, "source", None) or source
-            if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
-                logger.info(
-                    "Discarding stale goal continuation for session %s — goal is no longer active",
-                    session_key or "?",
-                )
-                return result
-            # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
-            # paths are buffered under the key given and consumed under next_session_key.
-            try:
-                next_session_key = self._session_key_for_source(next_source)
-            except Exception:
-                logger.debug(
-                    "Queued follow-up session-key resolution failed; reusing %s",
-                    session_key or "?", exc_info=True,
-                )
-            next_message = await self._prepare_profile_scoped_inbound_message_text(
-                event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
-            )
-            if next_message is None:
-                return result
-            from gateway.run_inbound import strip_discord_triggering_note
-            next_persist_message = strip_discord_triggering_note(pending_event, next_message)
-            next_message_id = self._reply_anchor_for_event(pending_event)
-            next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
-            next_channel_prompt, next_source = self._pinned_channel_inputs(
-                next_session_key, pending_event.channel_prompt, next_source,
-                preserve_pin=event_preserves_prompt_pins(pending_event),
-            )
-            if not event_preserves_prompt_pins(pending_event):
-                # A drained human turn re-pins its channel inputs; make them durable like a first turn.
-                await self._persist_prompt_pins(next_session_key, session_id)
-            next_message_type = getattr(pending_event, "message_type", None)
-        else:
-            # Event-less interrupt/steer follow-ups continue the effective prompt
-            # of the turn they are recursively following.
-            next_channel_prompt = turn_ctx.channel_prompt
-
-        # Clear the prior turn's streaming-TTS completion marker so the recursive turn isn't suppressed.
-        # See #60671.
-        _clear_adapter = self._delivery_adapter_for(source)
-        _completed_turns = getattr(_clear_adapter, "_streaming_tts_completed_turns", None)
-        _prior_key = getattr(_clear_adapter, "_streaming_tts_turn_key", None)
-        if _completed_turns is not None and callable(_prior_key) and session_key and run_generation is not None:
-            _pk = _prior_key(session_key, run_generation)
-            if _pk:
-                _completed_turns.discard(_pk)
-
-        # Restart the typing indicator; the outer typing task may be stale.
-        if _clear_adapter:
-            with suppress(Exception):
-                await _clear_adapter.send_typing(source.chat_id, metadata=_status_thread_metadata)
-
-        # Re-baseline the cached agent's message_count before recursing into the in-band queued
-        # follow-up: the cross-process coherence guard (#45966) would otherwise see this turn's own
-        # flushed rows against the stale build-time snapshot and rebuild the agent, destroying the
-        # prompt-cache prefix (#46237). The outer handler re-baselines only after the chain unwinds.
-        # Acknowledge the follow-up the way an idle-session message is: this in-band drain is the only
-        # place a queued/interrupting message ever runs. Resolve the adapter from the follow-up's OWN
-        # source — a multiplexed gateway can route it to a different profile's adapter.
-        from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
-        _hook_adapter = self._intake_adapter_for(next_source) if pending_event is not None else None
-        await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
-        # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker.
-        try:
-            await self._refresh_agent_cache_message_count(session_key, session_id)
-
-            followup_result = await self._run_agent(
-                message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
-                source=next_source, session_id=session_id, session_key=next_session_key,
-                run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
-                event_message_id=next_message_id, inbound_message_id=next_inbound_id,
-                channel_prompt=next_channel_prompt, message_type=next_message_type,
-                persist_user_message=next_persist_message,
-                persist_user_display_kind=next_display_kind,
-                reply_expected=next_reply_expected,
-                persist_user_display_metadata={
-                    **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
-            )
-        except asyncio.CancelledError:
-            await _run_followup_processing_hook(
-                _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
-            raise
-        except BaseException:
-            await _run_followup_processing_hook(
-                _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.FAILURE)
-            raise
-        await _run_followup_processing_hook(
-            _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
-        merged = _preserve_queued_followup_history_offset(result, followup_result)
-        # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
-        # the adapter brackets against the event that OPENED the chain. Without this the terminal
-        # reply is recorded under the first message's id, so a first reply that was refused (flood
-        # control) has its outstanding row replaced and marked delivered by an identical-text
-        # terminal reply, and is never redelivered. A deeper recursion has already set its own id,
-        # so only fill the key while it is still absent: the innermost turn wins.
-        if isinstance(merged, dict) and "queued_terminal_inbound_id" not in merged:
-            merged = {
-                **merged,
-                "queued_terminal_inbound_id": next_inbound_id,
-                "queued_terminal_display_kind": next_display_kind,
-                "queued_terminal_reply_expected": next_reply_expected,
-                "queued_terminal_notification_category": (
-                    (pending_event.metadata or {}).get("notification_category", "result")
-                    if pending_event is not None and pending_event.internal else "result"),
-            }
-        return merged
 
     async def _run_agent_cleanup_turn_tasks(
         self, turn_ctx: TurnContext, *, progress_task: Any, log_task: Any, interrupt_monitor: asyncio.Task,
@@ -4352,7 +4079,8 @@ class GatewayTurnMixin:
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            pending_event, pending = await self._run_agent_drain_pending(
+                result, adapter, source, session_key, run_generation=turn_ctx.run_generation)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,

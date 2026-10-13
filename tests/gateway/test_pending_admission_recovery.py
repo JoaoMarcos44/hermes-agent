@@ -16,12 +16,16 @@ async def test_shutdown_replays_admission_order_across_queue_owners(
 ):
     runner, adapter = _make_runner(monkeypatch)
     a, b, c = (_text_event(text, text) for text in ("A pending", "B overflow", "C debounce"))
-    c.preserve_prompt_pins = True
+    a.preserve_prompt_pins = True
     assert runner._queue_or_replace_pending_event(KEY, a) is True
     assert runner._queue_or_replace_pending_event(KEY, b) is True
     await adapter._queue_text_debounce(KEY, c)
     if transfer_buffer:
         assert await adapter._flush_text_debounce_now(KEY) is True
+    else:
+        runner._BUSY_QUEUE_MAX_PENDING = 2
+        assert await adapter._flush_text_debounce_now(KEY) is False
+        assert adapter._text_debounce_store()[KEY].event is c
     # Teardown visits adapter owners A/C before the runner-owned B tail.
     await adapter.cancel_background_tasks()
     assert flush_overflow_to_file({KEY: list(_overflow(runner))}) == (2 if transfer_buffer else 1)

@@ -109,6 +109,10 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # First queue admission, retained across debounce/FIFO transfer and front-restaging.
+    _pending_admission_order: Optional[tuple[int, int]] = field(default=None, init=False, repr=False, compare=False)
+    # An accepted late steer runs before the queued head, including after restart.
+    _pending_execution_order: Optional[tuple[int, int, int]] = field(default=None, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 

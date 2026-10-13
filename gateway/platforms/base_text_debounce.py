@@ -130,6 +130,8 @@ class TextDebounceMixin:
                 return
         now = time.monotonic()
         if state is None:
+            from gateway.shutdown_flush import mark_pending_admission
+            mark_pending_admission(event)
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
             store[session_key] = state
         else:

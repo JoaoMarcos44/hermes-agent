@@ -10,7 +10,14 @@ import pytest
 
 from gateway.turn_context import TurnContext
 from tests.gateway.test_drained_event_conservation import (
-    KEY, _SttBarrier, _admit, _make_runner, _overflow, _source, _text_event, _voice_event,
+    KEY,
+    _admit,
+    _make_runner,
+    _overflow,
+    _source,
+    _SttBarrier,
+    _text_event,
+    _voice_event,
 )
 
 
@@ -139,7 +146,11 @@ async def test_restart_retains_accepted_steer_before_queued_events(monkeypatch, 
 
 
 async def _assert_steer_spool_order(tmp_path, runner, adapter):
-    from gateway.shutdown_flush import flush_overflow_to_file, flush_pending_to_file, recover_pending_spool
+    from gateway.shutdown_flush import (
+        flush_overflow_to_file,
+        flush_pending_to_file,
+        recover_pending_spool,
+    )
     from hermes_state import SessionDB
 
     assert flush_pending_to_file(dict(adapter._pending_messages), reason="shutdown") == 1
@@ -150,7 +161,7 @@ async def _assert_steer_spool_order(tmp_path, runner, adapter):
         recovered, held = recover_pending_spool(
             db, session_resolver=lambda key, not_after=None: ("sess-1", db),
         )
-        assert (recovered, held) == (4, 0)
+        assert (recovered, held) == (4, set())
         assert [message["content"] for message in db.get_messages("sess-1")] == [
             "accepted correction", "A", "B", "C",
         ]
@@ -225,7 +236,7 @@ async def test_queued_followup_retains_owner_and_accepted_work_across_awaits(mon
             assert adapter._pending_messages[KEY] is successor
             assert _overflow(runner) == [later]
         else:
-            assert adapter._pending_messages[KEY] is event
+            assert adapter._pending_messages.get(KEY) is event
             assert _overflow(runner) == []
     finally:
         release.set()
