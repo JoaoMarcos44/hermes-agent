@@ -9,8 +9,9 @@ import pytest
 from agent import auxiliary_client as aux
 from agent import secret_scope
 from agent.agent_init import _init_anthropic_client
-from agent.agent_runtime_helpers import _build_anthropic_client_from_runtime, _build_switched_client
+from agent.agent_runtime_helpers import _build_switched_client
 from agent.anthropic_adapter import build_anthropic_client
+from agent.anthropic_provenance import _build_anthropic_client_from_runtime
 from agent.client_lifecycle import ClientLifecycleMixin, _swap_fallback_clients
 from agent.credential_pool import CredentialPool, PooledCredential, load_pool
 
@@ -135,12 +136,17 @@ def test_switch_replaces_declaration_before_request_and_restore(monkeypatch, str
         agent._close_cached_request_anthropic_client(reason="test")
 
 
+@pytest.mark.parametrize("declared", [False, True])
 @pytest.mark.parametrize("kind,token,oauth", [("api_key", API, False), ("oauth", OAUTH, True)])
-def test_aux_auto_forwards_exact_main_pool_credential(monkeypatch, kind, token, oauth):
+def test_aux_auto_forwards_exact_main_pool_credential(monkeypatch, kind, token, oauth, declared):
     pool = pool_for(token, kind)
+    monkeypatch.setattr(aux, "_load_pool_with_credentials", lambda provider: pool)
+    monkeypatch.setattr(pool, "select", lambda **kwargs: pytest.fail("reselected main credential"))
     monkeypatch.setattr(aux, "_select_pool_entry", lambda provider: pytest.fail("reselected main credential"))
     runtime = {"provider": "anthropic", "model": MODEL, "base_url": BASE,
-               "api_key": token, "api_mode": "anthropic_messages", "anthropic_api_key_declared": not oauth}
+               "api_key": token, "api_mode": "anthropic_messages"}
+    if declared:
+        runtime["anthropic_api_key_declared"] = not oauth
     client, model = aux.resolve_provider_client("auto", main_runtime=runtime)
     try:
         assert model == MODEL
@@ -150,17 +156,84 @@ def test_aux_auto_forwards_exact_main_pool_credential(monkeypatch, kind, token, 
         client.close()
 
 
-def test_static_api_fallback_preserves_origin_when_installed():
-    fallback, _ = aux.resolve_provider_client("anthropic", MODEL, explicit_api_key=API)
+@pytest.mark.parametrize("provider", ["anthropic", "custom", "custom:native-test"])
+def test_static_api_fallback_preserves_origin_when_installed(provider, tmp_path):
+    config = {"model": {"provider": "custom", "model": MODEL, "base_url": BASE,
+                        "api_key": API, "api_mode": "anthropic_messages"},
+              "custom_providers": [{"name": "native-test", "base_url": BASE,
+                                    "api_key": API, "api_mode": "anthropic_messages"}]}
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    fallback, _ = aux.resolve_provider_client(provider, MODEL, explicit_api_key=API)
     agent = Agent(OAUTH, "oauth")
     try:
         wire(fallback._real_client, API, False)
-        _swap_fallback_clients(agent, fallback, "anthropic", MODEL, BASE, "anthropic_messages")
+        _swap_fallback_clients(agent, fallback, provider, MODEL, BASE, "anthropic_messages")
         wire(agent._anthropic_client, API, False)
         assert agent._is_anthropic_oauth is False
         agent._anthropic_client.close()
     finally:
         fallback.close()
+
+
+def test_oauth_pool_fallback_preserves_origin_when_installed(monkeypatch):
+    pool = pool_for(OAUTH, "oauth")
+    monkeypatch.setattr(aux, "_select_pool_entry", lambda provider: (True, pool.current()))
+    fallback, _ = aux.resolve_provider_client("anthropic", MODEL)
+    agent = Agent(API)
+    try:
+        wire(fallback._real_client, OAUTH, True)
+        _swap_fallback_clients(agent, fallback, "anthropic", MODEL, BASE, "anthropic_messages")
+        try:
+            wire(agent._anthropic_client, OAUTH, True)
+            assert agent._is_anthropic_oauth is True
+        finally:
+            agent._anthropic_client.close()
+    finally:
+        fallback.close()
+
+
+def test_explicit_config_key_is_not_retyped_by_ambient_main_runtime(monkeypatch):
+    context = aux.set_runtime_main("anthropic", MODEL, api_key=API, anthropic_api_key_declared=False)
+    monkeypatch.setattr(aux, "_select_pool_entry", lambda provider: pytest.fail("reselected explicit key"))
+    try:
+        client, _ = aux.resolve_provider_client("anthropic", MODEL, explicit_api_key=API)
+        try:
+            wire(client._real_client, API, False)
+        finally:
+            client.close()
+    finally:
+        aux.reset_runtime_main(context)
+
+
+@pytest.mark.parametrize("start_kind,dest_kind", [("api_key", "oauth"), ("oauth", "api_key")])
+def test_refresh_drops_spent_key_origin_everywhere(monkeypatch, start_kind, dest_kind):
+    from agent.turn_context import _publish_runtime_main
+
+    old, new = (API, OAUTH) if start_kind == "api_key" else (OAUTH, API)
+    agent = Agent(old, start_kind)
+    _init_anthropic_client(agent, old, BASE, None)
+    agent._primary_runtime = {"anthropic_api_key": old, "api_key": old,
+                              "anthropic_api_key_declared": start_kind == "api_key"}
+    monkeypatch.setenv("ANTHROPIC_API_KEY" if dest_kind == "api_key" else "ANTHROPIC_TOKEN", new)
+    context = aux.set_runtime_main("anthropic", MODEL)
+    try:
+        _publish_runtime_main(agent)
+        before = aux._client_cache_key("auto", async_mode=False)
+        assert aux._normalize_main_runtime(None)["anthropic_api_key_declared"] is (start_kind == "api_key")
+        assert agent._try_refresh_anthropic_client_credentials()
+        assert agent._anthropic_api_key_declared is None
+        assert "anthropic_api_key_declared" not in agent._primary_runtime
+        assert "anthropic_api_key_declared" not in aux._normalize_main_runtime(None)
+        assert before != aux._client_cache_key("auto", async_mode=False)
+        wire(agent._anthropic_client, new, dest_kind == "oauth")
+        client, _ = aux.resolve_provider_client("auto")
+        try:
+            wire(client._real_client, new, dest_kind == "oauth")
+        finally:
+            client.close()
+    finally:
+        agent._anthropic_client.close()
+        aux.reset_runtime_main(context)
 
 
 @pytest.mark.parametrize("env_name", ["ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])

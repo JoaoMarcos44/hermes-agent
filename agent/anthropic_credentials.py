@@ -68,17 +68,10 @@ _OAUTH_TOKEN_SHAPES = ("sk-ant-oat", "eyJ", "cc-")
 def _declared_env_api_key() -> str:
     """The credential the operator explicitly configured as an API key (``ANTHROPIC_API_KEY``).
 
-    Same accessor ``resolve_anthropic_token`` reads that variable through, so the declaration is
-    seen wherever the credential itself is. Outside a secret scope while multiplexing,
-    ``get_secret`` refuses the read on purpose (another profile's value must never leak here):
-    fall back to ``''`` so classification degrades to the shape heuristic instead of failing the
-    request that was about to be sent.
+    Use the resolver's profile-scoped accessor and propagate scope refusal: classification
+    must not turn an unbound secret read into a request using a guessed identity.
     """
-    try:
-        return _first_env("ANTHROPIC_API_KEY")
-    except Exception as exc:  # scope refusal and co: a declaration miss must not fail classification
-        logger.debug("ANTHROPIC_API_KEY declaration unreadable for credential classification (%s)", exc)
-        return ""
+    return _first_env("ANTHROPIC_API_KEY")
 
 
 def _is_oauth_token(key: str, *, declared_api_key: Optional[bool] = None) -> bool:
@@ -93,8 +86,8 @@ def _is_oauth_token(key: str, *, declared_api_key: Optional[bool] = None) -> boo
     "Your credit balance is too low"). There the source's declaration wins — the value configured in
     ``ANTHROPIC_API_KEY`` is an API key regardless of prefix, and a caller holding the credential's
     own kind (a ``credential_pool`` entry's ``auth_type``, a static config key) passes it as
-    ``declared_api_key``. Sources that declare nothing (``ANTHROPIC_TOKEN``/``CLAUDE_CODE_OAUTH_TOKEN``,
-    borrowed logins, ``key_cmd`` output) keep the historical OAuth default so OAuth prefixes Anthropic
+    ``declared_api_key``. OAuth env sources retain their kind through the pool; otherwise undeclared
+    sources (borrowed logins, ``key_cmd`` output) keep the historical OAuth default so OAuth prefixes Anthropic
     ships later keep working."""
     if not key or key.startswith(_API_KEY_FAMILIES):
         return False

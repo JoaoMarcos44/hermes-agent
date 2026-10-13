@@ -1813,7 +1813,8 @@ class _AnthropicCompletionsAdapter:
 class AnthropicAuxiliaryClient:
     """OpenAI-client-compatible wrapper over a native Anthropic client."""
 
-    def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False):
+    def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False, *, declared_api_key: Optional[bool] = None):
+        self._anthropic_api_key_declared = declared_api_key
         self._real_client = real_client
         self.chat = _ChatShim(_AnthropicCompletionsAdapter(real_client, model, is_oauth=is_oauth, base_url=base_url))
         self.api_key = api_key
@@ -2756,7 +2757,7 @@ def _runtime_main_value(field: str) -> Any:
 def set_runtime_main(
     provider: str, model: str, *, requested_provider: str = "", base_url: str = "",
     api_key: Any = "", api_mode: str = "", auth_mode: str = "", session_id: str = "",
-    cache_scope: str = "",
+    cache_scope: str = "", anthropic_api_key_declared: Optional[bool] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -2778,6 +2779,7 @@ def set_runtime_main(
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
         "cache_scope": (cache_scope or "").strip(),
+        "anthropic_api_key_declared": anthropic_api_key_declared,
     }
     # Publish authoritative context before updating the locked mirrors.
     token = _RUNTIME_MAIN_CONTEXT.set(runtime)
@@ -2911,9 +2913,7 @@ def _try_custom_endpoint() -> tuple[Optional[Any], Optional[str]]:
         real_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
         return CodexAuxiliaryClient(real_client, model), model
     if custom_mode == "anthropic_messages":
-        # OAuth identity only when the host is exactly api.anthropic.com (key_cmd callable included,
-        # #114967); third-party Anthropic-compatible gateways never get it. A static config key is an
-        # API key by declaration (#137334); a key_cmd/Entra callable has no declaration.
+        # Native Anthropic alone may use OAuth; static config keys declare API auth, key_cmd does not.
         _declared = True if isinstance(custom_key, str) else None
         try:
             from agent.anthropic_adapter import build_anthropic_client
@@ -2926,7 +2926,7 @@ def _try_custom_endpoint() -> tuple[Optional[Any], Optional[str]]:
             )
             return _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra), model
         return AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base,
-                                        is_oauth=anthropic_route_is_oauth(custom_base, custom_key, declared_api_key=_declared)), model
+                                        is_oauth=anthropic_route_is_oauth(custom_base, custom_key, declared_api_key=_declared), declared_api_key=_declared), model
     # URL-based anthropic detection for custom endpoints without explicit api_mode.
     _fallback_client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **_extra)
     return _maybe_wrap_anthropic(_fallback_client, model, custom_key, custom_base, custom_mode), model
@@ -3041,36 +3041,18 @@ def _try_azure_foundry(
 
 
 def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
-                   explicit_base_url: Optional[str] = None) -> tuple[Optional[Any], Optional[str]]:
+                   explicit_base_url: Optional[str] = None, main_runtime: Optional[dict[str, Any]] = None) -> tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client
-        from agent.anthropic_credentials import resolve_anthropic_token
     except ImportError:
         return None, None
-    pool_present, entry = _select_pool_entry("anthropic")
-    if pool_present and entry is not None:
-        token = explicit_api_key or _pool_runtime_api_key(entry)
-    else:
-        # Pool absent/empty: legacy resolver so a dead pool entry can't wedge aux tasks when a standalone credential exists.
-        entry = None
-        token = explicit_api_key or resolve_anthropic_token()
+    from agent.anthropic_provenance import resolve_aux_credential
+    token, entry, declared_api_key = resolve_aux_credential(explicit_api_key, main_runtime)
     if not token:
         return None, None
-    # Source declaration for ambiguous sk-ant-* families (#137334): a key handed in explicitly is an
-    # API key, a pool row carries its own auth_type, and resolver output keeps shape + env defaults.
-    if callable(token) and not isinstance(token, str):
-        declared_api_key = None  # key_cmd / Entra: shape decides per mint (#114967)
-    elif explicit_api_key:
-        declared_api_key = True
-    elif entry is not None:
-        from agent.credential_pool import AUTH_TYPE_API_KEY
-        _auth_type = getattr(entry, "auth_type", None)
-        declared_api_key = (_auth_type == AUTH_TYPE_API_KEY) if _auth_type is not None else None
-    else:
-        declared_api_key = None
     # Honor config.yaml model.base_url only when provider is anthropic AND the URL is
     # Anthropic-compatible; a foreign host (Codex, OpenRouter) would 401 every aux call.
-    base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
+    base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if entry is not None else _ANTHROPIC_DEFAULT_BASE_URL
     with contextlib.suppress(Exception):
         from hermes_cli.config import load_config_readonly
         cfg = load_config_readonly()
@@ -3107,12 +3089,12 @@ def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
         real_client = build_anthropic_client(token, base_url, declared_api_key=declared_api_key)
     except ImportError:
         return None, None  # Adapter imports fine but the anthropic SDK itself is missing.
-    return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
+    return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth, declared_api_key=declared_api_key), model
 
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
 _MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
-    "requested_provider", "session_id", "cache_scope",
+    "requested_provider", "session_id", "cache_scope", "anthropic_api_key_declared",
 )
 
 
@@ -3132,7 +3114,9 @@ def _normalize_main_runtime(main_runtime: Optional[dict[str, Any]]) -> dict[str,
     normalized: dict[str, Any] = {}
     for field in _MAIN_RUNTIME_CONTEXT_FIELDS:
         value = main_runtime.get(field)
-        if field == "api_key" and callable(value) and not isinstance(value, str):
+        if (field == "api_key" and callable(value) and not isinstance(value, str)) or (
+            field == "anthropic_api_key_declared" and isinstance(value, bool)
+        ):
             normalized[field] = value
         elif isinstance(value, str) and value.strip():
             normalized[field] = value.strip()
@@ -4597,7 +4581,7 @@ def _main_route_target(runtime: dict[str, Any], task: Optional[str]) -> tuple[st
 
 
 def _try_main_provider_route(
-    main_provider: str, main_model: str, runtime_base_url: str, runtime_api_key: Any, runtime_api_mode: str,
+    main_provider: str, main_model: str, runtime_base_url: str, runtime_api_key: Any, runtime_api_mode: str, main_runtime: Optional[dict[str, Any]] = None,
 ) -> Optional[tuple[Any, str, str]]:
     """Step 1: route aux onto the main provider + main model; None if unusable."""
     if not (main_provider and main_model and main_provider not in {"auto", ""}):
@@ -4636,7 +4620,7 @@ def _try_main_provider_route(
         return None
     client, resolved = resolve_provider_client(
         resolved_provider, main_model, explicit_base_url=explicit_base_url,
-        explicit_api_key=explicit_api_key, api_mode=runtime_api_mode or None,
+        explicit_api_key=explicit_api_key, api_mode=runtime_api_mode or None, main_runtime=main_runtime,
     )
     if client is None:
         return None
@@ -4696,7 +4680,7 @@ def _resolve_auto_route(
     runtime = _normalize_main_runtime(main_runtime)
     _warn_stale_openai_base_url(runtime.get("provider", ""))
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
-    routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
+    routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode, main_runtime=runtime)
     if routed is not None:
         return routed
     if task:
@@ -5228,7 +5212,6 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
     # the Anthropic SDK sees the original (un-rewritten) URL.
     # Mirrors the anonymous-custom branch in _try_custom_endpoint(). See #15033.
     if entry_api_mode == "anthropic_messages":
-        # A static config key is an API key by declaration (#137334); a key_cmd callable is not.
         _declared = True if isinstance(custom_key, str) else None
         try:
             from agent.anthropic_adapter import build_anthropic_client
@@ -5244,7 +5227,7 @@ def _resolve_named_custom_branch(req: _ResolveRequest) -> Optional[_ResolveResul
             return _route_client(req, _named_custom_openai_wire_client(custom_base, custom_key, entry_headers), final_model)
         return _route_client(
             req, AnthropicAuxiliaryClient(real_client, final_model, custom_key, custom_base,
-                                          is_oauth=anthropic_route_is_oauth(custom_base, custom_key, declared_api_key=_declared)), final_model)
+                                          is_oauth=anthropic_route_is_oauth(custom_base, custom_key, declared_api_key=_declared), declared_api_key=_declared), final_model)
     client = _named_custom_openai_wire_client(custom_base, custom_key, entry_headers)
     # codex_responses, or auto-detect via _wrap_transport (which reads the task-level api_mode).
     if entry_api_mode == "codex_responses":
@@ -5293,7 +5276,7 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
     provider = req.provider
     if provider == "anthropic":
         client, default_model = _try_anthropic(explicit_api_key=req.explicit_api_key,
-                                               explicit_base_url=req.explicit_base_url)
+                                               explicit_base_url=req.explicit_base_url, main_runtime=req.main_runtime)
         return _route_or_warn(req, client, default_model,
                               "resolve_provider_client: anthropic requested but no Anthropic credentials found")
     creds = resolve_creds(provider)
@@ -5811,7 +5794,7 @@ def _client_cache_key(
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
-    runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
+    runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in (*_MAIN_RUNTIME_FIELDS, "anthropic_api_key_declared")) if provider == "auto" else ()
     task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
