@@ -103,3 +103,28 @@ def test_fallen_back_route_prefers_live_credential_and_omits_stale_oauth(
     assert pinned_key == expected_key
     assert runtime_key == expected_key
     assert compressor.api_key == expected_key
+
+
+def test_pre_compression_refresh_adopts_agent_oauth_without_runtime_context():
+    """compress_context refreshes then summarizes on a worker. Equality-gated holder
+    moves miss a diverged snapshot; the live agent key must still be pinned (#138469)."""
+    from agent.conversation_compression import _refresh_main_credential
+
+    compressor = _compressor(OAUTH_STALE)
+    compressor._fallback_to_main_for_compression(Exception("OAuth access token has been revoked."), "failed")
+    agent = SimpleNamespace(
+        api_mode="anthropic_messages",
+        api_key=OAUTH_LIVE,
+        _anthropic_api_key=OAUTH_LIVE,
+        provider="anthropic",
+        context_compressor=compressor,
+        _try_refresh_anthropic_client_credentials=lambda: False,
+    )
+    _refresh_main_credential(agent)
+    seen, fake = _capture()
+    with patch("agent.context_compressor.call_llm", side_effect=fake):
+        compressor._call_summary_llm("prompt", 0.0)
+    pinned_key, runtime_key = _sent_keys(seen)
+    assert pinned_key == OAUTH_LIVE
+    assert runtime_key == OAUTH_LIVE
+    assert compressor.api_key == OAUTH_LIVE

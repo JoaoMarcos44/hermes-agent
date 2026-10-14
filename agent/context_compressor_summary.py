@@ -27,6 +27,27 @@ def _accepts_keyword_argument(callable_obj: Any, name: str) -> bool:
 
 
 class SummaryDispatchMixin:
+    def _adopt_main_api_key(self, api_key: Any, *, provider: str = "") -> bool:
+        """Adopt a live same-provider credential onto the compressor snapshot.
+
+        Returns True when the snapshot was replaced. The fallen-back pin must not omit
+        an OAuth-shaped key that came from the live client or published runtime (#138469).
+        """
+        live_provider = str(provider or "").strip().lower()
+        self_provider = str(getattr(self, "provider", "") or "").strip().lower()
+        if not live_provider or live_provider != self_provider:
+            return False
+        live_key = api_key
+        if live_key is None or live_key == "":
+            return False
+        if isinstance(live_key, str):
+            live_key = live_key.strip()
+            if not live_key:
+                return False
+        self.api_key = live_key
+        self._live_main_credential_adopted = True
+        return True
+
     def _adopt_live_main_api_key(self) -> bool:
         """Replace a stale compressor snapshot with this turn's published main credential.
 
@@ -36,21 +57,11 @@ class SummaryDispatchMixin:
         """
         from agent.auxiliary_client import _RUNTIME_MAIN_CONTEXT
         live = _RUNTIME_MAIN_CONTEXT.get() or {}
-        if not isinstance(live, dict):
-            return False
-        live_provider = str(live.get("provider") or "").strip().lower()
-        self_provider = str(getattr(self, "provider", "") or "").strip().lower()
-        if not live_provider or live_provider != self_provider:
-            return False
-        live_key = live.get("api_key")
-        if live_key is None or live_key == "":
-            return False
-        if isinstance(live_key, str):
-            live_key = live_key.strip()
-            if not live_key:
-                return False
-        self.api_key = live_key
-        return True
+        if isinstance(live, dict) and self._adopt_main_api_key(
+            live.get("api_key"), provider=str(live.get("provider") or ""),
+        ):
+            return True
+        return bool(getattr(self, "_live_main_credential_adopted", False))
 
     @staticmethod
     def _oauth_shaped_credential(value: Any) -> bool:
