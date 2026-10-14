@@ -1022,3 +1022,75 @@ async def test_draining_turn_leaves_accepted_followups_for_shutdown_spool(monkey
     # Both accepted events survive, in place, in FIFO order, for the shutdown spool.
     assert adapter._pending_messages[KEY] is a
     assert _queued_events(runner) == [b]
+
+
+@pytest.mark.asyncio
+async def test_sethome_refreshes_pinned_context_for_preserving_turn(monkeypatch):
+    """#126167 review P2 — a successful ``/sethome`` mutates live config; the next
+    pin-preserving synthetic turn must advertise the NEW home (config re-render) while
+    keeping its prompt identity: the bytes it renders are exactly what the next human
+    turn renders (no A→B→A), and the durable snapshot follows the refresh."""
+    from gateway.config import HomeChannel
+
+    old_home = HomeChannel(platform=Platform.DISCORD, chat_id="111111111111111111", name="Old home")
+    new_home = HomeChannel(platform=Platform.DISCORD, chat_id="222222222222222222", name="New home")
+    config = _pinned_config()
+    # A connected platform (offline token) so the rendered context actually carries the home
+    # channel — an unconnected fixture renders no home section and proves nothing.
+    config.platforms[Platform.DISCORD].token = "offline-fixture"
+    config.platforms[Platform.DISCORD].home_channel = old_home
+
+    durable: dict = {}
+    runner = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+    # The durable origin is the authoritative human provenance for legacy/source-less pins.
+    runner.session_store.get_or_create_session.return_value.origin = _human_thread_source()
+    runner.session_store.lookup_by_session_key.return_value.origin = _human_thread_source()
+    calls: list[dict] = []
+    _capture(runner, calls)
+
+    await _drive(runner, ((False, _human_thread_source()),), channel_prompt="Channel hint.")
+    assert "111111111111111111" in calls[0]["context_prompt"]
+
+    # /sethome succeeds: live config carries the new home before any turn runs.
+    config.platforms[Platform.DISCORD].home_channel = new_home
+    await _send(runner, runner._synthetic_prompt_event(_wake_thread_source(), "[goal] continue"))
+
+    synthetic = calls[-1]["context_prompt"]
+    assert "222222222222222222" in synthetic, "preserving turn froze the old home after /sethome"
+    assert "111111111111111111" not in synthetic
+    assert durable["value"]["context_prompt"] == synthetic, "durable snapshot missed the refresh"
+    assert calls[-1]["channel_prompt"] == "Channel hint.", "preserving turn lost the channel pin"
+
+    # Identity contract: the next human turn renders the SAME bytes (no flip-back).
+    await _drive(runner, ((False, _human_thread_source()),), channel_prompt="Channel hint.")
+    assert calls[-1]["context_prompt"] == synthetic
+    assert _effective_ephemeral(runner, calls[-2]) == _effective_ephemeral(runner, calls[-1])
+
+
+@pytest.mark.asyncio
+async def test_sethome_unchanged_config_keeps_pin_verbatim(monkeypatch):
+    """The config-refresh must not cost byte stability when NOTHING changed: with the home
+    held constant, a preserving turn returns the pinned bytes verbatim (the #126109 flip
+    stays fixed), and the next human turn renders those same bytes."""
+    from gateway.config import HomeChannel
+
+    home = HomeChannel(platform=Platform.DISCORD, chat_id="111111111111111111", name="Stable home")
+    config = _pinned_config()
+    config.platforms[Platform.DISCORD].token = "offline-fixture"
+    config.platforms[Platform.DISCORD].home_channel = home
+
+    durable: dict = {}
+    runner = _make_runner(monkeypatch, config, durable_prompt_pin=durable)
+    runner.session_store.get_or_create_session.return_value.origin = _human_thread_source()
+    runner.session_store.lookup_by_session_key.return_value.origin = _human_thread_source()
+    calls: list[dict] = []
+    _capture(runner, calls)
+
+    await _drive(runner, ((False, _human_thread_source()),), channel_prompt="Channel hint.")
+    human_prompt = calls[0]["context_prompt"]
+
+    await _send(runner, runner._synthetic_prompt_event(_wake_thread_source(), "[goal] continue"))
+    assert calls[-1]["context_prompt"] == human_prompt, "unchanged config re-rendered the pin"
+    await _drive(runner, ((False, _human_thread_source()),), channel_prompt="Channel hint.")
+    assert calls[-1]["context_prompt"] == human_prompt
+    assert _effective_ephemeral(runner, calls[-2]) == _effective_ephemeral(runner, calls[-1])

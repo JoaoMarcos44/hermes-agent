@@ -2069,6 +2069,7 @@ class GatewayTurnMixin(GatewayPendingTurnMixin):
             await self._rehydrate_prompt_pins(session_key, session_entry.session_id)
         context_prompt = self._pinned_session_context_prompt(
             context, _redact_pii, session_key, preserve_pin=_preserve_pins,
+            authoritative_source=getattr(session_entry, "origin", None),
         )
 
         # Per-turn notes ride the user message via the api_content sidecar, NOT context_prompt
@@ -2193,10 +2194,11 @@ class GatewayTurnMixin(GatewayPendingTurnMixin):
             _turn_channel_prompt, _turn_source = self._pinned_channel_inputs(
                 session_key, event.channel_prompt, source, preserve_pin=_preserve_pins,
             )
-            if not _preserve_pins:
-                # Persist the coherent context+channel pair before execution: a crash during the
-                # human turn may be followed by an internal startup-resume on the next process.
-                await self._persist_prompt_pins(session_key, _run_start_session_id)
+            # Persist the coherent pair for every turn: the store no-ops an unchanged snapshot,
+            # so this only writes when a preserving turn re-rendered (e.g. a /sethome config
+            # refresh) — leaving the durable bytes stale would resurrect the old home after a
+            # crash/restart.
+            await self._persist_prompt_pins(session_key, _run_start_session_id)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,

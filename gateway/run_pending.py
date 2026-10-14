@@ -256,8 +256,11 @@ class GatewayPendingTurnMixin:
                 next_turn["session_key"], pending_event.channel_prompt, next_source,
                 preserve_pin=event_preserves_prompt_pins(pending_event),
             )
+            # Every turn persists; the store no-ops an unchanged snapshot, so this only writes
+            # when a preserving turn re-rendered (a /sethome config refresh) — stale durable
+            # bytes would resurrect the old home after a crash/restart.
+            await self._persist_prompt_pins(next_turn["session_key"], turn_ctx.session_id)
             if not event_preserves_prompt_pins(pending_event):
-                await self._persist_prompt_pins(next_turn["session_key"], turn_ctx.session_id)
                 if hold():
                     return None
             next_turn["message_type"] = getattr(pending_event, "message_type", None)
