@@ -60,3 +60,5 @@ Remaining evidence: the `Telegram initialization await chain:` line from a natur
 ## Infographic
 
 Native-generated `infographic.png`, Japanese sumi-e theme. Visually reviewed; the recovery arrow was corrected to originate at the successful successor. Public immutable raw URL verified as HTTP 200, `image/png`, 2,623,507 bytes. The file is versioned in the contributor fork's separate documentation branch, keeping the upstream code PR below its 500 KiB binary limit and avoiding GitHub Assets uploads.
+
+Diagnostic follow-up gates on `cc03c5b9`: ruff, code health, and blob-size all passed; code health reported zero blocking and zero advisory findings. The final ledger publication changes no tested production or test source.
