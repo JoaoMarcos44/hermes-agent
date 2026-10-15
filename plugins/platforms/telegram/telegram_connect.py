@@ -73,4 +73,3 @@ async def initialize_app_with_retries(adapter, builder) -> None:
                     await telegram._await_with_thread_deadline(
                         telegram._shutdown_abandoned_app(old_app), timeout=telegram._DRAIN_TIMEOUT,
                         label="telegram-init-cleanup", dump_on_blocked_loop=False)
-

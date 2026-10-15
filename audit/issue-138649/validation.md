@@ -1,0 +1,52 @@
+# Telegram initialization lifecycle evidence
+
+Issue: https://github.com/NousResearch/hermes-agent/issues/138649
+
+Baseline: `73456e11739ff1bf84f6d39859a6e55edb1afb92`.
+
+## Confirmed defects
+
+PTB's builder retains the explicitly supplied general and getUpdates requests. The old retry ladder called `builder.build()` with those same objects, then awaited `_shutdown_abandoned_app(old_app)` without a deadline. A slow shutdown could prevent the next initialize call entirely; a late old-app shutdown could close requests belonging to its successor.
+
+The report's claimed shield-held `_sticky_lock` mechanism is not established: production's lock critical sections contain no await after acquisition. Replacing locks or resetting `_primary_closed` does not isolate request ownership. Persistence across fresh gateway processes is outside what this local replay proves.
+
+## RED and GREEN
+
+Two invariant tests, with four collected cases, use real PTB 22.8 and HTTPX 0.28.1 with an asyncio loopback Bot API. Fault injection occurs at the transport/shutdown boundary. It does not replace the retry ladder or deadline helper.
+
+| Contract | Baseline | Fixed |
+|---|---|---|
+| Cancellation-resistant pre-socket work and held cleanup cannot block the next attempt: direct, proxy, fallback request construction | 3 cleanup timeouts | 3 pass |
+| A transient-error rebuild owns both requests; late old cleanup leaves the successor bot usable | Shared-request assertion fails | Pass |
+
+The final selected suite passed **48 tests in six files**, with **zero retries**:
+
+```sh
+scripts/run_tests.sh -j 2 --file-retries 0 \
+  tests/plugins/platforms/telegram/test_init_isolation.py \
+  tests/gateway/test_telegram_init_deadline.py \
+  tests/gateway/test_telegram_connect.py \
+  tests/gateway/test_telegram_closewait_limits.py \
+  tests/gateway/test_telegram_fallback_pool_release.py \
+  tests/gateway/test_telegram_network_reconnect.py -q
+```
+
+Runs used disposable source snapshots and temporary Hermes homes. TEMP/TMP, bytecode, generated files, and runner output stayed under the sandbox. Each run's source and output were removed on completion. The test environment was built through PM with dev/test groups and the Telegram extra. Worker count was capped at two. No bot credentials or external Telegram service were used.
+
+The initial gateway-directory harness was invalid because its conftest installs Telegram mocks. It was moved under the plugin test tree. The proxy case wraps HTTPX's selected proxy mount so it actually injects the pre-socket fault. Neither harness error is counted as defect reproduction. A neighboring test also exposed unnecessary successor allocation on a non-retryable error; the retry flag now applies only after the retryability guard.
+
+The final harness uses two-second injected deadlines and a twelve-second outer bound, with event-based release, to leave headroom on busy CI workers. The same four baseline failures were reconfirmed after widening those bounds.
+
+`python scripts/check --commit 29b66442 --base 73456e11` passed all **12 checks**, with **0 blocking and 0 advisory** code-health findings. The check runner's concurrency was capped at two. Native Git needed the checkout-local `core.longpaths=true` setting to materialize the isolated snapshot; no system setting changed. Final documentation and timing-only changes are checked again separately before publication.
+
+## Related work and scope
+
+PR https://github.com/NousResearch/hermes-agent/pull/122639 also introduces fresh retry requests and addresses cancellation/final-attempt cleanup. Its head `ad50c15d` still directly awaits old-app shutdown in retry `finally`. This draft adds the missing bounded-progress invariant and exercises late cleanup against real PTB clients. Maintainers can consolidate the overlapping request-isolation change with that PR.
+
+The retry ladder lives in `plugins/platforms/telegram/telegram_connect.py`; the existing adapter method remains the entry point. The existing factory retains proxy, fallback, polling instrumentation, pool limits, and TLS construction. No core tools, prompt state, dependencies, or configuration settings are added.
+
+Reporter-side replay on Linux aarch64 under the original pressure/reconnect conditions remains necessary to establish the original production trigger. This work is a draft patch for proven lifecycle faults, with that limit explicit.
+
+## Infographic
+
+Native-generated `infographic.png`, Japanese sumi-e theme. Visually reviewed; the recovery arrow was corrected to originate at the successful successor. Public immutable raw URL verified as HTTP 200, `image/png`, 2,623,507 bytes. The file is versioned in the contributor fork's separate documentation branch, keeping the upstream code PR below its 500 KiB binary limit and avoiding GitHub Assets uploads.

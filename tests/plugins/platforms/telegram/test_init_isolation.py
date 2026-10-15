@@ -53,8 +53,8 @@ def prepare(monkeypatch, url, mode="direct"):
     monkeypatch.setattr(telegram, "resolve_proxy_url", lambda *a, **kw: url if mode == "proxy" else None)
     monkeypatch.setattr(adapter, "_wire_plugin_handlers", lambda app: None)
     monkeypatch.setattr(adapter, "_register_handlers", lambda app: None)
-    monkeypatch.setattr(telegram, "env_float", lambda key, default: 0.2 if key == "HERMES_TELEGRAM_INIT_TIMEOUT" else default)
-    monkeypatch.setattr(telegram, "_DRAIN_TIMEOUT", 0.2)
+    monkeypatch.setattr(telegram, "env_float", lambda key, default: 2.0 if key == "HERMES_TELEGRAM_INIT_TIMEOUT" else default)
+    monkeypatch.setattr(telegram, "_DRAIN_TIMEOUT", 2.0)
     sleep = asyncio.sleep
 
     async def backoff(_delay):
@@ -110,7 +110,7 @@ async def test_retry_reaches_socket_while_abandoned_transport_and_cleanup_are_st
     adapter._bot = adapter._app.bot
     old_app = adapter._app
     try:
-        await asyncio.wait_for(adapter._initialize_app_with_retries(builder), 6)
+        await asyncio.wait_for(adapter._initialize_app_with_retries(builder), 12)
         assert calls and all(b"/getMe " in call for call in calls)
         assert blocked and all(not task.done() for task in blocked)
         assert not release.is_set()
