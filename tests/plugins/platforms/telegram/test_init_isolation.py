@@ -70,7 +70,8 @@ async def test_retry_reaches_socket_while_abandoned_transport_and_cleanup_are_st
     url, calls = bot_api
     adapter, builder = prepare(monkeypatch, url, mode)
     requests = await adapter._build_ptb_requests()
-    inner = requests[0]._client._transport
+    client = requests[0]._client
+    inner = client._transport_for_url(httpx.URL(url))
     release = asyncio.Event()
     blocked = set()
 
@@ -91,8 +92,12 @@ async def test_retry_reaches_socket_while_abandoned_transport_and_cleanup_are_st
             await inner.aclose()
 
     transport = WedgedTransport()
-    requests[0]._client._transport = transport
-    requests[0]._client_kwargs["transport"] = transport
+    if client._transport is inner:
+        client._transport = transport
+        requests[0]._client_kwargs["transport"] = transport
+    for pattern, mounted in client._mounts.items():
+        if mounted is inner:
+            client._mounts[pattern] = transport
     original_shutdown = type(requests[0]).shutdown
 
     async def shutdown(request):

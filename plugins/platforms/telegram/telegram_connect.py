@@ -43,9 +43,9 @@ async def initialize_app_with_retries(adapter, builder) -> None:
             await asyncio.sleep(wait)
         except Exception as init_err:
             # OSError always retries; anything else only when it looks like a network error.
-            rebuild_app = True
             if (not isinstance(init_err, OSError) and not adapter._looks_like_network_error(init_err)) or _attempt >= _max_connect - 1:
                 raise
+            rebuild_app = True
             wait = min(2 ** _attempt, 15)
             telegram.logger.warning(
                 "[%s] Connect attempt %d/%d failed: %s — retrying in %ds", adapter.name, _attempt + 1, _max_connect, init_err, wait)
@@ -57,10 +57,12 @@ async def initialize_app_with_retries(adapter, builder) -> None:
                 "CancelledError" if isinstance(sys.exc_info()[1], asyncio.CancelledError) else type(sys.exc_info()[1]).__name__)
             raise
         finally:
-            # A failed attempt may leave the app half-initialized: rebuild a fresh Application from the
-            # same builder for the next attempt and discard the old one.
+            # PTB retains explicitly supplied requests in the builder. An abandoned initialize and
+            # its delayed cleanup must never share connection state with the next attempt.
             if rebuild_app and _attempt < _max_connect - 1:
                 old_app = adapter._app
+                request, get_updates_request = await adapter._build_ptb_requests()
+                builder.request(request).get_updates_request(get_updates_request)
                 adapter._app = builder.build()
                 adapter._bot = adapter._app.bot
                 # Same order as connect(): plugin handlers first (the wired-set is keyed per app, so
@@ -68,5 +70,7 @@ async def initialize_app_with_retries(adapter, builder) -> None:
                 adapter._wire_plugin_handlers(adapter._app)
                 adapter._register_handlers(adapter._app)
                 with contextlib.suppress(Exception):
-                    await telegram._shutdown_abandoned_app(old_app)
+                    await telegram._await_with_thread_deadline(
+                        telegram._shutdown_abandoned_app(old_app), timeout=telegram._DRAIN_TIMEOUT,
+                        label="telegram-init-cleanup", dump_on_blocked_loop=False)
 
