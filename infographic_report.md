@@ -1,6 +1,8 @@
 # Telegram initialization recovery
 
-![Japanese sumi-e infographic showing shared request state blocking recovery, separate request pairs per attempt, and recovery with bounded old-app cleanup](https://raw.githubusercontent.com/JoaoMarcos44/hermes-agent/2dd9a166f509e60979a6824c1992add6a8816eac/infographic.png)
+[View the infographic](https://raw.githubusercontent.com/JoaoMarcos44/hermes-agent/2dd9a166f509e60979a6824c1992add6a8816eac/infographic.png) · [Draft PR #139277](https://github.com/NousResearch/hermes-agent/pull/139277)
+
+![Japanese sumi-e infographic showing shared request state blocking recovery, separate request pairs per attempt, and recovery with bounded old-app cleanup](infographic.png)
 
 The gateway builds a Telegram application using two HTTP requests: one for API calls and one for polling. PTB's builder retains those request objects. Rebuilding only the application therefore carries the failed attempt's connection state into its successor. Waiting indefinitely for the old application's shutdown can also stop the retry ladder before the next attempt starts.
 
@@ -12,6 +14,10 @@ This proves the retry lifecycle defects and recovery under controlled faults. Th
 
 To collect that missing evidence, each initialization timeout now reports the suspended Python await chain for its own task, before cancellation or cleanup erases it. The diagnostic contains only source basenames, line numbers, and function names. The existing tests also verify the blocked transport/event frames and exclusion of the dummy token and URL.
 
-The native image generator produced `infographic.png` using a Japanese sumi-e theme. The image is versioned on a separate documentation branch of the contributor fork, with the URL pinned to its commit. No GitHub Assets or release attachments are used. The prompt and local helper are stored beside the image in that branch. This report, validation evidence, and decision ledger are versioned alongside the image in the documentation branch and linked from the PR body. The upstream diff contains the Telegram implementation and regression tests.
+The native image generator produced `infographic.png` using a Japanese sumi-e theme. The PR body links directly to the image and embeds a preview. The image is hosted in `JoaoMarcos44/hermes-agent`, on the separate `docs/telegram-init-138649-infographic` branch. Its public URL is pinned to artifact commit `2dd9a166f509e60979a6824c1992add6a8816eac`, so later documentation edits do not change the image. No GitHub Assets or release attachments are used.
+
+The PNG was never tracked on the PR's code branch, `fix/telegram-init-attempt-isolation`; it is committed only on the separate artifact branch. The current PR diff contains exactly the Telegram adapter, its connection helper, and the regression test file. Earlier code-branch commits included working reports; those reports have already been removed from the final diff. The reports and their history remain available without rewriting code commits.
+
+This report, validation evidence, decision ledger, prompt, and publishing helper live alongside the image in the artifact branch. The PR body links the reports at an immutable documentation commit. Local `infographic.png` and `infographic_report.md` remain available for preview; the relative image embed above works locally and in the artifact branch.
 
 See [the decision ledger](audit/issue-138649/decision-ledger.jsonl) for accepted and rejected hypotheses and replay evidence.
