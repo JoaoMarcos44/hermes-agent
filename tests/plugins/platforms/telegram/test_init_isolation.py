@@ -66,7 +66,7 @@ def prepare(monkeypatch, url, mode="direct"):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["direct", "proxy", "fallback"])
-async def test_retry_reaches_socket_while_abandoned_transport_and_cleanup_are_still_waiting(monkeypatch, bot_api, mode):
+async def test_retry_reaches_socket_while_abandoned_transport_and_cleanup_are_still_waiting(monkeypatch, bot_api, mode, caplog):
     url, calls = bot_api
     adapter, builder = prepare(monkeypatch, url, mode)
     requests = await adapter._build_ptb_requests()
@@ -115,6 +115,11 @@ async def test_retry_reaches_socket_while_abandoned_transport_and_cleanup_are_st
         assert blocked and all(not task.done() for task in blocked)
         assert not release.is_set()
         assert not set(old_app.bot._request) & set(adapter._bot._request)
+        diagnostics = [record.getMessage() for record in caplog.records
+                       if "initialization await chain:" in record.getMessage()]
+        assert diagnostics
+        assert any("handle_async_request" in message and "wait" in message for message in diagnostics)
+        assert all("LOCAL_TEST" not in message and "http://" not in message for message in diagnostics)
         # A late old-app shutdown must never close the successful successor's clients.
         release.set()
         await asyncio.gather(*blocked, return_exceptions=True)
