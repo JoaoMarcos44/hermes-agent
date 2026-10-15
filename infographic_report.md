@@ -10,6 +10,8 @@ Two invariant tests exercise real PTB and HTTPX against a loopback Bot API. The 
 
 This proves the retry lifecycle defects and recovery under controlled faults. The original production trigger, its recurrence after process restarts, and the reporter's Linux aarch64 environment still require reporter-side confirmation.
 
+To collect that missing evidence, each initialization timeout now reports the suspended Python await chain for its own task, before cancellation or cleanup erases it. The diagnostic contains only source basenames, line numbers, and function names. The existing tests also verify the blocked transport/event frames and exclusion of the dummy token and URL.
+
 The native image generator produced `infographic.png` using a Japanese sumi-e theme. The image is versioned on a separate documentation branch of the contributor fork, with the URL pinned to its commit. No GitHub Assets or release attachments are used. The prompt and local helper are stored beside the image in that branch. The code branch carries the report and decision ledger without adding a large binary to upstream clones.
 
 See [the decision ledger](audit/issue-138649/decision-ledger.jsonl) for accepted and rejected hypotheses and replay evidence.

@@ -3,6 +3,22 @@
 import asyncio
 import contextlib
 import sys
+from pathlib import Path
+
+
+def _initialization_await_chain(task) -> str:
+    """Describe suspended Python awaits without task reprs, source text or frame locals."""
+    current = task.get_coro() if isinstance(task, asyncio.Task) else None
+    chain = []
+    for _ in range(32):
+        frame = getattr(current, "cr_frame", None) or getattr(current, "gi_frame", None)
+        if frame is not None:
+            code = frame.f_code
+            chain.append(f"{Path(code.co_filename).name}:{frame.f_lineno} ({code.co_name})")
+        current = getattr(current, "cr_await", None) or getattr(current, "gi_yieldfrom", None)
+        if current is None:
+            break
+    return " -> ".join(chain) or "<no suspended Python frame>"
 
 
 async def initialize_app_with_retries(adapter, builder) -> None:
@@ -26,11 +42,15 @@ async def initialize_app_with_retries(adapter, builder) -> None:
             telegram.logger.warning("[%s] Connecting to Telegram (attempt %d/%d)…", adapter.name, _attempt + 1, _max_connect)
             # On timeout the (possibly shielded) initialize() task is abandoned; release the half-built
             # app's httpx client so it isn't leaked across the ladder.
+            init_task = asyncio.ensure_future(adapter._app.initialize())
             await telegram._await_with_thread_deadline(
-                adapter._app.initialize(), timeout=_init_timeout, on_abandon=lambda app=adapter._app: telegram._shutdown_abandoned_app(app),
+                init_task, timeout=_init_timeout, on_abandon=lambda app=adapter._app: telegram._shutdown_abandoned_app(app),
                 label="telegram-init")
             break
         except TimeoutError:
+            # Stay on this loop tick: cancellation or cleanup can erase the suspended frames.
+            telegram.logger.warning(
+                "[%s] Telegram initialization await chain: %s", adapter.name, _initialization_await_chain(init_task))
             rebuild_app = True
             if _attempt >= _max_connect - 1:
                 raise OSError(

@@ -47,6 +47,16 @@ The retry ladder lives in `plugins/platforms/telegram/telegram_connect.py`; the 
 
 Reporter-side replay on Linux aarch64 under the original pressure/reconnect conditions remains necessary to establish the original production trigger. This work is a draft patch for proven lifecycle faults, with that limit explicit.
 
+## Capturing the missing production evidence
+
+The gateway's existing faulthandler watchdog dumps thread stacks when the loop itself stops processing its deadline. That does not locate an asyncio wait while the loop remains healthy, which is the reported signature.
+
+On an initialization timeout the retry ladder now emits `Telegram initialization await chain:` followed by up to 32 suspended Python frames from that initialization task. It captures them synchronously before cancellation or detached cleanup gets another loop tick. Each entry contains only the source basename, line number, and function name. Task representations, source lines, request URLs, frame locals, and other tasks are not inspected or emitted. Traversal ends at an opaque future rather than following unrelated tasks.
+
+The existing real-PTB timeout invariant now also checks that the captured chain contains the injected transport and event wait, and excludes the dummy token and URL. On `a6dcf299`, the new diagnostic assertion failed after recovery succeeded; with the diagnostic, all **48 selected tests passed again**, with no retries. The direct, proxy, and fallback cases all verify the diagnostic.
+
+Remaining evidence: the `Telegram initialization await chain:` line from a naturally failing attempt on the affected gateway. The controlled fault is not evidence that the production hang is in the same primitive. No new production stack or issue/PR reply was available when this follow-up was prepared.
+
 ## Infographic
 
 Native-generated `infographic.png`, Japanese sumi-e theme. Visually reviewed; the recovery arrow was corrected to originate at the successful successor. Public immutable raw URL verified as HTTP 200, `image/png`, 2,623,507 bytes. The file is versioned in the contributor fork's separate documentation branch, keeping the upstream code PR below its 500 KiB binary limit and avoiding GitHub Assets uploads.
