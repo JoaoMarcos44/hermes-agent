@@ -41,6 +41,7 @@ class TextDebounceMixin:
         result = (
             getattr(self, "_busy_text_mode", "interrupt") == "queue"
             and event.message_type == MessageType.TEXT and not getattr(event, "internal", False)
+            and not getattr(event, "preserve_prompt_pins", False)
             and not event.is_command() and bool((event.text or "").strip()))
         if result:
             logger.debug("[%s] Queue-text debounce candidate accepted: session=%s text_len=%d",
