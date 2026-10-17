@@ -106,6 +106,12 @@ class MessageEvent:
     # pinned prompt bytes instead of overwriting the channel/context pins. This is prompt identity
     # only: the ``internal`` field above still alone gates authorization and the emergency stop.
     preserve_prompt_pins: bool = False
+    # Main's marker for the same synthetic-turn class, landed via #139865: goal/heartbeat/loop
+    # resume events that carry no channel inputs of their own reuse the session's pinned channel
+    # prompt/parent instead of overwriting it with None (#126109). Kept alongside the predicate
+    # above (event_preserves_prompt_pins accepts either); appended after ``preserve_prompt_pins``
+    # for positional compat (see the field-order rule above).
+    inherit_channel_pin: bool = False
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
