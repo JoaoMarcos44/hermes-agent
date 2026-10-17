@@ -160,9 +160,14 @@ def event_preserves_prompt_pins(event: Any) -> bool:
     One predicate for both prompt-identity owners (the session-context and channel pin helpers) and
     every lifecycle gate, so no boundary can flip one site against another. ``internal`` events are
     self-injected turns that never carry a fresh identity; a non-internal synthetic turn
-    (goal/heartbeat/loop/steer continuation) opts in with ``preserve_prompt_pins``. ``getattr`` keeps
+    (goal/heartbeat/loop/steer continuation) opts in with ``preserve_prompt_pins`` (this branch) or
+    ``inherit_channel_pin`` (the same marker that main landed via #139865). ``getattr`` keeps
     ``None``, legacy events, and test doubles non-preserving.
     """
     if event is None:
         return False
-    return bool(getattr(event, "internal", False) or getattr(event, "preserve_prompt_pins", False))
+    return bool(
+        getattr(event, "internal", False)
+        or getattr(event, "preserve_prompt_pins", False)
+        or getattr(event, "inherit_channel_pin", False)
+    )
