@@ -649,7 +649,7 @@ class GatewayAgentCacheMixin:
         member/speaking churn can't touch the prompt."""
         if source.platform != Platform.DISCORD:
             return None
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self._delivery_adapter_for(source)
         guild_id = self._get_guild_id(event)
         if not (guild_id and adapter and hasattr(adapter, "get_voice_channel_context")):
             return None
@@ -667,13 +667,13 @@ class GatewayAgentCacheMixin:
         return f"[Voice channel now: {vc_now or 'not connected to a voice channel'}]"
 
     async def _rehydrate_prompt_pins(self, session_key: str, expected_session_id: Optional[str]) -> None:
-        """Adopt the durable pin snapshot for an internal turn when this process holds no pins for
-        *session_key* (a restart). Eviction clears only ``ephemeral_pin`` and keeps ``channel_pin``,
-        so an evicted agent still re-renders instead of reviving the snapshot."""
+        """Adopt the durable pin snapshot for an internal turn when this process holds no context pin
+        for *session_key*: a restart, or an eviction (/stop, /undo, /model), which clears only
+        ``ephemeral_pin``. Without it the wake renders from its origin-only source (no chat or user
+        names) and the next human turn re-keys back, rewriting the system bytes twice. Human turns
+        never call this, so an evicted agent's next human turn still re-renders."""
         state = self._peek_session_state(session_key)
-        if state is not None and (
-            state.conversation.ephemeral_pin is not None or state.conversation.channel_pin is not None
-        ):
+        if state is not None and state.conversation.ephemeral_pin is not None:
             return
         try:
             pin = sanitize_prompt_pin(await self.async_session_store.get_prompt_pin(
