@@ -182,8 +182,20 @@ threading.Event().wait()
         )
         assert result.returncode == 0, result.stderr.decode(errors="replace")
 
+    duplicate = None
     try:
         first, first_watch = generation(1)
+        duplicate = subprocess.Popen(
+            owner.args,
+            cwd=Path(__file__).resolve().parents[2],
+            env={**os.environ, "HERMES_HOME": str(tmp_path)},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        assert duplicate.wait(timeout=15) == 0
+        assert len((tmp_path / "children.txt").read_text(encoding="utf-8").splitlines()) == 1
+        assert owner.poll() is None
+        assert psutil.pid_exists(first_watch)
         kill_tree(first)
         second, second_watch = generation(2)
         assert second != first
@@ -196,10 +208,14 @@ threading.Event().wait()
         assert owner.wait(timeout=15) == 0
         assert ack.read_text(encoding="utf-8") == "planned-stop"
         assert len((tmp_path / "children.txt").read_text(encoding="utf-8").splitlines()) == 2
+        assert not psutil.pid_exists(second_watch)
     finally:
-        if owner.poll() is None:
-            subprocess.run(
-                ["taskkill", "/PID", str(owner.pid), "/T", "/F"],
-                capture_output=True, timeout=15, check=False,
-            )
-        owner.wait(timeout=15)
+        for process in (duplicate, owner):
+            if process is None:
+                continue
+            if process.poll() is None:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True, timeout=15, check=False,
+                )
+            process.wait(timeout=15)
