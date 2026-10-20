@@ -72,6 +72,7 @@ class GatewayPendingTurnMixin:
             _dequeue_pending_event,
             _is_control_interrupt_message,
         )
+        from gateway.session_ingress import executing_admission
 
         if not result or not adapter or not session_key:
             return None, None
@@ -83,7 +84,8 @@ class GatewayPendingTurnMixin:
             if _is_control_interrupt_message(interrupt_message):
                 logger.info("Ignoring control interrupt message for session %s: %s", session_key, interrupt_message)
             else:
-                pending = interrupt_message
+                # FIFO already has this send.
+                pending = None if executing_admission.get() else interrupt_message
         elif pending_event:
             _pending_text = pending_event.text or ""
             try:
