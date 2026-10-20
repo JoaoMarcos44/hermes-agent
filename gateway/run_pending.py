@@ -77,6 +77,11 @@ class GatewayPendingTurnMixin:
         if not result or not adapter or not session_key:
             return None, None
         pending_event = _dequeue_pending_event(adapter, session_key)
+        if result.get("compression_exhausted") and pending_event is not None:
+            # The outer handler owns the fresh-session reset: hand the queued event back to the head
+            # slot so its post-handler drain starts it there, never on the exhausted session.
+            self._defer_past_exhaustion_reset(result, adapter, source, session_key, pending_event)
+            return None, None
         pending_event = self._promote_queued_event(session_key, adapter, pending_event)
         pending = None
         if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
@@ -148,6 +153,11 @@ class GatewayPendingTurnMixin:
         # Post-transcription fence: a /new or /stop invalidated the run generation while the
         # drain was suspended, so the stale A (and any steer) must not be returned or restaged.
         if not _run_still_current():
+            return None, None
+
+        if result and result.get("compression_exhausted"):
+            # Exhaustion deferral already ended this drain (only the outer handler's fresh-session
+            # drain may consume the queued event); no follow-up can be prepared here.
             return None, None
 
         # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
